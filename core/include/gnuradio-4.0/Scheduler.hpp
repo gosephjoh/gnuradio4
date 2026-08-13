@@ -18,6 +18,7 @@
 #include <gnuradio-4.0/Port.hpp>
 #include <gnuradio-4.0/Profiler.hpp>
 #include <gnuradio-4.0/SchedulerModel.hpp> // nested-scheduler dispatch (detail::asSchedulerModel)
+#include <gnuradio-4.0/SchedulingPolicy.hpp>
 #include <gnuradio-4.0/meta/indirect.hpp>
 #include <gnuradio-4.0/meta/reflection.hpp>
 #include <gnuradio-4.0/thread/thread_pool.hpp>
@@ -87,7 +88,7 @@ enum class ExecutionPolicy {
 
 using JobLists = std::vector<std::vector<std::shared_ptr<BlockModel>>>;
 
-template<typename Derived, ExecutionPolicy execution = ExecutionPolicy::singleThreaded, profiling::ProfilerLike TProfiler = profiling::null::Profiler>
+template<typename Derived, ExecutionPolicy execution = ExecutionPolicy::singleThreaded, profiling::ProfilerLike TProfiler = profiling::null::Profiler, SchedulingPolicyLike TPolicy = RoundRobinPolicy>
 struct SchedulerBase : Block<Derived> {
     friend class lifecycle::StateMachine<Derived>;
     using TaskExecutor = gr::thread_pool::TaskExecutor;
@@ -95,7 +96,7 @@ struct SchedulerBase : Block<Derived> {
 
 private:
     static consteval void _forbid_reserved_overrides() {
-        using Base = SchedulerBase<Derived, execution, TProfiler>;
+        using Base = SchedulerBase<Derived, execution, TProfiler, TPolicy>;
         // Lifecycle callback functions init/start/stop/pause/resume/reset need to remain reserved to SchedulerBase<Derived, ...>.
         // Do NOT re-implement them in the Derived custom user-defined scheduler.
         static_assert(std::same_as<decltype(&Derived::init), decltype(&Base::init)>, "Derived defines 'init()' (reserved). Use 'customInit()' instead.");
@@ -268,6 +269,8 @@ public:
     constexpr static block::Category blockCategory = block::Category::ScheduledBlockGroup;
 
     [[nodiscard]] static constexpr auto executionPolicy() { return execution; }
+
+    [[nodiscard]] static constexpr std::string_view schedulingPolicyName() { return TPolicy::kName; }
 
     void requestWorkQuiescence() {
         gr::atomic_ref(_workQuiescenceRequested).store_release(true);
@@ -852,6 +855,7 @@ protected:
             localBlockList.reserve(blocks.size());
             std::ranges::copy(blocks, std::back_inserter(localBlockList));
         }
+        detail::applyStaticOrder<TPolicy>(localBlockList); // no-op for RoundRobinPolicy: its key is the position itself
 
         if (localBlockList.empty()) {
             return;
@@ -1905,11 +1909,11 @@ protected:
     }
 };
 
-template<ExecutionPolicy execution = ExecutionPolicy::singleThreaded, profiling::ProfilerLike TProfiler = profiling::null::Profiler>
-struct Simple : SchedulerBase<Simple<execution, TProfiler>, execution, TProfiler> {
+template<ExecutionPolicy execution = ExecutionPolicy::singleThreaded, profiling::ProfilerLike TProfiler = profiling::null::Profiler, SchedulingPolicyLike TPolicy = RoundRobinPolicy>
+struct Simple : SchedulerBase<Simple<execution, TProfiler, TPolicy>, execution, TProfiler, TPolicy> {
     using Description = Doc<R""(Simple loop based Scheduler, which iterates over all blocks in the order they have beein defined and emplaced definition in the graph.)"">;
 
-    using SchedulerBase<Simple<execution, TProfiler>, execution, TProfiler>::SchedulerBase;
+    using SchedulerBase<Simple<execution, TProfiler, TPolicy>, execution, TProfiler, TPolicy>::SchedulerBase;
 
     void customInit() {
         [[maybe_unused]] const auto pe = this->_profilerHandler->startCompleteEvent("scheduler_simple.init");
@@ -1971,14 +1975,14 @@ inline void printExecutionOrder(const std::vector<std::vector<std::shared_ptr<Bl
 
 } // namespace detail
 
-template<ExecutionPolicy execution = ExecutionPolicy::singleThreaded, profiling::ProfilerLike TProfiler = profiling::null::Profiler>
-struct BreadthFirst : SchedulerBase<BreadthFirst<execution, TProfiler>, execution, TProfiler> {
+template<ExecutionPolicy execution = ExecutionPolicy::singleThreaded, profiling::ProfilerLike TProfiler = profiling::null::Profiler, SchedulingPolicyLike TPolicy = RoundRobinPolicy>
+struct BreadthFirst : SchedulerBase<BreadthFirst<execution, TProfiler, TPolicy>, execution, TProfiler, TPolicy> {
     using Description = Doc<R""(Breadth First Scheduler which traverses the graph starting from the source blocks in a breath first fashion
 detecting cycles and blocks which can be reached from several source blocks.)"">;
 
     static_assert(execution == ExecutionPolicy::singleThreaded || execution == ExecutionPolicy::multiThreaded, "Unsupported execution policy");
 
-    using SchedulerBase<BreadthFirst<execution, TProfiler>, execution, TProfiler>::SchedulerBase;
+    using SchedulerBase<BreadthFirst<execution, TProfiler, TPolicy>, execution, TProfiler, TPolicy>::SchedulerBase;
 
     void customInit() {
         /* implements Breadth-first search scheduling algorithm (https://en.wikipedia.org/wiki/Breadth-first_search)
@@ -2049,12 +2053,12 @@ detecting cycles and blocks which can be reached from several source blocks.)"">
     void customReset() { customInit(); }
 };
 
-template<ExecutionPolicy execution = ExecutionPolicy::singleThreaded, profiling::ProfilerLike TProfiler = profiling::null::Profiler>
-struct DepthFirst : SchedulerBase<DepthFirst<execution, TProfiler>, execution, TProfiler> {
+template<ExecutionPolicy execution = ExecutionPolicy::singleThreaded, profiling::ProfilerLike TProfiler = profiling::null::Profiler, SchedulingPolicyLike TPolicy = RoundRobinPolicy>
+struct DepthFirst : SchedulerBase<DepthFirst<execution, TProfiler, TPolicy>, execution, TProfiler, TPolicy> {
     using Description = Doc<R""(Depth First Scheduler which traverses the graph starting from the source blocks in a depth-first manner.)"">;
     static_assert(execution == ExecutionPolicy::singleThreaded || execution == ExecutionPolicy::multiThreaded, "Unsupported execution policy");
 
-    using SchedulerBase<DepthFirst<execution, TProfiler>, execution, TProfiler>::SchedulerBase;
+    using SchedulerBase<DepthFirst<execution, TProfiler, TPolicy>, execution, TProfiler, TPolicy>::SchedulerBase;
 
     void customInit() {
         /**
