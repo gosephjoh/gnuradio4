@@ -294,7 +294,17 @@ public:
     }
 
     std::span<const std::size_t> availableSamples(bool reset = false) {
-        if (_dirtyAvailable || reset) {
+        // `reset` must mark the caches dirty, not merely request an update: updateAvailable() early-returns on
+        // a clean cache, and the statistic is otherwise only invalidated when this block's own work() runs. A
+        // caller probing another block's occupancy (e.g. a readiness-scanning scheduler) would then see values
+        // frozen at that block's previous execution, not the samples its neighbours have published since. The
+        // config cache is refreshed too because the port masks capture isConnected(), which flips when edges
+        // are wired in start() -- after any cache populated during a scheduler's init would have frozen it.
+        if (reset) {
+            _dirtyConfig    = true;
+            _dirtyAvailable = true;
+        }
+        if (_dirtyAvailable) {
             updateAvailable();
         }
         assert(!_dirtyAvailable);
