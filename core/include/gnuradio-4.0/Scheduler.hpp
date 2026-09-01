@@ -1681,6 +1681,13 @@ protected:
         MovedBlockList& ourMovedBlockList = _movedBlocks[runnerID];
         std::lock_guard lockGuard(*ourMovedBlockList.mutex);
 
+        if (ourMovedBlockList.blocks.empty()) {
+            // Nothing was moved away from this worker, which is the overwhelmingly common case. Both sets
+            // below would then be built and thrown away without removing anything, so skip them: a policy
+            // that dispatches one block per pass pays this per work() call rather than per sweep.
+            return;
+        }
+
         auto ourMovedBlockListSet = ourMovedBlockList.blocks | std::ranges::to<std::unordered_set>();
         auto localBlockListSet    = localBlockList | std::ranges::to<std::unordered_set>();
 

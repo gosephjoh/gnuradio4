@@ -4,15 +4,40 @@
 #include <algorithm>
 #include <concepts>
 #include <cstddef>
+#include <cstdint>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <numeric>
 #include <string_view>
+#include <tuple>
 #include <vector>
 
 #include <gnuradio-4.0/BlockModel.hpp>
 
 namespace gr::scheduler {
+
+/// Per-block fixed-priority annotation. Smaller values are more urgent; an omitted priority sorts last.
+inline constexpr std::string_view kPriorityKey = "gr:priority";
+
+/**
+ * @brief Reads a block's fixed-priority annotation from its metadata.
+ *
+ * Cold path only: the result belongs in `SchedState::priority` once the schedule is formed. Reading it per
+ * selection costs a string-keyed hash lookup on every candidate of every dispatch pass, which dominates the
+ * decision itself at small batch sizes.
+ *
+ * N.B. `(*it).second` is bound to the non-owning 8-byte `ValueView`; materialising an owning `pmt::Value`
+ * here would allocate from the polymorphic memory resource just to read one integer.
+ */
+[[nodiscard]] inline std::int64_t readFixedPriority(const BlockModel& block) {
+    const auto& meta = block.metaInformation();
+    if (const auto it = meta.find(kPriorityKey); it != meta.end()) {
+        const auto entry = (*it).second;
+        return entry.value_or<std::int64_t>(std::numeric_limits<std::int64_t>::max());
+    }
+    return std::numeric_limits<std::int64_t>::max();
+}
 
 /**
  * @brief Per-block scheduling state, held by the worker alongside its block list.
@@ -22,7 +47,10 @@ namespace gr::scheduler {
  * Deadline- and priority-carrying fields are to be added alongside relevant policies.
  */
 struct SchedState {
-    std::size_t index = 0UZ;
+    std::size_t   index              = 0UZ;
+    std::int64_t  absoluteDeadlineNs = std::numeric_limits<std::int64_t>::max();
+    std::uint64_t releaseOrder       = std::numeric_limits<std::uint64_t>::max();
+    std::int64_t  priority           = std::numeric_limits<std::int64_t>::max();
 };
 
 /**
@@ -65,6 +93,39 @@ struct RoundRobinPolicy {
 
 static_assert(SchedulingPolicyLike<RoundRobinPolicy>);
 
+/**
+ * @brief Dynamic earliest-deadline-first ordering for released jobs.
+ *
+ * The job-aware scheduler supplies the absolute deadline and release sequence in `SchedState`.
+ * Release order and then graph order make simultaneous deadlines deterministic.
+ */
+struct EarliestDeadlineFirstPolicy {
+    static constexpr std::string_view kName           = "EarliestDeadlineFirst";
+    static constexpr bool             kStaticPriority = false;
+    static constexpr bool             kNeedsRelease   = true;
+
+    [[nodiscard]] constexpr auto key(const BlockModel& /*block*/, const SchedState& state) const noexcept {
+        return std::tuple{state.absoluteDeadlineNs, state.releaseOrder, state.index};
+    }
+};
+
+/**
+ * @brief Static, non-preemptive fixed-priority ordering for released jobs.
+ *
+ * A smaller `gr:priority` value is more urgent. Unannotated blocks run after annotated blocks,
+ * with graph order providing a deterministic tie-breaker.
+ */
+struct FixedPriorityPolicy {
+    static constexpr std::string_view kName           = "FixedPriority";
+    static constexpr bool             kStaticPriority = true;
+    static constexpr bool             kNeedsRelease   = true;
+
+    [[nodiscard]] constexpr auto key(const BlockModel& /*block*/, const SchedState& state) const noexcept { return std::pair{state.priority, state.index}; }
+};
+
+static_assert(SchedulingPolicyLike<EarliestDeadlineFirstPolicy>);
+static_assert(SchedulingPolicyLike<FixedPriorityPolicy>);
+
 namespace detail {
 
 /**
@@ -86,7 +147,14 @@ void applyStaticOrder(std::vector<std::shared_ptr<BlockModel>>& blocks) {
         std::vector<std::size_t> order(blocks.size());
         std::iota(order.begin(), order.end(), 0UZ);
 
-        const auto keyAt = [&policy, &blocks](std::size_t position) { return policy.key(*blocks[position], SchedState{.index = position}); };
+        // resolve each block's static key once here rather than O(N log N) times inside the comparator
+        std::vector<SchedState> states;
+        states.reserve(blocks.size());
+        for (std::size_t position = 0UZ; position < blocks.size(); ++position) {
+            states.push_back(SchedState{.index = position, .priority = readFixedPriority(*blocks[position])});
+        }
+
+        const auto keyAt = [&policy, &blocks, &states](std::size_t position) { return policy.key(*blocks[position], states[position]); };
         std::ranges::sort(order, [&keyAt](std::size_t lhs, std::size_t rhs) {
             const auto lhsKey = keyAt(lhs);
             const auto rhsKey = keyAt(rhs);
