@@ -654,7 +654,7 @@ public:
     requires(executionPolicy() == ExecutionPolicy::externalStep)
     {
         processScheduledMessages();
-        return traverseBlockListOnce((*_executionOrder)[0]);
+        return static_cast<Derived*>(this)->dispatchOnce(0UZ, (*_executionOrder)[0]);
     }
 
     /*
@@ -737,6 +737,10 @@ protected:
 #endif
         return {max_work_items, performedWorkAllBlocks, unfinishedBlocksExist ? work::Status::OK : work::Status::DONE};
     }
+
+    // customisation point for one dispatch pass over a worker's block list; the default keeps the historic
+    // round-robin. runnerID identifies the calling worker so that overrides can key per-worker state without locking.
+    work::Result dispatchOnce(std::size_t /*runnerID*/, const std::vector<std::shared_ptr<BlockModel>>& blocks) { return traverseBlockListOnce(blocks); }
 
     void init() {
         [[maybe_unused]] const auto pe = _profilerHandler->startCompleteEvent("scheduler_base.init");
@@ -929,7 +933,7 @@ protected:
                     cleanupRemovedBlocks(runnerID, localBlockList);
                     idleUntilAdoption = localBlockList.empty();
                     if (!idleUntilAdoption) {
-                        gr::work::Result result = traverseBlockListOnce(localBlockList);
+                        gr::work::Result result = static_cast<Derived*>(this)->dispatchOnce(runnerID, localBlockList);
                         if (result.status == work::Status::DONE) {
                             break; // nothing happened -> shutdown this worker
                         } else if (result.status == work::Status::ERROR) {
