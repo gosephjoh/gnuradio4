@@ -224,6 +224,16 @@ protected:
     std::vector<gr::Message> _pendingMessagesToChildren;
     bool                     _messagePortsConnected = false;
 
+    /// Per-block scheduling state, mirroring `_executionOrder`'s shape and rebuilt with it under
+    /// `_executionOrderMutex`. Built during setup so that `step()` -- which has no worker-local
+    /// storage and must not allocate -- can index it directly.
+    std::vector<std::vector<SchedState>> _schedStates{};
+
+    /// Multiplier applied to the block count when `max_selections_per_pass` is left at auto. A
+    /// tunable heuristic, not a derived quantity: larger favours fidelity to the priority order,
+    /// smaller bounds how long message handling, adoption and lifecycle transitions wait.
+    static constexpr std::size_t kDefaultSelectionMultiplier = 4UZ;
+
     std::atomic_flag _processingScheduledMessages;
     bool             _workQuiescenceRequested{false};
     std::size_t      _nWorkersInWork{0};
@@ -264,13 +274,61 @@ public:
     Annotated<std::size_t, "max_work_items", Doc<"number of work items per work scheduling interval (controls latency)">>                                                                                                                                                      max_work_items                  = std::numeric_limits<std::size_t>::max(); // TODO: check whether we can keep this std::size_t or more consistently to gr::Size_t
     Annotated<property_map, "sched_settings", Doc<"scheduler implementation specific settings">>                                                                                                                                                                               sched_settings{};
 
-    GR_MAKE_REFLECTABLE(SchedulerBase, timeout_ms, watchdog_timeout, timeout_inactivity_count, process_stream_to_message_ratio, house_keeping_policy, house_keeping_depth, max_work_items, poolName, sched_settings);
+    Annotated<gr::Size_t, "max_selections_per_pass", Doc<"priority-class policies: cap on successful work() calls before returning to house-keeping (0: auto = 4 x block count)">> max_selections_per_pass = 0U;
+
+    GR_MAKE_REFLECTABLE(SchedulerBase, timeout_ms, watchdog_timeout, timeout_inactivity_count, process_stream_to_message_ratio, house_keeping_policy, house_keeping_depth, max_work_items, max_selections_per_pass, poolName, sched_settings);
 
     constexpr static block::Category blockCategory = block::Category::ScheduledBlockGroup;
 
     [[nodiscard]] static constexpr auto executionPolicy() { return execution; }
 
     [[nodiscard]] static constexpr std::string_view schedulingPolicyName() { return TPolicy::kName; }
+
+    /// Resolves each block's cached scheduling state from its own settings. A block declares its
+    /// priority with `sched_priority` and its batch ceiling with `max_batch_size`; `0` means unset,
+    /// in which case the scheduler's own `max_work_items` applies.
+    void syncSchedStates(const std::vector<std::shared_ptr<BlockModel>>& blocks, std::vector<SchedState>& states) const {
+        states.resize(blocks.size());
+        for (std::size_t i = 0UZ; i < blocks.size(); ++i) {
+            const auto settingOr = [&block = *blocks[i]]<typename T>(const std::string& key, T fallback) -> T {
+                const std::optional<Value> value = block.settings().get(key);
+                if (!value.has_value()) {
+                    return fallback;
+                }
+                const auto* typed = value->get_if<T>();
+                return typed == nullptr ? fallback : *typed;
+            };
+
+            const std::int32_t userPriority = settingOr.template operator()<std::int32_t>("sched_priority", 0);
+            const gr::Size_t blockCeiling   = settingOr.template operator()<gr::Size_t>("max_batch_size", 0U);
+
+            states[i] = SchedState{.index = i,                                                                                                      //
+                .batchCeiling             = blockCeiling == 0U ? static_cast<std::size_t>(max_work_items) : static_cast<std::size_t>(blockCeiling), //
+                .priority                 = userPriority,
+                .userPriority             = userPriority};
+        }
+    }
+
+    void rebuildSchedStates() {
+        std::lock_guard lock(_executionOrderMutex);
+        if (!_executionOrder) {
+            _schedStates.clear();
+            return;
+        }
+        _schedStates.resize(_executionOrder->size());
+        for (std::size_t job = 0UZ; job < _executionOrder->size(); ++job) {
+            syncSchedStates((*_executionOrder)[job], _schedStates[job]);
+
+            // Order the *shared* list too, not only the worker-local copies. `step()` executes
+            // `(*_executionOrder)[0]` directly and has no worker-local copy to order, so without
+            // this the same graph would run priority-ordered on the pool path and in registration
+            // order under `externalStep` -- a scheduler silently ignoring its own policy parameter.
+            // Done here because `applyStaticOrder` allocates and `step()` must not; init() is setup,
+            // which the no-heap contract exempts. Each job list is sorted independently: reordering
+            // *across* lists would override the assignment policy's grouping.
+            gr::scheduler::detail::applyStaticOrder<TPolicy>((*_executionOrder)[job], _schedStates[job]);
+        }
+    }
 
     void requestWorkQuiescence() {
         gr::atomic_ref(_workQuiescenceRequested).store_release(true);
@@ -654,7 +712,7 @@ public:
     requires(executionPolicy() == ExecutionPolicy::externalStep)
     {
         processScheduledMessages();
-        return traverseBlockListOnce((*_executionOrder)[0]);
+        return traverseBlockListOnce((*_executionOrder)[0], _schedStates.empty() ? std::span<SchedState>{} : std::span<SchedState>{_schedStates[0]});
     }
 
     /*
@@ -718,18 +776,75 @@ protected:
         return result;
     }
 
-    work::Result traverseBlockListOnce(const std::vector<std::shared_ptr<BlockModel>>& blocks) const {
-        const std::size_t requestedWorkAllBlocks = max_work_items;
-        std::size_t       performedWorkAllBlocks = 0UZ;
-        bool              unfinishedBlocksExist  = false; // i.e. at least one block returned OK, INSUFFICIENT_INPUT_ITEMS, or INSUFFICIENT_OUTPU_ITEMS
-        for (auto& currentBlock : blocks) {
-            const auto [requested_work, performed_work, status] = currentBlock->work(requestedWorkAllBlocks);
-            performedWorkAllBlocks += performed_work;
+    /// N.B. `states` is parallel to `blocks`; each entry supplies that block's batch ceiling.
+    /// Do not reach for `max_work_items` directly here -- routing every batch decision through the
+    /// resolver is what keeps the executor and the derivation from disagreeing (DEVLOG_M1 §14.2).
+    ///
+    /// Two loops, selected by the policy's `PriorityClass`:
+    ///
+    /// - **`none`** (round robin) sweeps the list once, calling `work()` on every block. Time
+    ///   sharing: each block gets one turn per pass.
+    /// - **`fixed`** selects the highest-priority *eligible* block each time, which is what
+    ///   fixed-priority scheduling means. The list is already priority-sorted, so "highest
+    ///   priority eligible" is "the earliest index that can run".
+    work::Result traverseBlockListOnce(const std::vector<std::shared_ptr<BlockModel>>& blocks, std::span<SchedState> states) const {
+        std::size_t performedWorkAllBlocks = 0UZ;
+        bool        unfinishedBlocksExist  = false; // i.e. at least one block returned OK, INSUFFICIENT_INPUT_ITEMS, or INSUFFICIENT_OUTPU_ITEMS
 
-            if (status == work::Status::ERROR) {
-                return {requested_work, performedWorkAllBlocks, work::Status::ERROR};
-            } else if (status != work::Status::DONE) {
+        const auto ceilingFor = [&](std::size_t i) { return i < states.size() ? states[i].batchCeiling : static_cast<std::size_t>(max_work_items); };
+
+        if constexpr (!selectsByPriority(TPolicy::kPriorityClass)) {
+            for (std::size_t i = 0UZ; i < blocks.size(); ++i) {
+                const auto [requested_work, performed_work, status] = blocks[i]->work(ceilingFor(i));
+                performedWorkAllBlocks += performed_work;
+
+                if (status == work::Status::ERROR) {
+                    return {requested_work, performedWorkAllBlocks, work::Status::ERROR};
+                } else if (status != work::Status::DONE) {
+                    unfinishedBlocksExist = true;
+                }
+            }
+        } else {
+            // Selection loop. `work()` doubles as the eligibility oracle: a block that cannot run
+            // returns performed_work == 0 with an INSUFFICIENT_* status, which is a cheap near-no-op
+            // (§2.1). That is why this needs no readiness query -- Tier 1 (§2.2) adds one to remove
+            // the *probing*, not to make selection possible.
+            //
+            // The bound is what keeps the worker responsive: house-keeping, message handling,
+            // adoption and lifecycle checks all live between passes, so an unbounded loop would not
+            // merely starve low-priority blocks, it would hang the worker.
+            const std::size_t nBlocks    = blocks.size();
+            const std::size_t bound      = max_selections_per_pass == 0U ? kDefaultSelectionMultiplier * nBlocks : static_cast<std::size_t>(max_selections_per_pass);
+            std::size_t       selections = 0UZ;
+            std::size_t       index      = 0UZ;
+
+            while (index < nBlocks && selections < bound) {
+                if (index < states.size() && states[index].finished) {
+                    ++index; // already DONE: skipped by marker rather than compacted out of the list
+                    continue;
+                }
+
+                const auto [requested_work, performed_work, status] = blocks[index]->work(ceilingFor(index));
+                performedWorkAllBlocks += performed_work;
+
+                if (status == work::Status::ERROR) {
+                    return {requested_work, performedWorkAllBlocks, work::Status::ERROR};
+                }
+                if (status == work::Status::DONE) {
+                    if (index < states.size()) {
+                        states[index].finished = true;
+                    }
+                    ++index;
+                    continue;
+                }
+
                 unfinishedBlocksExist = true;
+                if (performed_work > 0UZ) {
+                    ++selections;
+                    index = 0UZ; // strict restart: a still-runnable higher-priority block runs again
+                } else {
+                    ++index; // not eligible right now; try the next-highest priority
+                }
             }
         }
 #ifdef __EMSCRIPTEN__
@@ -746,6 +861,8 @@ protected:
         if constexpr (requires(Derived& d) { d.customInit(); }) {
             static_cast<Derived*>(this)->customInit();
         }
+
+        rebuildSchedStates();
     }
 
     void reset() {
@@ -855,7 +972,9 @@ protected:
             localBlockList.reserve(blocks.size());
             std::ranges::copy(blocks, std::back_inserter(localBlockList));
         }
-        detail::applyStaticOrder<TPolicy>(localBlockList); // no-op for RoundRobinPolicy: its key is the position itself
+        std::vector<SchedState> localStates;
+        syncSchedStates(localBlockList, localStates);
+        gr::scheduler::detail::applyStaticOrder<TPolicy>(localBlockList, localStates); // no-op for RoundRobinPolicy: its key is the position itself
 
         if (localBlockList.empty()) {
             return;
@@ -902,6 +1021,18 @@ protected:
 
                     adoptBlocks(runnerID, localBlockList);
 
+                    // Removal, zombie cleanup and adoption all mutate `localBlockList`, so the
+                    // parallel state must be re-derived before it is indexed again. Unconditionally:
+                    // a removal and an adoption in the same pass leave the size unchanged while the
+                    // *contents* differ, so a size comparison would silently hand each block its
+                    // neighbour's ceiling. This runs on the house-keeping cadence, not per pass.
+                    syncSchedStates(localBlockList, localStates);
+
+                    // Re-order after the mutations (the M0 obligation): adoption appends to the end
+                    // of the list, so without this a newly adopted block would run last whatever
+                    // its priority. A no-op for `RoundRobinPolicy`, whose key is the position.
+                    gr::scheduler::detail::applyStaticOrder<TPolicy>(localBlockList, localStates);
+
                     std::ranges::for_each(localBlockList, &BlockModel::processScheduledMessages);
                     // Buffer housekeeping rides the same cadence as message handling. Light skips
                     // the scheduler-driven trigger entirely (intrinsic writer-pressure path still
@@ -929,7 +1060,7 @@ protected:
                     cleanupRemovedBlocks(runnerID, localBlockList);
                     idleUntilAdoption = localBlockList.empty();
                     if (!idleUntilAdoption) {
-                        gr::work::Result result = traverseBlockListOnce(localBlockList);
+                        gr::work::Result result = traverseBlockListOnce(localBlockList, localStates);
                         if (result.status == work::Status::DONE) {
                             break; // nothing happened -> shutdown this worker
                         } else if (result.status == work::Status::ERROR) {
