@@ -1121,6 +1121,116 @@ const boost::ut::suite TopologyGraphTests = [] {
 };
 
 /// old tests, from the time graph handled messages. They're still good
+/// Records the largest input span it is handed. Used to observe the batch ceiling the scheduler
+/// actually requested, which is the only externally visible consequence of the per-block state
+/// staying aligned with the worker's block list.
+template<typename T>
+struct BatchCeilingProbe : gr::Block<BatchCeilingProbe<T>> {
+    gr::PortIn<T>  in;
+    gr::PortOut<T> out;
+
+    GR_MAKE_REFLECTABLE(BatchCeilingProbe, in, out);
+
+    std::atomic<std::size_t> maxSeen{0UZ};
+
+    gr::work::Status processBulk(gr::InputSpanLike auto& input, gr::OutputSpanLike auto& output) noexcept {
+        const std::size_t n        = std::min(input.size(), output.size());
+        std::size_t       previous = maxSeen.load(std::memory_order_relaxed);
+        while (n > previous && !maxSeen.compare_exchange_weak(previous, n, std::memory_order_relaxed)) {
+        }
+        output.publish(n);
+        std::ignore = input.consume(n);
+        return gr::work::Status::OK;
+    }
+};
+
+const boost::ut::suite SchedulingStateAlignmentTests = [] {
+    using namespace boost::ut;
+    using namespace gr;
+    using namespace gr::testing;
+    using enum gr::message::Command;
+
+    "a same-pass removal and adoption keeps each block's batch ceiling"_test = [] {
+        // DEVLOG_M1 §14.14.1. `cleanupRemovedBlocks`, `cleanupZombieBlocks` and `adoptBlocks` all
+        // run in one house-keeping pass, so a removal *and* an adoption together leave the worker's
+        // block list the same length while its contents shift. A resync guarded on size therefore
+        // does nothing, and every block past the removal point is handed its neighbour's ceiling.
+        //
+        // `victim` is inserted before the probe so removing it shifts the probe down one slot; the
+        // emplaced block restores the length. With the size-guarded resync the probe inherits the
+        // unbounded ceiling of the block that used to precede it and is handed far more than 8
+        // samples.
+        gr::Graph flow;
+        auto&     victim = flow.emplaceBlock<gr::testing::Copy<float>>({{"name", std::string("victim")}});
+        auto&     src    = flow.emplaceBlock<gr::testing::ConstantSource<float>>({{"n_samples_max", gr::Size_t{200000}}});
+        auto&     probe  = flow.emplaceBlock<BatchCeilingProbe<float>>({{"max_batch_size", gr::Size_t{8}}});
+        auto&     sink   = flow.emplaceBlock<gr::testing::NullSink<float>>();
+        expect(flow.connect<"out", "in">(src, probe).has_value());
+        expect(flow.connect<"out", "in">(probe, sink).has_value());
+
+        const std::string victimName = victim.unique_name;
+        auto*             probePtr   = std::addressof(probe);
+
+        TestScheduler<> scheduler(std::move(flow), false);
+
+        // Both messages are queued before either reply is awaited, so the scheduler stages the
+        // removal and the adoption together and one house-keeping pass applies both.
+        sendMessage<Set>(scheduler.toScheduler, scheduler.scheduler().unique_name, scheduler::property::kEmplaceBlock, {{"type", "gr::testing::Copy<float32>"}, {"properties", property_map{}}});
+        sendMessage<Set>(scheduler.toScheduler, scheduler.scheduler().unique_name, scheduler::property::kRemoveBlock, {{"uniqueName", victimName}});
+
+        expect(waitForReply(scheduler.fromScheduler, ReplyChecker{.expectedEndpoint = scheduler::property::kBlockEmplaced}, 2s).has_value()) << "the adoption must be acknowledged";
+        expect(waitForReply(scheduler.fromScheduler, ReplyChecker{.expectedEndpoint = scheduler::property::kBlockRemoved}, 2s).has_value()) << "the removal must be acknowledged";
+
+        // let the graph run on past the mutation so the probe observes post-resync batches
+        std::this_thread::sleep_for(200ms);
+        const std::size_t seen = probePtr->maxSeen.load(std::memory_order_relaxed);
+        scheduler.stop();
+
+        expect(seen > 0UZ) << "the probe must have run";
+        expect(le(seen, 8UZ)) << std::format("the probe's own ceiling of 8 must survive a same-pass remove+adopt, saw {}", seen);
+    };
+};
+
+const boost::ut::suite AdoptedBlockSchedulingTests = [] {
+    using namespace boost::ut;
+    using namespace gr;
+    using namespace gr::testing;
+    using enum gr::message::Command;
+
+    "a block adopted at run time is absent from the scheduling analysis"_test = [] {
+        // DEVLOG_M1 §14.14.7 / §14.21. `refreshSchedulingAnalysis()` runs from `init()` only, and a
+        // running scheduler never re-enters it -- so a block adopted at run time stays absent from
+        // the analysis for the remainder of the run, not "until the next refresh".
+        //
+        // This pins the *precondition* of the adopted-block fallback. If adoption ever gains a
+        // re-derivation, this test fails and points at the note explaining why the fallback exists.
+        TestScheduler<> scheduler(gr::Graph{});
+
+        sendMessage<Set>(scheduler.toScheduler, scheduler.scheduler().unique_name, scheduler::property::kEmplaceBlock, //
+            {{"type", "gr::testing::Copy<float32>"}, {"properties", property_map{{"max_batch_size", gr::Size_t{8}}}}});
+
+        const std::optional<Message> reply = waitForReply(scheduler.fromScheduler, ReplyChecker{.expectedEndpoint = scheduler::property::kBlockEmplaced}, 2s);
+        expect(reply.has_value() && reply->data.has_value()) << fatal << "the block must be emplaced";
+        const std::string adoptedName(reply->data.value().value_or<std::string_view>("unique_name", std::string_view{}));
+        expect(!adoptedName.empty()) << fatal;
+
+        const auto adopted = graph::findBlock(scheduler.graph(), std::string_view(adoptedName));
+        expect(adopted.has_value()) << fatal << "the adopted block must be in the graph";
+
+        expect(scheduler.scheduler().schedulingAnalysis().find(*adopted.value()) == nullptr) //
+            << "the analysis is derived at init() and is not re-run for a block adopted later";
+
+        // ... and its own ceiling survived the emplacement, so the fallback has something to honour
+        const auto ceiling = adopted.value()->settings().get("max_batch_size");
+        expect(ceiling.has_value()) << fatal << "the adopted block must carry the requested setting";
+        const auto* ceilingValue = ceiling.value().get_if<gr::Size_t>();
+        expect(ceilingValue != nullptr) << fatal << "the setting must round-trip as gr::Size_t";
+        expect(eq(*ceilingValue, gr::Size_t{8})) << "an explicit per-block ceiling must survive emplacement, or there is nothing for the fallback to resolve";
+
+        scheduler.stop();
+    };
+};
+
 const boost::ut::suite MoreTopologyGraphTests = [] {
     using namespace std::string_literals;
     using namespace boost::ut;

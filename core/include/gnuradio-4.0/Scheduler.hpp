@@ -18,6 +18,7 @@
 #include <gnuradio-4.0/Port.hpp>
 #include <gnuradio-4.0/Profiler.hpp>
 #include <gnuradio-4.0/SchedulerModel.hpp> // nested-scheduler dispatch (detail::asSchedulerModel)
+#include <gnuradio-4.0/SchedulingAnalysis.hpp>
 #include <gnuradio-4.0/SchedulingPolicy.hpp>
 #include <gnuradio-4.0/meta/indirect.hpp>
 #include <gnuradio-4.0/meta/reflection.hpp>
@@ -224,6 +225,9 @@ protected:
     std::vector<gr::Message> _pendingMessagesToChildren;
     bool                     _messagePortsConnected = false;
 
+    std::shared_ptr<BatchStrategy> _batchStrategy = std::make_shared<NominalBatchStrategy>();
+    SchedulingAnalysis             _schedulingAnalysis{};
+
     /// Per-block scheduling state, mirroring `_executionOrder`'s shape and rebuilt with it under
     /// `_executionOrderMutex`. Built during setup so that `step()` -- which has no worker-local
     /// storage and must not allocate -- can index it directly.
@@ -284,28 +288,70 @@ public:
 
     [[nodiscard]] static constexpr std::string_view schedulingPolicyName() { return TPolicy::kName; }
 
-    /// Resolves each block's cached scheduling state from its own settings. A block declares its
-    /// priority with `sched_priority` and its batch ceiling with `max_batch_size`; `0` means unset,
-    /// in which case the scheduler's own `max_work_items` applies.
+    /// Per-block periods/deadlines/priorities derived at init(); empty until the graph is initialised.
+    [[nodiscard]] const SchedulingAnalysis& schedulingAnalysis() const noexcept { return _schedulingAnalysis; }
+
+    /// Replaces the batch-operating-point strategy; takes effect at the next init()/refresh.
+    void setBatchStrategy(std::shared_ptr<BatchStrategy> strategy) {
+        if (strategy) {
+            _batchStrategy = std::move(strategy);
+        }
+    }
+
+    /**
+     * Re-derives the scheduling attributes for the current graph. Read-only with respect to the
+     * blocks: derived values are kept here rather than written back, so re-deriving on a later
+     * start() cannot mistake a previously derived value for one the user set.
+     */
+    void refreshSchedulingAnalysis() {
+        [[maybe_unused]] const auto pe = _profilerHandler->startCompleteEvent("scheduler_base.deriveSchedulingAttributes");
+
+        gr::Graph flatGraph = gr::graph::flatten(*_graph);
+
+        // sample which attributes the user set *before* deriving anything (see SchedulingAnalysis.hpp)
+        std::unordered_map<const BlockModel*, UserSetAttributes> userSet;
+        userSet.reserve(flatGraph.blocks().size());
+        for (const std::shared_ptr<BlockModel>& block : flatGraph.blocks()) {
+            userSet.emplace(block.get(), userSetFromSettings(*block));
+        }
+
+        _schedulingAnalysis = deriveSchedulingAttributes(
+            flatGraph, *_batchStrategy,
+            [&userSet](const BlockModel& block) {
+                const auto it = userSet.find(std::addressof(block));
+                return it == userSet.end() ? UserSetAttributes{} : it->second;
+            },
+            max_work_items); // the scheduler's own ceiling is what a block inherits when it sets none
+    }
+
+    /// Resolves each block's cached scheduling state from the analysis. A block the analysis does
+    /// not know -- one adopted at run time, after the last derivation -- falls back to the
+    /// scheduler's own ceiling, which is what every block received before per-block batches existed.
     void syncSchedStates(const std::vector<std::shared_ptr<BlockModel>>& blocks, std::vector<SchedState>& states) const {
         states.resize(blocks.size());
         for (std::size_t i = 0UZ; i < blocks.size(); ++i) {
-            const auto settingOr = [&block = *blocks[i]]<typename T>(const std::string& key, T fallback) -> T {
-                const std::optional<Value> value = block.settings().get(key);
-                if (!value.has_value()) {
-                    return fallback;
-                }
-                const auto* typed = value->get_if<T>();
-                return typed == nullptr ? fallback : *typed;
-            };
+            // The user's own declaration is block-local, so it survives adoption intact -- which is
+            // what makes an *absolute* priority scheme exact for adopted blocks where a
+            // rate-monotonic one cannot be (DEVLOG_M2 §3.2).
+            const std::int32_t userPriority = static_cast<std::int32_t>(gr::scheduler::detail::settingAsDouble(*blocks[i], "sched_priority", 0.0));
 
-            const std::int32_t userPriority = settingOr.template operator()<std::int32_t>("sched_priority", 0);
-            const gr::Size_t blockCeiling   = settingOr.template operator()<gr::Size_t>("max_batch_size", 0U);
-
-            states[i] = SchedState{.index = i,                                                                                                      //
-                .batchCeiling             = blockCeiling == 0U ? static_cast<std::size_t>(max_work_items) : static_cast<std::size_t>(blockCeiling), //
-                .priority                 = userPriority,
-                .userPriority             = userPriority};
+            std::size_t  ceiling  = kUnboundedBatch;
+            std::int32_t priority = userPriority; // a derived rank needs the graph; absent one, the user's value or 0
+            if (const DerivedAttributes* attributes = _schedulingAnalysis.find(*blocks[i]); attributes != nullptr) {
+                ceiling  = attributes->executionCeiling;
+                priority = attributes->priority;
+            } else {
+                // A block adopted at run time is absent from the analysis, and stays absent: the
+                // derivation runs from init() only, which a running scheduler never re-enters. So
+                // resolve its ceiling directly rather than handing it the scheduler's -- every
+                // input to `executionCeiling` is block-local (its own `max_batch_size`, the
+                // scheduler ceiling, its own ports), so no graph pass is needed. Falling back to
+                // `max_work_items` would silently discard an explicit per-block ceiling for the
+                // rest of the run, breaking "user-set values always win" (§4.2) for exactly the
+                // blocks whose configuration arrived most recently.
+                ceiling = _batchStrategy->resolve(*blocks[i], static_cast<std::size_t>(max_work_items)).executionCeiling;
+            }
+            states[i] = SchedState{.index = i, .batchCeiling = ceiling, .priority = priority, .userPriority = userPriority};
         }
     }
 
@@ -862,6 +908,7 @@ protected:
             static_cast<Derived*>(this)->customInit();
         }
 
+        refreshSchedulingAnalysis();
         rebuildSchedStates();
     }
 
