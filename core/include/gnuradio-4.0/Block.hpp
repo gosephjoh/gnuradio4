@@ -712,6 +712,13 @@ public:
     A<bool, "disconnect on done", Doc<"If no downstream blocks, declare itself 'DONE' and disconnect from upstream blocks.">> disconnect_on_done = true;
     A<std::string, "compute domain", Doc<"compute domain/IO thread pool name">>                                               compute_domain     = gr::thread_pool::kDefaultIoPoolId;
 
+    // real-time scheduling attributes -- inert unless a scheduling policy reads them; 0 means "unset"
+    A<std::int32_t, "sched_priority", Doc<"static scheduling priority, larger = more urgent (0: unset)">>                                  sched_priority    = 0;
+    A<float, "period", Unit<"s">, Doc<"inter-release interval; derived from graph rates when 0 (0: unset)">>                               period            = 0.f;
+    A<float, "relative_deadline", Unit<"s">, Doc<"deadline measured from release; implicit (= period) when 0 (0: unset)">>                 relative_deadline = 0.f;
+    A<float, "wcet_estimate", Unit<"s">, Doc<"per-invocation execution cost; only measured or user-supplied, never derived (0: unknown)">> wcet_estimate     = 0.f;
+    A<gr::Size_t, "max_batch_size", Doc<"per-invocation batch ceiling; inherits the scheduler's max_work_items when 0 (0: unset)">>        max_batch_size    = 0U;
+
     gr::Size_t strideCounter = 0UL; // leftover stride from previous calls
 
     gr::meta::immutable<std::size_t>      unique_id   = gr::atomic_ref(_uniqueIdCounter).fetch_add(1UZ);
@@ -752,7 +759,7 @@ public:
     A<property_map, "ui-constraints", Doc<"store non-graph-processing information like UI block position etc.">>         ui_constraints;
     A<property_map, "meta-information", Doc<"store static non-graph-processing information like Annotated<> info etc.">> meta_information = initMetaInfo();
 
-    GR_MAKE_REFLECTABLE(Block, input_chunk_size, output_chunk_size, stride, disconnect_on_done, compute_domain, unique_name, name, ui_constraints);
+    GR_MAKE_REFLECTABLE(Block, input_chunk_size, output_chunk_size, stride, disconnect_on_done, compute_domain, sched_priority, period, relative_deadline, wcet_estimate, max_batch_size, unique_name, name, ui_constraints);
 
     // TODO: C++26 make sure these are not reflected
     // We support ports that are template parameters or reflected member variables,
