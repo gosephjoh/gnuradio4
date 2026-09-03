@@ -1,0 +1,45 @@
+cmake_minimum_required(VERSION 3.20)
+project(GR4Profile CXX)
+
+set(CMAKE_CXX_STANDARD 23)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+find_package(Python3 COMPONENTS Interpreter Development NumPy REQUIRED)
+find_package(gnuradio4 REQUIRED)
+
+add_executable(gr4_profile gr4_profile.cpp)
+target_link_libraries(gr4_profile PRIVATE gnuradio4::GrBasicBlocksShared)
+set(CMAKE_CXX_STANDARD_LIBRARIES "${CMAKE_CXX_STANDARD_LIBRARIES} /usr/local/lib/libgnuradio-blocklib-core.so")
+
+add_executable(gr4_nbfm_rx gr4_nbfm_rx.cpp)
+target_link_libraries(gr4_nbfm_rx PRIVATE gnuradio4::GrBasicBlocksShared gnuradio4::GrFilterBlocksShared)
+
+add_executable(gr4_builtin_graph gr4_builtin_graph.cpp)
+target_link_libraries(gr4_builtin_graph PRIVATE gnuradio4::GrBasicBlocksShared gnuradio4::GrFilterBlocksShared)
+
+add_executable(packet_modem_flowgraph packet_modem_flowgraph.cpp)
+target_link_libraries(packet_modem_flowgraph PRIVATE gnuradio4::GrBasicBlocksShared gnuradio4::GrFilterBlocksShared)
+
+add_executable(gr4_scheduler_benchmark gr4_scheduler_benchmark.cpp)
+target_link_libraries(gr4_scheduler_benchmark PRIVATE gnuradio4::GrBasicBlocksShared gnuradio4::GrFilterBlocksShared)
+
+add_executable(gr4_complex_scheduler_benchmark gr4_complex_scheduler_benchmark.cpp)
+target_link_libraries(gr4_complex_scheduler_benchmark PRIVATE gnuradio4::GrBasicBlocksShared gnuradio4::GrFilterBlocksShared)
+
+add_executable(gr4_all_blocks_profile gr4_all_blocks_profile.cpp)
+target_link_libraries(gr4_all_blocks_profile PRIVATE gnuradio4::GrBasicBlocksShared gnuradio4::GrFilterBlocksShared)
+
+add_executable(test_edf_scheduler test_edf_scheduler.cpp)
+target_link_libraries(test_edf_scheduler PRIVATE gnuradio4::GrBasicBlocksShared gnuradio4::GrFilterBlocksShared)
+
+
+
+# Tutorial executables
+add_executable(tutorial_minimal tutorial_minimal.cpp)
+target_link_libraries(tutorial_minimal PRIVATE gnuradio4::GrBasicBlocksShared)
+
+add_executable(tutorial_block_parameters tutorial_block_parameters.cpp)
+target_link_libraries(tutorial_block_parameters PRIVATE gnuradio4::GrBasicBlocksShared)
+
+add_executable(tutorial_stop_flowgraph tutorial_stop_flowgraph.cpp)
+target_link_libraries(tutorial_stop_flowgraph PRIVATE gnuradio4::GrBasicBlocksShared)

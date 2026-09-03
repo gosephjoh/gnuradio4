@@ -1,0 +1,1001 @@
+Run_ID,Scheduler_Name,Execution_Time_ms,Throughput_MSps
+1,"Simple (Single-Threaded)",397.9260,15.0782
+2,"Simple (Single-Threaded)",408.5680,14.6854
+3,"Simple (Single-Threaded)",387.1830,15.4965
+4,"Simple (Single-Threaded)",386.0790,15.5409
+5,"Simple (Single-Threaded)",396.4340,15.1349
+6,"Simple (Single-Threaded)",391.2120,15.3370
+7,"Simple (Single-Threaded)",395.5560,15.1685
+8,"Simple (Single-Threaded)",395.6700,15.1642
+9,"Simple (Single-Threaded)",388.4090,15.4476
+10,"Simple (Single-Threaded)",390.5660,15.3623
+11,"Simple (Single-Threaded)",396.3690,15.1374
+12,"Simple (Single-Threaded)",388.8950,15.4283
+13,"Simple (Single-Threaded)",390.8410,15.3515
+14,"Simple (Single-Threaded)",395.0850,15.1866
+15,"Simple (Single-Threaded)",398.6230,15.0518
+16,"Simple (Single-Threaded)",398.6690,15.0501
+17,"Simple (Single-Threaded)",391.1690,15.3386
+18,"Simple (Single-Threaded)",393.7180,15.2393
+19,"Simple (Single-Threaded)",392.7490,15.2769
+20,"Simple (Single-Threaded)",395.8430,15.1575
+21,"Simple (Single-Threaded)",394.2440,15.2190
+22,"Simple (Single-Threaded)",393.6180,15.2432
+23,"Simple (Single-Threaded)",439.9820,13.6369
+24,"Simple (Single-Threaded)",390.6840,15.3577
+25,"Simple (Single-Threaded)",391.6610,15.3194
+26,"Simple (Single-Threaded)",386.7940,15.5121
+27,"Simple (Single-Threaded)",388.3040,15.4518
+28,"Simple (Single-Threaded)",388.7670,15.4334
+29,"Simple (Single-Threaded)",405.2840,14.8044
+30,"Simple (Single-Threaded)",388.7640,15.4335
+31,"Simple (Single-Threaded)",392.4010,15.2905
+32,"Simple (Single-Threaded)",388.5830,15.4407
+33,"Simple (Single-Threaded)",389.3920,15.4086
+34,"Simple (Single-Threaded)",392.5720,15.2838
+35,"Simple (Single-Threaded)",389.9740,15.3856
+36,"Simple (Single-Threaded)",390.8030,15.3530
+37,"Simple (Single-Threaded)",389.3350,15.4109
+38,"Simple (Single-Threaded)",389.9490,15.3866
+39,"Simple (Single-Threaded)",396.2130,15.1434
+40,"Simple (Single-Threaded)",397.9400,15.0776
+41,"Simple (Single-Threaded)",391.4850,15.3263
+42,"Simple (Single-Threaded)",399.9150,15.0032
+43,"Simple (Single-Threaded)",392.7100,15.2784
+44,"Simple (Single-Threaded)",408.0740,14.7032
+45,"Simple (Single-Threaded)",408.6400,14.6829
+46,"Simple (Single-Threaded)",453.0070,13.2448
+47,"Simple (Single-Threaded)",461.8430,12.9914
+48,"Simple (Single-Threaded)",395.0140,15.1893
+49,"Simple (Single-Threaded)",556.5420,10.7809
+50,"Simple (Single-Threaded)",405.1930,14.8078
+51,"Simple (Single-Threaded)",418.0340,14.3529
+52,"Simple (Single-Threaded)",611.2430,9.8161
+53,"Simple (Single-Threaded)",440.4860,13.6213
+54,"Simple (Single-Threaded)",573.4380,10.4632
+55,"Simple (Single-Threaded)",492.1660,12.1910
+56,"Simple (Single-Threaded)",461.5470,12.9998
+57,"Simple (Single-Threaded)",406.7300,14.7518
+58,"Simple (Single-Threaded)",675.7300,8.8793
+59,"Simple (Single-Threaded)",602.2460,9.9627
+60,"Simple (Single-Threaded)",399.8920,15.0041
+61,"Simple (Single-Threaded)",419.1970,14.3131
+62,"Simple (Single-Threaded)",459.0940,13.0692
+63,"Simple (Single-Threaded)",638.3780,9.3988
+64,"Simple (Single-Threaded)",493.8500,12.1494
+65,"Simple (Single-Threaded)",443.9990,13.5135
+66,"Simple (Single-Threaded)",444.9570,13.4844
+67,"Simple (Single-Threaded)",497.7820,12.0535
+68,"Simple (Single-Threaded)",600.2640,9.9956
+69,"Simple (Single-Threaded)",425.4250,14.1035
+70,"Simple (Single-Threaded)",667.9020,8.9834
+71,"Simple (Single-Threaded)",584.5650,10.2640
+72,"Simple (Single-Threaded)",393.4540,15.2496
+73,"Simple (Single-Threaded)",448.0300,13.3920
+74,"Simple (Single-Threaded)",493.8660,12.1490
+75,"Simple (Single-Threaded)",628.0790,9.5529
+76,"Simple (Single-Threaded)",396.6190,15.1279
+77,"Simple (Single-Threaded)",400.0580,14.9978
+78,"Simple (Single-Threaded)",401.4140,14.9472
+79,"Simple (Single-Threaded)",417.8970,14.3576
+80,"Simple (Single-Threaded)",561.5520,10.6847
+81,"Simple (Single-Threaded)",515.1840,11.6463
+82,"Simple (Single-Threaded)",525.9570,11.4078
+83,"Simple (Single-Threaded)",389.0950,15.4204
+84,"Simple (Single-Threaded)",550.1530,10.9061
+85,"Simple (Single-Threaded)",450.1480,13.3289
+86,"Simple (Single-Threaded)",682.4360,8.7920
+87,"Simple (Single-Threaded)",550.2110,10.9049
+88,"Simple (Single-Threaded)",451.7800,13.2808
+89,"Simple (Single-Threaded)",425.3460,14.1062
+90,"Simple (Single-Threaded)",413.3350,14.5161
+91,"Simple (Single-Threaded)",473.2620,12.6780
+92,"Simple (Single-Threaded)",566.2200,10.5966
+93,"Simple (Single-Threaded)",437.6550,13.7094
+94,"Simple (Single-Threaded)",602.2030,9.9634
+95,"Simple (Single-Threaded)",476.3900,12.5947
+96,"Simple (Single-Threaded)",466.8490,12.8521
+97,"Simple (Single-Threaded)",580.3230,10.3391
+98,"Simple (Single-Threaded)",405.9280,14.7809
+99,"Simple (Single-Threaded)",424.3270,14.1400
+100,"Simple (Single-Threaded)",422.4880,14.2016
+101,"Simple (Single-Threaded)",399.3740,15.0235
+102,"Simple (Single-Threaded)",413.6040,14.5066
+103,"Simple (Single-Threaded)",531.0390,11.2986
+104,"Simple (Single-Threaded)",579.0900,10.3611
+105,"Simple (Single-Threaded)",401.1310,14.9577
+106,"Simple (Single-Threaded)",776.2980,7.7290
+107,"Simple (Single-Threaded)",504.7000,11.8883
+108,"Simple (Single-Threaded)",487.8010,12.3001
+109,"Simple (Single-Threaded)",467.8010,12.8260
+110,"Simple (Single-Threaded)",445.9310,13.4550
+111,"Simple (Single-Threaded)",527.5380,11.3736
+112,"Simple (Single-Threaded)",568.8180,10.5482
+113,"Simple (Single-Threaded)",463.1250,12.9555
+114,"Simple (Single-Threaded)",415.0500,14.4561
+115,"Simple (Single-Threaded)",483.8670,12.4001
+116,"Simple (Single-Threaded)",466.6940,12.8564
+117,"Simple (Single-Threaded)",513.3430,11.6881
+118,"Simple (Single-Threaded)",422.9660,14.1855
+119,"Simple (Single-Threaded)",572.1150,10.4874
+120,"Simple (Single-Threaded)",399.0570,15.0354
+121,"Simple (Single-Threaded)",579.0820,10.3612
+122,"Simple (Single-Threaded)",571.7930,10.4933
+123,"Simple (Single-Threaded)",557.5480,10.7614
+124,"Simple (Single-Threaded)",654.9720,9.1607
+125,"Simple (Single-Threaded)",630.6770,9.5136
+126,"Simple (Single-Threaded)",444.8900,13.4865
+127,"Simple (Single-Threaded)",463.8480,12.9353
+128,"Simple (Single-Threaded)",431.6810,13.8992
+129,"Simple (Single-Threaded)",557.4330,10.7636
+130,"Simple (Single-Threaded)",486.6770,12.3285
+131,"Simple (Single-Threaded)",709.1860,8.4604
+132,"Simple (Single-Threaded)",427.1440,14.0468
+133,"Simple (Single-Threaded)",565.6780,10.6067
+134,"Simple (Single-Threaded)",582.2510,10.3048
+135,"Simple (Single-Threaded)",462.2950,12.9787
+136,"Simple (Single-Threaded)",577.0870,10.3970
+137,"Simple (Single-Threaded)",449.6780,13.3429
+138,"Simple (Single-Threaded)",415.2340,14.4497
+139,"Simple (Single-Threaded)",437.4420,13.7161
+140,"Simple (Single-Threaded)",559.3650,10.7264
+141,"Simple (Single-Threaded)",437.5420,13.7130
+142,"Simple (Single-Threaded)",467.2630,12.8407
+143,"Simple (Single-Threaded)",574.2370,10.4486
+144,"Simple (Single-Threaded)",596.0030,10.0671
+145,"Simple (Single-Threaded)",402.1490,14.9198
+146,"Simple (Single-Threaded)",462.0580,12.9854
+147,"Simple (Single-Threaded)",587.3930,10.2146
+148,"Simple (Single-Threaded)",629.9940,9.5239
+149,"Simple (Single-Threaded)",488.8810,12.2729
+150,"Simple (Single-Threaded)",585.7060,10.2440
+151,"Simple (Single-Threaded)",506.6040,11.8436
+152,"Simple (Single-Threaded)",539.3760,11.1240
+153,"Simple (Single-Threaded)",490.3430,12.2363
+154,"Simple (Single-Threaded)",612.7980,9.7912
+155,"Simple (Single-Threaded)",466.2400,12.8689
+156,"Simple (Single-Threaded)",464.0110,12.9307
+157,"Simple (Single-Threaded)",462.9840,12.9594
+158,"Simple (Single-Threaded)",402.6300,14.9020
+159,"Simple (Single-Threaded)",402.8720,14.8931
+160,"Simple (Single-Threaded)",522.8830,11.4748
+161,"Simple (Single-Threaded)",485.2490,12.3648
+162,"Simple (Single-Threaded)",536.0860,11.1922
+163,"Simple (Single-Threaded)",610.0230,9.8357
+164,"Simple (Single-Threaded)",555.8110,10.7950
+165,"Simple (Single-Threaded)",420.1130,14.2819
+166,"Simple (Single-Threaded)",488.1640,12.2910
+167,"Simple (Single-Threaded)",413.1850,14.5213
+168,"Simple (Single-Threaded)",495.3490,12.1127
+169,"Simple (Single-Threaded)",428.4200,14.0049
+170,"Simple (Single-Threaded)",644.8880,9.3039
+171,"Simple (Single-Threaded)",535.5160,11.2041
+172,"Simple (Single-Threaded)",422.2620,14.2092
+173,"Simple (Single-Threaded)",535.2500,11.2097
+174,"Simple (Single-Threaded)",567.8850,10.5655
+175,"Simple (Single-Threaded)",543.8350,11.0328
+176,"Simple (Single-Threaded)",586.5800,10.2288
+177,"Simple (Single-Threaded)",484.8120,12.3759
+178,"Simple (Single-Threaded)",558.8420,10.7365
+179,"Simple (Single-Threaded)",441.3530,13.5946
+180,"Simple (Single-Threaded)",394.9260,15.1927
+181,"Simple (Single-Threaded)",395.5870,15.1673
+182,"Simple (Single-Threaded)",488.0300,12.2943
+183,"Simple (Single-Threaded)",679.5380,8.8295
+184,"Simple (Single-Threaded)",445.6020,13.4649
+185,"Simple (Single-Threaded)",429.3880,13.9734
+186,"Simple (Single-Threaded)",652.2550,9.1989
+187,"Simple (Single-Threaded)",577.4430,10.3906
+188,"Simple (Single-Threaded)",433.6290,13.8367
+189,"Simple (Single-Threaded)",413.6360,14.5055
+190,"Simple (Single-Threaded)",390.3330,15.3715
+191,"Simple (Single-Threaded)",493.4900,12.1583
+192,"Simple (Single-Threaded)",699.7480,8.5745
+193,"Simple (Single-Threaded)",449.2020,13.3570
+194,"Simple (Single-Threaded)",607.5430,9.8758
+195,"Simple (Single-Threaded)",481.4960,12.4612
+196,"Simple (Single-Threaded)",431.7740,13.8962
+197,"Simple (Single-Threaded)",720.5500,8.3270
+198,"Simple (Single-Threaded)",530.2100,11.3163
+199,"Simple (Single-Threaded)",611.1920,9.8169
+200,"Simple (Single-Threaded)",511.7500,11.7245
+1,"Simple (Multi-Threaded)",420.3900,14.2725
+2,"Simple (Multi-Threaded)",731.8080,8.1989
+3,"Simple (Multi-Threaded)",731.5290,8.2020
+4,"Simple (Multi-Threaded)",730.9880,8.2081
+5,"Simple (Multi-Threaded)",734.8960,8.1644
+6,"Simple (Multi-Threaded)",735.1770,8.1613
+7,"Simple (Multi-Threaded)",739.2010,8.1169
+8,"Simple (Multi-Threaded)",727.2970,8.2497
+9,"Simple (Multi-Threaded)",719.4220,8.3400
+10,"Simple (Multi-Threaded)",627.2230,9.5660
+11,"Simple (Multi-Threaded)",630.3270,9.5189
+12,"Simple (Multi-Threaded)",834.3740,7.1910
+13,"Simple (Multi-Threaded)",631.9890,9.4938
+14,"Simple (Multi-Threaded)",631.2470,9.5050
+15,"Simple (Multi-Threaded)",739.4760,8.1139
+16,"Simple (Multi-Threaded)",634.7810,9.4521
+17,"Simple (Multi-Threaded)",742.8780,8.0767
+18,"Simple (Multi-Threaded)",739.4580,8.1141
+19,"Simple (Multi-Threaded)",738.9270,8.1199
+20,"Simple (Multi-Threaded)",720.0590,8.3327
+21,"Simple (Multi-Threaded)",723.0390,8.2983
+22,"Simple (Multi-Threaded)",622.3500,9.6409
+23,"Simple (Multi-Threaded)",739.3520,8.1152
+24,"Simple (Multi-Threaded)",753.1790,7.9662
+25,"Simple (Multi-Threaded)",740.9440,8.0978
+26,"Simple (Multi-Threaded)",631.4300,9.5022
+27,"Simple (Multi-Threaded)",735.4050,8.1588
+28,"Simple (Multi-Threaded)",727.0710,8.2523
+29,"Simple (Multi-Threaded)",735.2580,8.1604
+30,"Simple (Multi-Threaded)",723.3580,8.2946
+31,"Simple (Multi-Threaded)",730.8450,8.2097
+32,"Simple (Multi-Threaded)",726.7390,8.2561
+33,"Simple (Multi-Threaded)",749.8360,8.0017
+34,"Simple (Multi-Threaded)",732.6610,8.1893
+35,"Simple (Multi-Threaded)",753.3010,7.9649
+36,"Simple (Multi-Threaded)",737.5550,8.1350
+37,"Simple (Multi-Threaded)",642.0960,9.3444
+38,"Simple (Multi-Threaded)",625.3420,9.5947
+39,"Simple (Multi-Threaded)",419.4050,14.3060
+40,"Simple (Multi-Threaded)",418.1890,14.3476
+41,"Simple (Multi-Threaded)",628.0240,9.5538
+42,"Simple (Multi-Threaded)",522.1710,11.4905
+43,"Simple (Multi-Threaded)",423.6270,14.1634
+44,"Simple (Multi-Threaded)",518.8640,11.5637
+45,"Simple (Multi-Threaded)",623.4750,9.6235
+46,"Simple (Multi-Threaded)",518.9630,11.5615
+47,"Simple (Multi-Threaded)",618.8630,9.6952
+48,"Simple (Multi-Threaded)",415.1970,14.4510
+49,"Simple (Multi-Threaded)",420.3520,14.2738
+50,"Simple (Multi-Threaded)",415.9920,14.4234
+51,"Simple (Multi-Threaded)",415.4690,14.4415
+52,"Simple (Multi-Threaded)",415.4460,14.4423
+53,"Simple (Multi-Threaded)",616.5580,9.7314
+54,"Simple (Multi-Threaded)",523.3500,11.4646
+55,"Simple (Multi-Threaded)",414.0870,14.4897
+56,"Simple (Multi-Threaded)",520.4110,11.5293
+57,"Simple (Multi-Threaded)",514.0190,11.6727
+58,"Simple (Multi-Threaded)",419.3150,14.3091
+59,"Simple (Multi-Threaded)",413.8260,14.4988
+60,"Simple (Multi-Threaded)",414.9360,14.4601
+61,"Simple (Multi-Threaded)",414.4260,14.4779
+62,"Simple (Multi-Threaded)",418.7210,14.3294
+63,"Simple (Multi-Threaded)",519.2310,11.5556
+64,"Simple (Multi-Threaded)",421.1330,14.2473
+65,"Simple (Multi-Threaded)",425.5870,14.0982
+66,"Simple (Multi-Threaded)",413.0880,14.5248
+67,"Simple (Multi-Threaded)",417.1320,14.3839
+68,"Simple (Multi-Threaded)",517.8100,11.5873
+69,"Simple (Multi-Threaded)",542.7400,11.0550
+70,"Simple (Multi-Threaded)",429.4640,13.9709
+71,"Simple (Multi-Threaded)",519.7760,11.5434
+72,"Simple (Multi-Threaded)",419.3060,14.3094
+73,"Simple (Multi-Threaded)",519.3000,11.5540
+74,"Simple (Multi-Threaded)",615.8920,9.7420
+75,"Simple (Multi-Threaded)",620.9120,9.6632
+76,"Simple (Multi-Threaded)",522.2240,11.4893
+77,"Simple (Multi-Threaded)",522.4550,11.4842
+78,"Simple (Multi-Threaded)",523.1670,11.4686
+79,"Simple (Multi-Threaded)",623.5640,9.6221
+80,"Simple (Multi-Threaded)",418.5020,14.3368
+81,"Simple (Multi-Threaded)",526.9840,11.3855
+82,"Simple (Multi-Threaded)",418.5670,14.3346
+83,"Simple (Multi-Threaded)",424.2070,14.1440
+84,"Simple (Multi-Threaded)",519.5370,11.5487
+85,"Simple (Multi-Threaded)",414.7060,14.4681
+86,"Simple (Multi-Threaded)",417.1740,14.3825
+87,"Simple (Multi-Threaded)",418.8010,14.3266
+88,"Simple (Multi-Threaded)",417.8360,14.3597
+89,"Simple (Multi-Threaded)",520.7000,11.5229
+90,"Simple (Multi-Threaded)",618.0030,9.7087
+91,"Simple (Multi-Threaded)",415.1480,14.4527
+92,"Simple (Multi-Threaded)",720.1510,8.3316
+93,"Simple (Multi-Threaded)",418.3520,14.3420
+94,"Simple (Multi-Threaded)",418.2550,14.3453
+95,"Simple (Multi-Threaded)",522.8620,11.4753
+96,"Simple (Multi-Threaded)",623.3980,9.6247
+97,"Simple (Multi-Threaded)",422.8900,14.1881
+98,"Simple (Multi-Threaded)",418.3680,14.3414
+99,"Simple (Multi-Threaded)",419.1650,14.3142
+100,"Simple (Multi-Threaded)",523.2310,11.4672
+101,"Simple (Multi-Threaded)",416.2550,14.4142
+102,"Simple (Multi-Threaded)",416.6500,14.4006
+103,"Simple (Multi-Threaded)",418.7450,14.3285
+104,"Simple (Multi-Threaded)",519.4820,11.5500
+105,"Simple (Multi-Threaded)",416.0100,14.4227
+106,"Simple (Multi-Threaded)",420.5710,14.2663
+107,"Simple (Multi-Threaded)",519.3700,11.5525
+108,"Simple (Multi-Threaded)",414.2460,14.4841
+109,"Simple (Multi-Threaded)",531.0350,11.2987
+110,"Simple (Multi-Threaded)",417.4170,14.3741
+111,"Simple (Multi-Threaded)",621.4510,9.6548
+112,"Simple (Multi-Threaded)",514.8030,11.6549
+113,"Simple (Multi-Threaded)",414.8250,14.4639
+114,"Simple (Multi-Threaded)",523.9530,11.4514
+115,"Simple (Multi-Threaded)",614.3710,9.7661
+116,"Simple (Multi-Threaded)",522.9790,11.4727
+117,"Simple (Multi-Threaded)",518.5020,11.5718
+118,"Simple (Multi-Threaded)",419.0680,14.3175
+119,"Simple (Multi-Threaded)",619.5430,9.6846
+120,"Simple (Multi-Threaded)",618.9950,9.6931
+121,"Simple (Multi-Threaded)",415.6260,14.4361
+122,"Simple (Multi-Threaded)",436.0250,13.7607
+123,"Simple (Multi-Threaded)",420.9430,14.2537
+124,"Simple (Multi-Threaded)",415.3770,14.4447
+125,"Simple (Multi-Threaded)",419.3810,14.3068
+126,"Simple (Multi-Threaded)",418.0140,14.3536
+127,"Simple (Multi-Threaded)",530.6240,11.3074
+128,"Simple (Multi-Threaded)",519.3180,11.5536
+129,"Simple (Multi-Threaded)",623.3750,9.6250
+130,"Simple (Multi-Threaded)",419.1950,14.3131
+131,"Simple (Multi-Threaded)",425.7350,14.0933
+132,"Simple (Multi-Threaded)",629.6490,9.5291
+133,"Simple (Multi-Threaded)",618.9020,9.6946
+134,"Simple (Multi-Threaded)",523.0640,11.4709
+135,"Simple (Multi-Threaded)",629.7590,9.5275
+136,"Simple (Multi-Threaded)",422.8240,14.1903
+137,"Simple (Multi-Threaded)",418.1670,14.3483
+138,"Simple (Multi-Threaded)",415.4140,14.4434
+139,"Simple (Multi-Threaded)",624.8240,9.6027
+140,"Simple (Multi-Threaded)",515.4800,11.6396
+141,"Simple (Multi-Threaded)",421.1980,14.2451
+142,"Simple (Multi-Threaded)",414.8590,14.4627
+143,"Simple (Multi-Threaded)",414.5400,14.4739
+144,"Simple (Multi-Threaded)",415.1070,14.4541
+145,"Simple (Multi-Threaded)",520.5040,11.5273
+146,"Simple (Multi-Threaded)",519.0960,11.5586
+147,"Simple (Multi-Threaded)",419.2790,14.3103
+148,"Simple (Multi-Threaded)",419.1630,14.3142
+149,"Simple (Multi-Threaded)",429.1450,13.9813
+150,"Simple (Multi-Threaded)",420.5080,14.2685
+151,"Simple (Multi-Threaded)",418.3860,14.3408
+152,"Simple (Multi-Threaded)",623.1450,9.6286
+153,"Simple (Multi-Threaded)",423.1570,14.1791
+154,"Simple (Multi-Threaded)",419.5300,14.3017
+155,"Simple (Multi-Threaded)",419.1960,14.3131
+156,"Simple (Multi-Threaded)",419.2940,14.3098
+157,"Simple (Multi-Threaded)",415.1180,14.4537
+158,"Simple (Multi-Threaded)",514.4220,11.6636
+159,"Simple (Multi-Threaded)",619.3430,9.6877
+160,"Simple (Multi-Threaded)",620.8600,9.6640
+161,"Simple (Multi-Threaded)",413.4550,14.5119
+162,"Simple (Multi-Threaded)",524.3020,11.4438
+163,"Simple (Multi-Threaded)",516.5720,11.6150
+164,"Simple (Multi-Threaded)",419.1580,14.3144
+165,"Simple (Multi-Threaded)",419.9520,14.2873
+166,"Simple (Multi-Threaded)",422.7970,14.1912
+167,"Simple (Multi-Threaded)",414.6910,14.4686
+168,"Simple (Multi-Threaded)",419.7750,14.2934
+169,"Simple (Multi-Threaded)",623.1770,9.6281
+170,"Simple (Multi-Threaded)",515.0730,11.6488
+171,"Simple (Multi-Threaded)",729.6650,8.2230
+172,"Simple (Multi-Threaded)",416.0930,14.4199
+173,"Simple (Multi-Threaded)",418.0940,14.3508
+174,"Simple (Multi-Threaded)",519.6750,11.5457
+175,"Simple (Multi-Threaded)",419.5930,14.2996
+176,"Simple (Multi-Threaded)",418.9110,14.3229
+177,"Simple (Multi-Threaded)",414.2480,14.4841
+178,"Simple (Multi-Threaded)",416.2030,14.4160
+179,"Simple (Multi-Threaded)",418.1190,14.3500
+180,"Simple (Multi-Threaded)",413.0380,14.5265
+181,"Simple (Multi-Threaded)",422.9990,14.1844
+182,"Simple (Multi-Threaded)",413.3780,14.5146
+183,"Simple (Multi-Threaded)",427.0880,14.0486
+184,"Simple (Multi-Threaded)",417.8500,14.3592
+185,"Simple (Multi-Threaded)",514.9960,11.6506
+186,"Simple (Multi-Threaded)",424.6520,14.1292
+187,"Simple (Multi-Threaded)",552.5960,10.8578
+188,"Simple (Multi-Threaded)",419.0020,14.3197
+189,"Simple (Multi-Threaded)",419.2450,14.3114
+190,"Simple (Multi-Threaded)",519.4430,11.5508
+191,"Simple (Multi-Threaded)",414.2760,14.4831
+192,"Simple (Multi-Threaded)",416.2700,14.4137
+193,"Simple (Multi-Threaded)",519.3570,11.5527
+194,"Simple (Multi-Threaded)",426.1940,14.0781
+195,"Simple (Multi-Threaded)",415.6740,14.4344
+196,"Simple (Multi-Threaded)",518.4390,11.5732
+197,"Simple (Multi-Threaded)",414.0320,14.4916
+198,"Simple (Multi-Threaded)",414.2410,14.4843
+199,"Simple (Multi-Threaded)",416.3320,14.4116
+200,"Simple (Multi-Threaded)",727.1950,8.2509
+1,"Breadth-First (Single-Threaded)",423.4530,14.1692
+2,"Breadth-First (Single-Threaded)",395.5360,15.1693
+3,"Breadth-First (Single-Threaded)",395.6440,15.1651
+4,"Breadth-First (Single-Threaded)",397.3330,15.1007
+5,"Breadth-First (Single-Threaded)",396.7510,15.1228
+6,"Breadth-First (Single-Threaded)",396.5870,15.1291
+7,"Breadth-First (Single-Threaded)",412.9030,14.5313
+8,"Breadth-First (Single-Threaded)",397.4620,15.0958
+9,"Breadth-First (Single-Threaded)",406.0610,14.7761
+10,"Breadth-First (Single-Threaded)",413.7240,14.5024
+11,"Breadth-First (Single-Threaded)",390.7280,15.3560
+12,"Breadth-First (Single-Threaded)",390.3580,15.3705
+13,"Breadth-First (Single-Threaded)",395.2480,15.1803
+14,"Breadth-First (Single-Threaded)",388.1020,15.4599
+15,"Breadth-First (Single-Threaded)",388.0880,15.4604
+16,"Breadth-First (Single-Threaded)",394.4350,15.2116
+17,"Breadth-First (Single-Threaded)",391.1390,15.3398
+18,"Breadth-First (Single-Threaded)",408.3990,14.6915
+19,"Breadth-First (Single-Threaded)",392.6800,15.2796
+20,"Breadth-First (Single-Threaded)",446.0700,13.4508
+21,"Breadth-First (Single-Threaded)",393.4520,15.2496
+22,"Breadth-First (Single-Threaded)",392.0820,15.3029
+23,"Breadth-First (Single-Threaded)",392.6900,15.2792
+24,"Breadth-First (Single-Threaded)",412.4780,14.5462
+25,"Breadth-First (Single-Threaded)",401.7450,14.9348
+26,"Breadth-First (Single-Threaded)",394.5290,15.2080
+27,"Breadth-First (Single-Threaded)",392.2640,15.2958
+28,"Breadth-First (Single-Threaded)",391.2070,15.3371
+29,"Breadth-First (Single-Threaded)",389.1660,15.4176
+30,"Breadth-First (Single-Threaded)",389.3610,15.4099
+31,"Breadth-First (Single-Threaded)",391.4640,15.3271
+32,"Breadth-First (Single-Threaded)",393.5600,15.2455
+33,"Breadth-First (Single-Threaded)",447.1100,13.4195
+34,"Breadth-First (Single-Threaded)",391.3410,15.3319
+35,"Breadth-First (Single-Threaded)",400.5940,14.9778
+36,"Breadth-First (Single-Threaded)",399.1210,15.0330
+37,"Breadth-First (Single-Threaded)",402.0490,14.9236
+38,"Breadth-First (Single-Threaded)",402.2720,14.9153
+39,"Breadth-First (Single-Threaded)",401.1980,14.9552
+40,"Breadth-First (Single-Threaded)",399.4720,15.0198
+41,"Breadth-First (Single-Threaded)",394.9330,15.1925
+42,"Breadth-First (Single-Threaded)",414.0630,14.4905
+43,"Breadth-First (Single-Threaded)",400.2770,14.9896
+44,"Breadth-First (Single-Threaded)",401.4890,14.9444
+45,"Breadth-First (Single-Threaded)",390.2990,15.3728
+46,"Breadth-First (Single-Threaded)",395.2400,15.1806
+47,"Breadth-First (Single-Threaded)",529.8630,11.3237
+48,"Breadth-First (Single-Threaded)",449.1580,13.3583
+49,"Breadth-First (Single-Threaded)",397.3050,15.1017
+50,"Breadth-First (Single-Threaded)",392.5760,15.2837
+51,"Breadth-First (Single-Threaded)",393.9950,15.2286
+52,"Breadth-First (Single-Threaded)",394.7960,15.1977
+53,"Breadth-First (Single-Threaded)",390.9740,15.3463
+54,"Breadth-First (Single-Threaded)",391.0370,15.3438
+55,"Breadth-First (Single-Threaded)",392.6260,15.2817
+56,"Breadth-First (Single-Threaded)",399.2410,15.0285
+57,"Breadth-First (Single-Threaded)",395.5890,15.1673
+58,"Breadth-First (Single-Threaded)",395.7810,15.1599
+59,"Breadth-First (Single-Threaded)",394.2570,15.2185
+60,"Breadth-First (Single-Threaded)",390.6680,15.3583
+61,"Breadth-First (Single-Threaded)",393.0710,15.2644
+62,"Breadth-First (Single-Threaded)",392.9150,15.2705
+63,"Breadth-First (Single-Threaded)",406.8590,14.7471
+64,"Breadth-First (Single-Threaded)",400.2890,14.9892
+65,"Breadth-First (Single-Threaded)",400.6790,14.9746
+66,"Breadth-First (Single-Threaded)",399.2180,15.0294
+67,"Breadth-First (Single-Threaded)",395.8770,15.1562
+68,"Breadth-First (Single-Threaded)",410.1330,14.6294
+69,"Breadth-First (Single-Threaded)",397.6030,15.0904
+70,"Breadth-First (Single-Threaded)",391.2600,15.3351
+71,"Breadth-First (Single-Threaded)",399.2470,15.0283
+72,"Breadth-First (Single-Threaded)",389.1040,15.4200
+73,"Breadth-First (Single-Threaded)",389.4950,15.4046
+74,"Breadth-First (Single-Threaded)",395.9380,15.1539
+75,"Breadth-First (Single-Threaded)",392.9990,15.2672
+76,"Breadth-First (Single-Threaded)",392.6740,15.2799
+77,"Breadth-First (Single-Threaded)",395.9260,15.1543
+78,"Breadth-First (Single-Threaded)",394.2030,15.2206
+79,"Breadth-First (Single-Threaded)",412.0840,14.5601
+80,"Breadth-First (Single-Threaded)",394.4120,15.2125
+81,"Breadth-First (Single-Threaded)",391.4360,15.3282
+82,"Breadth-First (Single-Threaded)",403.7010,14.8625
+83,"Breadth-First (Single-Threaded)",399.1780,15.0309
+84,"Breadth-First (Single-Threaded)",403.0660,14.8859
+85,"Breadth-First (Single-Threaded)",401.9900,14.9257
+86,"Breadth-First (Single-Threaded)",393.3220,15.2547
+87,"Breadth-First (Single-Threaded)",393.7450,15.2383
+88,"Breadth-First (Single-Threaded)",397.0200,15.1126
+89,"Breadth-First (Single-Threaded)",394.8780,15.1946
+90,"Breadth-First (Single-Threaded)",399.4330,15.0213
+91,"Breadth-First (Single-Threaded)",390.2070,15.3765
+92,"Breadth-First (Single-Threaded)",391.8610,15.3116
+93,"Breadth-First (Single-Threaded)",395.8700,15.1565
+94,"Breadth-First (Single-Threaded)",404.2480,14.8424
+95,"Breadth-First (Single-Threaded)",423.1670,14.1788
+96,"Breadth-First (Single-Threaded)",394.9890,15.1903
+97,"Breadth-First (Single-Threaded)",390.0230,15.3837
+98,"Breadth-First (Single-Threaded)",388.9000,15.4281
+99,"Breadth-First (Single-Threaded)",402.2880,14.9147
+100,"Breadth-First (Single-Threaded)",389.4170,15.4076
+101,"Breadth-First (Single-Threaded)",392.5500,15.2847
+102,"Breadth-First (Single-Threaded)",393.9090,15.2319
+103,"Breadth-First (Single-Threaded)",388.8470,15.4302
+104,"Breadth-First (Single-Threaded)",393.1170,15.2626
+105,"Breadth-First (Single-Threaded)",396.8020,15.1209
+106,"Breadth-First (Single-Threaded)",394.2850,15.2174
+107,"Breadth-First (Single-Threaded)",397.3440,15.1003
+108,"Breadth-First (Single-Threaded)",390.5440,15.3632577.6510,10.3869
+109,"Breadth-First (Single-Threaded)",634.6950,9.4534
+110,"Breadth-First (Single-Threaded)",427.2900,14.0420
+111,"Breadth-First (Single-Threaded)",432.5170,13.8723
+112,"Breadth-First (Single-Threaded)",564.3280,10.6321
+113,"Breadth-First (Single-Threaded)",453.7240,13.2239
+114,"Breadth-First (Single-Threaded)",596.0450,10.0664
+115,"Breadth-First (Single-Threaded)",430.1890,13.9474
+116,"Breadth-First (Single-Threaded)",510.3830,11.7559
+117,"Breadth-First (Single-Threaded)",448.2150,13.3864
+118,"Breadth-First (Single-Threaded)",423.9100,14.1539
+119,"Breadth-First (Single-Threaded)",499.3160,12.0164
+120,"Breadth-First (Single-Threaded)",721.2610,8.3188
+121,"Breadth-First (Single-Threaded)",437.5020,13.7142
+122,"Breadth-First (Single-Threaded)",641.7310,9.3497
+123,"Breadth-First (Single-Threaded)",671.0290,8.9415
+124,"Breadth-First (Single-Threaded)",418.3680,14.3414
+125,"Breadth-First (Single-Threaded)",468.0610,12.8188
+126,"Breadth-First (Single-Threaded)",409.4610,14.6534
+127,"Breadth-First (Single-Threaded)",442.2490,13.5670
+128,"Breadth-First (Single-Threaded)",396.9570,15.1150
+129,"Breadth-First (Single-Threaded)",411.7020,14.5736
+130,"Breadth-First (Single-Threaded)",536.9540,11.1741
+131,"Breadth-First (Single-Threaded)",455.6710,13.1674
+132,"Breadth-First (Single-Threaded)",422.5690,14.1989
+133,"Breadth-First (Single-Threaded)",480.4280,12.4889
+134,"Breadth-First (Single-Threaded)",622.0610,9.6454
+135,"Breadth-First (Single-Threaded)",498.3240,12.0404
+136,"Breadth-First (Single-Threaded)",474.2080,12.6527
+137,"Breadth-First (Single-Threaded)",424.9850,14.1181
+138,"Breadth-First (Single-Threaded)",635.5780,9.4402
+139,"Breadth-First (Single-Threaded)",430.9840,13.9216
+140,"Breadth-First (Single-Threaded)",554.8370,10.8140
+141,"Breadth-First (Single-Threaded)",416.8730,14.3929
+142,"Breadth-First (Single-Threaded)",531.5010,11.2888
+143,"Breadth-First (Single-Threaded)",593.4830,10.1098
+144,"Breadth-First (Single-Threaded)",435.8980,13.7647
+145,"Breadth-First (Single-Threaded)",581.5180,10.3178
+146,"Breadth-First (Single-Threaded)",499.1980,12.0193
+147,"Breadth-First (Single-Threaded)",473.5470,12.6703
+148,"Breadth-First (Single-Threaded)",417.2930,14.3784
+149,"Breadth-First (Single-Threaded)",537.8720,11.1551
+150,"Breadth-First (Single-Threaded)",423.8880,14.1547
+151,"Breadth-First (Single-Threaded)",461.3520,13.0053
+152,"Breadth-First (Single-Threaded)",431.4390,13.9069
+153,"Breadth-First (Single-Threaded)",619.4670,9.6857
+154,"Breadth-First (Single-Threaded)",456.3730,13.1471
+155,"Breadth-First (Single-Threaded)",402.9640,14.8897
+156,"Breadth-First (Single-Threaded)",506.3440,11.8497
+157,"Breadth-First (Single-Threaded)",430.3340,13.9427
+158,"Breadth-First (Single-Threaded)",395.9910,15.1519
+159,"Breadth-First (Single-Threaded)",394.7840,15.1982
+160,"Breadth-First (Single-Threaded)",396.3490,15.1382
+161,"Breadth-First (Single-Threaded)",389.5650,15.4018
+162,"Breadth-First (Single-Threaded)",392.8690,15.2723
+163,"Breadth-First (Single-Threaded)",406.1690,14.7722
+164,"Breadth-First (Single-Threaded)",397.7340,15.0855
+165,"Breadth-First (Single-Threaded)",406.2600,14.7689
+166,"Breadth-First (Single-Threaded)",414.2740,14.4832
+167,"Breadth-First (Single-Threaded)",395.2050,15.1820
+168,"Breadth-First (Single-Threaded)",392.3570,15.2922
+169,"Breadth-First (Single-Threaded)",391.4080,15.3293
+170,"Breadth-First (Single-Threaded)",391.0360,15.3439
+171,"Breadth-First (Single-Threaded)",392.5930,15.2830
+172,"Breadth-First (Single-Threaded)",396.5480,15.1306
+173,"Breadth-First (Single-Threaded)",392.4190,15.2898
+174,"Breadth-First (Single-Threaded)",409.5260,14.6511
+175,"Breadth-First (Single-Threaded)",391.9160,15.3094
+176,"Breadth-First (Single-Threaded)",401.8030,14.9327
+177,"Breadth-First (Single-Threaded)",399.7210,15.0105
+178,"Breadth-First (Single-Threaded)",392.8200,15.2742
+179,"Breadth-First (Single-Threaded)",393.4890,15.2482
+180,"Breadth-First (Single-Threaded)",414.1060,14.4890
+181,"Breadth-First (Single-Threaded)",401.7950,14.9330
+182,"Breadth-First (Single-Threaded)",397.9910,15.0757
+183,"Breadth-First (Single-Threaded)",393.4610,15.2493
+184,"Breadth-First (Single-Threaded)",391.5220,15.3248
+185,"Breadth-First (Single-Threaded)",390.1910,15.3771
+186,"Breadth-First (Single-Threaded)",391.3110,15.3331
+187,"Breadth-First (Single-Threaded)",393.9310,15.2311
+188,"Breadth-First (Single-Threaded)",395.3500,15.1764
+189,"Breadth-First (Single-Threaded)",398.6730,15.0499
+190,"Breadth-First (Single-Threaded)",387.5070,15.4836
+191,"Breadth-First (Single-Threaded)",397.3970,15.0983
+192,"Breadth-First (Single-Threaded)",422.4980,14.2013
+193,"Breadth-First (Single-Threaded)",395.4000,15.1745
+194,"Breadth-First (Single-Threaded)",408.1460,14.7006
+195,"Breadth-First (Single-Threaded)",395.2300,15.1810
+196,"Breadth-First (Single-Threaded)",402.5310,14.9057
+197,"Breadth-First (Single-Threaded)",395.2200,15.1814
+198,"Breadth-First (Single-Threaded)",420.4380,14.2708
+199,"Breadth-First (Single-Threaded)",401.1790,14.9559
+200,"Breadth-First (Single-Threaded)",408.7680,14.6783
+1,"Depth-First (Single-Threaded)",393.3760,15.2526
+2,"Depth-First (Single-Threaded)",392.9010,15.2710
+3,"Depth-First (Single-Threaded)",440.7400,13.6135
+4,"Depth-First (Single-Threaded)",420.3790,14.2728
+5,"Depth-First (Single-Threaded)",403.1350,14.8834
+6,"Depth-First (Single-Threaded)",391.2950,15.3337
+7,"Depth-First (Single-Threaded)",392.8490,15.2730
+8,"Depth-First (Single-Threaded)",393.9640,15.2298
+9,"Depth-First (Single-Threaded)",394.2960,15.2170
+10,"Depth-First (Single-Threaded)",390.6450,15.3592
+11,"Depth-First (Single-Threaded)",389.9340,15.3872
+12,"Depth-First (Single-Threaded)",399.2320,15.0289
+13,"Depth-First (Single-Threaded)",396.4700,15.1336
+14,"Depth-First (Single-Threaded)",396.2930,15.1403
+15,"Depth-First (Single-Threaded)",394.0800,15.2253
+16,"Depth-First (Single-Threaded)",391.4850,15.3263
+17,"Depth-First (Single-Threaded)",391.7930,15.3142
+18,"Depth-First (Single-Threaded)",396.0920,15.1480
+19,"Depth-First (Single-Threaded)",397.4680,15.0956
+20,"Depth-First (Single-Threaded)",437.0520,13.7283
+21,"Depth-First (Single-Threaded)",401.8570,14.9307
+22,"Depth-First (Single-Threaded)",393.9200,15.2315
+23,"Depth-First (Single-Threaded)",399.2700,15.0274
+24,"Depth-First (Single-Threaded)",393.6650,15.2414
+25,"Depth-First (Single-Threaded)",395.2510,15.1802
+26,"Depth-First (Single-Threaded)",388.3500,15.4500
+27,"Depth-First (Single-Threaded)",394.0710,15.2257
+28,"Depth-First (Single-Threaded)",395.4480,15.1727
+29,"Depth-First (Single-Threaded)",392.6950,15.2790
+30,"Depth-First (Single-Threaded)",391.2860,15.3341
+31,"Depth-First (Single-Threaded)",398.0990,15.0716
+32,"Depth-First (Single-Threaded)",393.6000,15.2439
+33,"Depth-First (Single-Threaded)",394.4380,15.2115
+34,"Depth-First (Single-Threaded)",394.1560,15.2224
+35,"Depth-First (Single-Threaded)",402.8240,14.8948
+36,"Depth-First (Single-Threaded)",440.6250,13.6170
+37,"Depth-First (Single-Threaded)",391.2790,15.3343
+38,"Depth-First (Single-Threaded)",395.5240,15.1697
+39,"Depth-First (Single-Threaded)",396.0920,15.1480
+40,"Depth-First (Single-Threaded)",390.4640,15.3663
+41,"Depth-First (Single-Threaded)",396.9040,15.1170
+42,"Depth-First (Single-Threaded)",392.4770,15.2875
+43,"Depth-First (Single-Threaded)",397.3600,15.0997
+44,"Depth-First (Single-Threaded)",396.7910,15.1213
+45,"Depth-First (Single-Threaded)",396.3700,15.1374
+46,"Depth-First (Single-Threaded)",399.2880,15.0267
+47,"Depth-First (Single-Threaded)",390.5960,15.3611
+48,"Depth-First (Single-Threaded)",391.0370,15.3438
+49,"Depth-First (Single-Threaded)",394.5400,15.2076
+50,"Depth-First (Single-Threaded)",401.2090,14.9548
+51,"Depth-First (Single-Threaded)",401.0580,14.9604
+52,"Depth-First (Single-Threaded)",412.2050,14.5559
+53,"Depth-First (Single-Threaded)",395.3220,15.1775
+54,"Depth-First (Single-Threaded)",393.5410,15.2462
+55,"Depth-First (Single-Threaded)",403.7800,14.8596
+56,"Depth-First (Single-Threaded)",396.0440,15.1498
+57,"Depth-First (Single-Threaded)",394.7320,15.2002
+58,"Depth-First (Single-Threaded)",392.6670,15.2801
+59,"Depth-First (Single-Threaded)",391.2750,15.3345
+60,"Depth-First (Single-Threaded)",391.2170,15.3368
+61,"Depth-First (Single-Threaded)",399.5910,15.0154
+62,"Depth-First (Single-Threaded)",394.3180,15.2161
+63,"Depth-First (Single-Threaded)",396.5870,15.1291
+64,"Depth-First (Single-Threaded)",392.6690,15.2800
+65,"Depth-First (Single-Threaded)",394.4090,15.2126
+66,"Depth-First (Single-Threaded)",394.8070,15.1973
+67,"Depth-First (Single-Threaded)",463.3100,12.9503
+68,"Depth-First (Single-Threaded)",390.6590,15.3587
+69,"Depth-First (Single-Threaded)",388.7900,15.4325
+70,"Depth-First (Single-Threaded)",391.5030,15.3256
+71,"Depth-First (Single-Threaded)",396.0240,15.1506
+72,"Depth-First (Single-Threaded)",399.8320,15.0063
+73,"Depth-First (Single-Threaded)",394.0040,15.2283
+74,"Depth-First (Single-Threaded)",444.2190,13.5069
+75,"Depth-First (Single-Threaded)",394.2000,15.2207
+76,"Depth-First (Single-Threaded)",391.9150,15.3094
+77,"Depth-First (Single-Threaded)",394.1450,15.2228
+78,"Depth-First (Single-Threaded)",406.6300,14.7554
+79,"Depth-First (Single-Threaded)",441.7400,13.5827
+80,"Depth-First (Single-Threaded)",414.9400,14.4599
+81,"Depth-First (Single-Threaded)",390.2950,15.3730
+82,"Depth-First (Single-Threaded)",395.1780,15.1830
+83,"Depth-First (Single-Threaded)",408.5010,14.6878
+84,"Depth-First (Single-Threaded)",393.4470,15.2498
+85,"Depth-First (Single-Threaded)",426.3300,14.0736
+86,"Depth-First (Single-Threaded)",406.0690,14.7758
+87,"Depth-First (Single-Threaded)",396.8610,15.1186
+88,"Depth-First (Single-Threaded)",395.9630,15.1529
+89,"Depth-First (Single-Threaded)",457.8330,13.1052
+90,"Depth-First (Single-Threaded)",396.9630,15.1148
+91,"Depth-First (Single-Threaded)",391.4800,15.3265
+92,"Depth-First (Single-Threaded)",388.7210,15.4352
+93,"Depth-First (Single-Threaded)",391.3990,15.3296
+94,"Depth-First (Single-Threaded)",400.8040,14.9699
+95,"Depth-First (Single-Threaded)",389.2580,15.4139
+96,"Depth-First (Single-Threaded)",393.9570,15.2301
+97,"Depth-First (Single-Threaded)",391.2830,15.3342
+98,"Depth-First (Single-Threaded)",389.5600,15.4020
+99,"Depth-First (Single-Threaded)",469.0390,12.7921
+100,"Depth-First (Single-Threaded)",397.4740,15.0953
+101,"Depth-First (Single-Threaded)",398.1550,15.0695
+102,"Depth-First (Single-Threaded)",398.1510,15.0697
+103,"Depth-First (Single-Threaded)",388.9700,15.4254
+104,"Depth-First (Single-Threaded)",394.1520,15.2226
+105,"Depth-First (Single-Threaded)",393.6770,15.2409
+106,"Depth-First (Single-Threaded)",392.6020,15.2827
+107,"Depth-First (Single-Threaded)",394.5320,15.2079
+108,"Depth-First (Single-Threaded)",393.9130,15.2318
+109,"Depth-First (Single-Threaded)",393.0630,15.2647
+110,"Depth-First (Single-Threaded)",398.4120,15.0598
+111,"Depth-First (Single-Threaded)",394.0580,15.2262
+112,"Depth-First (Single-Threaded)",391.9400,15.3085
+113,"Depth-First (Single-Threaded)",393.5750,15.2449
+114,"Depth-First (Single-Threaded)",389.2450,15.4145
+115,"Depth-First (Single-Threaded)",413.4140,14.5133
+116,"Depth-First (Single-Threaded)",391.6470,15.3199
+117,"Depth-First (Single-Threaded)",393.1970,15.2595
+118,"Depth-First (Single-Threaded)",394.6140,15.2047
+119,"Depth-First (Single-Threaded)",392.9900,15.2676
+120,"Depth-First (Single-Threaded)",395.7580,15.1608
+121,"Depth-First (Single-Threaded)",391.7040,15.3177
+122,"Depth-First (Single-Threaded)",395.6670,15.1643
+123,"Depth-First (Single-Threaded)",388.6840,15.4367
+124,"Depth-First (Single-Threaded)",390.0100,15.3842
+125,"Depth-First (Single-Threaded)",395.1760,15.1831
+126,"Depth-First (Single-Threaded)",391.6590,15.3194
+127,"Depth-First (Single-Threaded)",432.4640,13.8740
+128,"Depth-First (Single-Threaded)",390.3090,15.3724
+129,"Depth-First (Single-Threaded)",394.1380,15.2231
+130,"Depth-First (Single-Threaded)",389.5650,15.4018
+131,"Depth-First (Single-Threaded)",395.4280,15.1734
+132,"Depth-First (Single-Threaded)",396.5070,15.1321
+133,"Depth-First (Single-Threaded)",398.8510,15.0432
+134,"Depth-First (Single-Threaded)",389.3750,15.4093
+135,"Depth-First (Single-Threaded)",393.9520,15.2303
+136,"Depth-First (Single-Threaded)",392.9200,15.2703
+137,"Depth-First (Single-Threaded)",392.8860,15.2716
+138,"Depth-First (Single-Threaded)",390.1550,15.3785
+139,"Depth-First (Single-Threaded)",394.3190,15.2161
+140,"Depth-First (Single-Threaded)",393.9160,15.2317
+141,"Depth-First (Single-Threaded)",460.5530,13.0278
+142,"Depth-First (Single-Threaded)",393.6100,15.2435
+143,"Depth-First (Single-Threaded)",390.2900,15.3732
+144,"Depth-First (Single-Threaded)",391.9010,15.3100
+145,"Depth-First (Single-Threaded)",442.0440,13.5733
+146,"Depth-First (Single-Threaded)",411.4860,14.5813
+147,"Depth-First (Single-Threaded)",407.5910,14.7206
+148,"Depth-First (Single-Threaded)",389.9920,15.3849
+149,"Depth-First (Single-Threaded)",391.0780,15.3422
+150,"Depth-First (Single-Threaded)",393.4850,15.2484
+151,"Depth-First (Single-Threaded)",393.9000,15.2323
+152,"Depth-First (Single-Threaded)",397.5720,15.0916
+153,"Depth-First (Single-Threaded)",393.0930,15.2636
+154,"Depth-First (Single-Threaded)",391.3200,15.3327
+155,"Depth-First (Single-Threaded)",395.8470,15.1574
+156,"Depth-First (Single-Threaded)",389.0370,15.4227
+157,"Depth-First (Single-Threaded)",452.3840,13.2631
+158,"Depth-First (Single-Threaded)",415.9090,14.4262
+159,"Depth-First (Single-Threaded)",400.4520,14.9831
+160,"Depth-First (Single-Threaded)",395.8910,15.1557
+161,"Depth-First (Single-Threaded)",427.0280,14.0506
+162,"Depth-First (Single-Threaded)",405.9850,14.7789
+163,"Depth-First (Single-Threaded)",399.6750,15.0122
+164,"Depth-First (Single-Threaded)",393.3890,15.2521
+165,"Depth-First (Single-Threaded)",397.0610,15.1110
+166,"Depth-First (Single-Threaded)",392.0240,15.3052
+167,"Depth-First (Single-Threaded)",404.6400,14.8280
+168,"Depth-First (Single-Threaded)",395.6570,15.1647
+169,"Depth-First (Single-Threaded)",395.7790,15.1600
+170,"Depth-First (Single-Threaded)",395.3910,15.1749
+171,"Depth-First (Single-Threaded)",407.8660,14.7107
+172,"Depth-First (Single-Threaded)",427.7080,14.0283
+173,"Depth-First (Single-Threaded)",406.8350,14.7480
+174,"Depth-First (Single-Threaded)",393.2330,15.2581
+175,"Depth-First (Single-Threaded)",407.9710,14.7069
+176,"Depth-First (Single-Threaded)",396.5080,15.1321
+177,"Depth-First (Single-Threaded)",390.8180,15.3524
+178,"Depth-First (Single-Threaded)",425.8750,14.0886
+179,"Depth-First (Single-Threaded)",379.2950,15.8188
+180,"Depth-First (Single-Threaded)",383.9400,15.6274
+181,"Depth-First (Single-Threaded)",385.2910,15.5726
+182,"Depth-First (Single-Threaded)",376.1880,15.9495
+183,"Depth-First (Single-Threaded)",393.3580,15.2533
+184,"Depth-First (Single-Threaded)",411.0890,14.5954
+185,"Depth-First (Single-Threaded)",379.1510,15.8248
+186,"Depth-First (Single-Threaded)",380.7590,15.7580
+187,"Depth-First (Single-Threaded)",380.4810,15.7695
+188,"Depth-First (Single-Threaded)",379.5590,15.8078
+189,"Depth-First (Single-Threaded)",383.2710,15.6547
+190,"Depth-First (Single-Threaded)",377.4480,15.8962
+191,"Depth-First (Single-Threaded)",379.2070,15.8225
+192,"Depth-First (Single-Threaded)",378.0210,15.8721
+193,"Depth-First (Single-Threaded)",386.7130,15.5154
+194,"Depth-First (Single-Threaded)",389.1420,15.4185
+195,"Depth-First (Single-Threaded)",384.7710,15.5937
+196,"Depth-First (Single-Threaded)",379.0920,15.8273
+197,"Depth-First (Single-Threaded)",378.0020,15.8729
+198,"Depth-First (Single-Threaded)",377.5850,15.8905
+199,"Depth-First (Single-Threaded)",380.7760,15.7573
+200,"Depth-First (Single-Threaded)",436.0890,13.7587
+1,"Simple (Single-Threaded Blocking)",383.0060,15.6656
+2,"Simple (Single-Threaded Blocking)",377.3470,15.9005
+3,"Simple (Single-Threaded Blocking)",380.8290,15.7551
+4,"Simple (Single-Threaded Blocking)",379.9220,15.7927
+5,"Simple (Single-Threaded Blocking)",380.8300,15.7551
+6,"Simple (Single-Threaded Blocking)",382.4780,15.6872
+7,"Simple (Single-Threaded Blocking)",379.2440,15.8209
+8,"Simple (Single-Threaded Blocking)",377.8960,15.8774
+9,"Simple (Single-Threaded Blocking)",378.2990,15.8605
+10,"Simple (Single-Threaded Blocking)",379.3030,15.8185
+11,"Simple (Single-Threaded Blocking)",380.7330,15.7591
+12,"Simple (Single-Threaded Blocking)",379.7250,15.8009
+13,"Simple (Single-Threaded Blocking)",377.3500,15.9004
+14,"Simple (Single-Threaded Blocking)",379.3160,15.8179
+15,"Simple (Single-Threaded Blocking)",379.9770,15.7904
+16,"Simple (Single-Threaded Blocking)",386.8750,15.5089
+17,"Simple (Single-Threaded Blocking)",394.3180,15.2161
+18,"Simple (Single-Threaded Blocking)",380.7440,15.7586
+19,"Simple (Single-Threaded Blocking)",378.0970,15.8689
+20,"Simple (Single-Threaded Blocking)",378.5280,15.8509
+21,"Simple (Single-Threaded Blocking)",379.5380,15.8087
+22,"Simple (Single-Threaded Blocking)",380.2600,15.7787
+23,"Simple (Single-Threaded Blocking)",376.9380,15.9177
+24,"Simple (Single-Threaded Blocking)",377.7860,15.8820
+25,"Simple (Single-Threaded Blocking)",380.0970,15.7854
+26,"Simple (Single-Threaded Blocking)",377.4290,15.8970
+27,"Simple (Single-Threaded Blocking)",380.5680,15.7659
+28,"Simple (Single-Threaded Blocking)",379.0050,15.8309
+29,"Simple (Single-Threaded Blocking)",377.8710,15.8784
+30,"Simple (Single-Threaded Blocking)",379.8720,15.7948
+31,"Simple (Single-Threaded Blocking)",377.8750,15.8783
+32,"Simple (Single-Threaded Blocking)",377.4310,15.8969
+33,"Simple (Single-Threaded Blocking)",388.0550,15.4617
+34,"Simple (Single-Threaded Blocking)",377.9210,15.8763
+35,"Simple (Single-Threaded Blocking)",378.3670,15.8576
+36,"Simple (Single-Threaded Blocking)",378.3610,15.8579
+37,"Simple (Single-Threaded Blocking)",378.4390,15.8546
+38,"Simple (Single-Threaded Blocking)",380.5810,15.7654
+39,"Simple (Single-Threaded Blocking)",378.4000,15.8562
+40,"Simple (Single-Threaded Blocking)",377.1940,15.9069
+41,"Simple (Single-Threaded Blocking)",379.0060,15.8309
+42,"Simple (Single-Threaded Blocking)",378.5100,15.8516
+43,"Simple (Single-Threaded Blocking)",379.3700,15.8157
+44,"Simple (Single-Threaded Blocking)",379.6730,15.8031
+45,"Simple (Single-Threaded Blocking)",379.5210,15.8094
+46,"Simple (Single-Threaded Blocking)",377.8470,15.8794
+47,"Simple (Single-Threaded Blocking)",379.9070,15.7933
+48,"Simple (Single-Threaded Blocking)",378.0730,15.8700
+49,"Simple (Single-Threaded Blocking)",381.2800,15.7365
+50,"Simple (Single-Threaded Blocking)",378.2500,15.8625
+51,"Simple (Single-Threaded Blocking)",379.3870,15.8150
+52,"Simple (Single-Threaded Blocking)",377.9760,15.8740
+53,"Simple (Single-Threaded Blocking)",379.4350,15.8130
+54,"Simple (Single-Threaded Blocking)",385.6340,15.5588
+55,"Simple (Single-Threaded Blocking)",381.1750,15.7408
+56,"Simple (Single-Threaded Blocking)",378.7800,15.8403
+57,"Simple (Single-Threaded Blocking)",377.7860,15.8820
+58,"Simple (Single-Threaded Blocking)",377.9030,15.8771
+59,"Simple (Single-Threaded Blocking)",379.8100,15.7974
+60,"Simple (Single-Threaded Blocking)",379.9220,15.7927
+61,"Simple (Single-Threaded Blocking)",378.1980,15.8647
+62,"Simple (Single-Threaded Blocking)",379.5040,15.8101
+63,"Simple (Single-Threaded Blocking)",378.6350,15.8464
+64,"Simple (Single-Threaded Blocking)",379.1070,15.8267
+65,"Simple (Single-Threaded Blocking)",383.0720,15.6629
+66,"Simple (Single-Threaded Blocking)",377.4300,15.8970
+67,"Simple (Single-Threaded Blocking)",376.1930,15.9493
+68,"Simple (Single-Threaded Blocking)",378.3490,15.8584
+69,"Simple (Single-Threaded Blocking)",380.3520,15.7749
+70,"Simple (Single-Threaded Blocking)",378.8380,15.8379
+71,"Simple (Single-Threaded Blocking)",413.8980,14.4963
+72,"Simple (Single-Threaded Blocking)",397.0620,15.1110
+73,"Simple (Single-Threaded Blocking)",382.8300,15.6728
+74,"Simple (Single-Threaded Blocking)",385.3520,15.5702
+75,"Simple (Single-Threaded Blocking)",379.5400,15.8086
+76,"Simple (Single-Threaded Blocking)",381.0120,15.7475
+77,"Simple (Single-Threaded Blocking)",379.7350,15.8005
+78,"Simple (Single-Threaded Blocking)",380.1480,15.7833
+79,"Simple (Single-Threaded Blocking)",382.0070,15.7065
+80,"Simple (Single-Threaded Blocking)",377.5860,15.8904
+81,"Simple (Single-Threaded Blocking)",383.2290,15.6564
+82,"Simple (Single-Threaded Blocking)",385.5340,15.5628
+83,"Simple (Single-Threaded Blocking)",378.6230,15.8469
+84,"Simple (Single-Threaded Blocking)",378.0730,15.8700
+85,"Simple (Single-Threaded Blocking)",378.3870,15.8568
+86,"Simple (Single-Threaded Blocking)",377.9190,15.8764
+87,"Simple (Single-Threaded Blocking)",392.3730,15.2916
+88,"Simple (Single-Threaded Blocking)",383.6760,15.6382
+89,"Simple (Single-Threaded Blocking)",379.3300,15.8174
+90,"Simple (Single-Threaded Blocking)",378.6040,15.8477
+91,"Simple (Single-Threaded Blocking)",379.8760,15.7946
+92,"Simple (Single-Threaded Blocking)",386.7130,15.5154
+93,"Simple (Single-Threaded Blocking)",381.9690,15.7081
+94,"Simple (Single-Threaded Blocking)",380.8580,15.7539
+95,"Simple (Single-Threaded Blocking)",379.7480,15.8000
+96,"Simple (Single-Threaded Blocking)",378.6670,15.8451
+97,"Simple (Single-Threaded Blocking)",379.5570,15.8079
+98,"Simple (Single-Threaded Blocking)",388.4300,15.4468
+99,"Simple (Single-Threaded Blocking)",383.4790,15.6462
+100,"Simple (Single-Threaded Blocking)",381.1360,15.7424
+101,"Simple (Single-Threaded Blocking)",378.6370,15.8463
+102,"Simple (Single-Threaded Blocking)",379.0050,15.8309
+103,"Simple (Single-Threaded Blocking)",378.6830,15.8444
+104,"Simple (Single-Threaded Blocking)",402.4620,14.9082
+105,"Simple (Single-Threaded Blocking)",378.7170,15.8430
+106,"Simple (Single-Threaded Blocking)",377.1370,15.9093
+107,"Simple (Single-Threaded Blocking)",376.5200,15.9354
+108,"Simple (Single-Threaded Blocking)",378.1800,15.8655
+109,"Simple (Single-Threaded Blocking)",381.6370,15.7217
+110,"Simple (Single-Threaded Blocking)",377.8860,15.8778
+111,"Simple (Single-Threaded Blocking)",379.3600,15.8161
+112,"Simple (Single-Threaded Blocking)",378.0310,15.8717
+113,"Simple (Single-Threaded Blocking)",378.5550,15.8497
+114,"Simple (Single-Threaded Blocking)",378.0950,15.8690
+115,"Simple (Single-Threaded Blocking)",379.8580,15.7954
+116,"Simple (Single-Threaded Blocking)",378.2380,15.8630
+117,"Simple (Single-Threaded Blocking)",379.9120,15.7931
+118,"Simple (Single-Threaded Blocking)",378.5950,15.8481
+119,"Simple (Single-Threaded Blocking)",377.7950,15.8816
+120,"Simple (Single-Threaded Blocking)",382.0370,15.7053
+121,"Simple (Single-Threaded Blocking)",378.0720,15.8700
+122,"Simple (Single-Threaded Blocking)",378.1410,15.8671
+123,"Simple (Single-Threaded Blocking)",379.5250,15.8092
+124,"Simple (Single-Threaded Blocking)",385.4860,15.5648
+125,"Simple (Single-Threaded Blocking)",382.0970,15.7028
+126,"Simple (Single-Threaded Blocking)",383.5370,15.6439
+127,"Simple (Single-Threaded Blocking)",376.3110,15.9443
+128,"Simple (Single-Threaded Blocking)",379.5280,15.8091
+129,"Simple (Single-Threaded Blocking)",380.5500,15.7667
+130,"Simple (Single-Threaded Blocking)",379.2850,15.8192
+131,"Simple (Single-Threaded Blocking)",380.5450,15.7669
+132,"Simple (Single-Threaded Blocking)",377.1590,15.9084
+133,"Simple (Single-Threaded Blocking)",378.3000,15.8604
+134,"Simple (Single-Threaded Blocking)",377.2390,15.9050
+135,"Simple (Single-Threaded Blocking)",378.8070,15.8392
+136,"Simple (Single-Threaded Blocking)",380.3280,15.7759
+137,"Simple (Single-Threaded Blocking)",380.4460,15.7710
+138,"Simple (Single-Threaded Blocking)",377.8840,15.8779
+139,"Simple (Single-Threaded Blocking)",378.2850,15.8611
+140,"Simple (Single-Threaded Blocking)",377.6370,15.8883
+141,"Simple (Single-Threaded Blocking)",380.4360,15.7714
+142,"Simple (Single-Threaded Blocking)",387.3270,15.4908
+143,"Simple (Single-Threaded Blocking)",379.2570,15.8204
+144,"Simple (Single-Threaded Blocking)",378.5190,15.8513
+145,"Simple (Single-Threaded Blocking)",379.0020,15.8311
+146,"Simple (Single-Threaded Blocking)",380.3220,15.7761
+147,"Simple (Single-Threaded Blocking)",380.1080,15.7850
+148,"Simple (Single-Threaded Blocking)",379.2300,15.8215
+149,"Simple (Single-Threaded Blocking)",379.1780,15.8237
+150,"Simple (Single-Threaded Blocking)",377.6390,15.8882
+151,"Simple (Single-Threaded Blocking)",380.2200,15.7803
+152,"Simple (Single-Threaded Blocking)",378.9640,15.8326
+153,"Simple (Single-Threaded Blocking)",380.3930,15.7732
+154,"Simple (Single-Threaded Blocking)",378.7210,15.8428
+155,"Simple (Single-Threaded Blocking)",379.0370,15.8296
+156,"Simple (Single-Threaded Blocking)",379.6810,15.8027
+157,"Simple (Single-Threaded Blocking)",378.3310,15.8591
+158,"Simple (Single-Threaded Blocking)",388.6080,15.4397
+159,"Simple (Single-Threaded Blocking)",379.8730,15.7948
+160,"Simple (Single-Threaded Blocking)",378.7030,15.8436
+161,"Simple (Single-Threaded Blocking)",377.3090,15.9021
+162,"Simple (Single-Threaded Blocking)",377.5820,15.8906
+163,"Simple (Single-Threaded Blocking)",385.6700,15.5573
+164,"Simple (Single-Threaded Blocking)",381.5120,15.7269
+165,"Simple (Single-Threaded Blocking)",377.6280,15.8887
+166,"Simple (Single-Threaded Blocking)",376.9050,15.9191
+167,"Simple (Single-Threaded Blocking)",378.6910,15.8441
+168,"Simple (Single-Threaded Blocking)",378.2160,15.8640
+169,"Simple (Single-Threaded Blocking)",381.6240,15.7223
+170,"Simple (Single-Threaded Blocking)",423.8350,14.1565
+171,"Simple (Single-Threaded Blocking)",379.6590,15.8037
+172,"Simple (Single-Threaded Blocking)",380.8520,15.7542
+173,"Simple (Single-Threaded Blocking)",382.1040,15.7025
+174,"Simple (Single-Threaded Blocking)",379.6810,15.8027
+175,"Simple (Single-Threaded Blocking)",385.3660,15.5696
+176,"Simple (Single-Threaded Blocking)",380.3760,15.7739
+177,"Simple (Single-Threaded Blocking)",382.3750,15.6914
+178,"Simple (Single-Threaded Blocking)",385.3500,15.5703
+179,"Simple (Single-Threaded Blocking)",380.1750,15.7822
+180,"Simple (Single-Threaded Blocking)",394.7360,15.2000
+181,"Simple (Single-Threaded Blocking)",381.0960,15.7441
+182,"Simple (Single-Threaded Blocking)",378.6080,15.8475
+183,"Simple (Single-Threaded Blocking)",378.4200,15.8554
+184,"Simple (Single-Threaded Blocking)",378.4090,15.8559
+185,"Simple (Single-Threaded Blocking)",381.0090,15.7477
+186,"Simple (Single-Threaded Blocking)",404.6350,14.8282
+187,"Simple (Single-Threaded Blocking)",378.7120,15.8432
+188,"Simple (Single-Threaded Blocking)",387.5390,15.4823
+189,"Simple (Single-Threaded Blocking)",377.8580,15.8790
+190,"Simple (Single-Threaded Blocking)",377.7300,15.8844
+191,"Simple (Single-Threaded Blocking)",380.4330,15.7715
+192,"Simple (Single-Threaded Blocking)",377.4500,15.8961
+193,"Simple (Single-Threaded Blocking)",392.5720,15.2838
+194,"Simple (Single-Threaded Blocking)",378.4520,15.8541
+195,"Simple (Single-Threaded Blocking)",380.2370,15.7796
+196,"Simple (Single-Threaded Blocking)",380.6250,15.7635
+197,"Simple (Single-Threaded Blocking)",378.9010,15.8353
+198,"Simple (Single-Threaded Blocking)",378.5390,15.8504
+199,"Simple (Single-Threaded Blocking)",379.2300,15.8215
+200,"Simple (Single-Threaded Blocking)",378.6020,15.8478
