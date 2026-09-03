@@ -1,6 +1,7 @@
 #include <gnuradio-4.0/BlockingSync.hpp>
 #include <gnuradio-4.0/EarliestDeadlineFirst.hpp>
 #include <gnuradio-4.0/Graph.hpp>
+#include <gnuradio-4.0/Profiler.hpp>
 #include <gnuradio-4.0/Scheduler.hpp>
 
 #include <algorithm>
@@ -190,10 +191,12 @@ struct BuiltGraph {
 }
 
 template<typename TScheduler>
-void runOnce(std::string_view policy, const std::vector<TaskSpec>& specs, double seconds, double nsPerOp) {
+void runOnce(std::string_view policy, const std::vector<TaskSpec>& specs, double seconds, double nsPerOp, std::string_view traceFile = {}) {
     BuiltGraph built = makeGraph(specs, nsPerOp);
     TScheduler scheduler({{"max_work_items", static_cast<std::size_t>(kChunk)}});
-    if (auto exchanged = scheduler.exchange(std::move(built.flow)); !exchanged.has_value()) {
+    // a traced run writes the scheduler's release/dispatch/complete/miss events (Chrome trace JSON) to traceFile
+    auto exchanged = traceFile.empty() ? scheduler.exchange(std::move(built.flow)) : scheduler.exchange(std::move(built.flow), gr::profiling::Options{.output_file = std::string(traceFile), .output_mode = gr::profiling::OutputMode::File});
+    if (!exchanged.has_value()) {
         throw std::runtime_error(std::format("scheduler exchange failed: {}", exchanged.error()));
     }
 
@@ -237,7 +240,7 @@ void runOnce(std::string_view policy, const std::vector<TaskSpec>& specs, double
 
 int main(int argc, char** argv) {
     if (argc < 4) {
-        std::println("usage: {} <rr|edf|fp> <seconds> <period_ns:cost_ns> [<period_ns:cost_ns> ...]", argv[0]);
+        std::println("usage: {} <rr|edf|fp|edf-trace|fp-trace> <seconds> <period_ns:cost_ns> [<period_ns:cost_ns> ...]", argv[0]);
         return 1;
     }
     const std::string_view policy(argv[1]);
@@ -263,6 +266,12 @@ int main(int argc, char** argv) {
         runOnce<gr::scheduler::EarliestDeadlineFirst<>>("edf", specs, seconds, nsPerOp);
     } else if (policy == "fp") {
         runOnce<gr::scheduler::FixedPriority<>>("fp", specs, seconds, nsPerOp);
+    } else if (policy == "edf-trace") {
+        using Traced = gr::scheduler::EarliestDeadlineFirst<gr::scheduler::ExecutionPolicy::singleThreaded, std::chrono::steady_clock, gr::profiling::Profiler>;
+        runOnce<Traced>("edf", specs, seconds, nsPerOp, "taskset_edf.trace.json");
+    } else if (policy == "fp-trace") {
+        using Traced = gr::scheduler::FixedPriority<gr::scheduler::ExecutionPolicy::singleThreaded, std::chrono::steady_clock, gr::profiling::Profiler>;
+        runOnce<Traced>("fp", specs, seconds, nsPerOp, "taskset_fp.trace.json");
     } else {
         throw std::invalid_argument("policy must be rr, edf, or fp");
     }
