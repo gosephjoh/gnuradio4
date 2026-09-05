@@ -73,7 +73,7 @@ struct EarliestDeadlineFirst : SchedulerBase<EarliestDeadlineFirst<execution, TC
         JobParameters               parameters{};
         JobState<TClock>            jobs{};
         Duration                    relativeDeadline{};
-        Duration                    effectiveDeadline{}; // relativeDeadline after precedence modification
+        Duration                    effectiveDeadline{}; // relativeDeadline after precedence modification; ORDERING ONLY, never miss accounting
         TimePoint                   absoluteDeadline{};
         std::int64_t                fixedPriority     = std::numeric_limits<std::int64_t>::max();
         std::uint64_t               nDispatches       = 0UZ;
@@ -100,9 +100,14 @@ struct EarliestDeadlineFirst : SchedulerBase<EarliestDeadlineFirst<execution, TC
         TimePoint   nextDue{};                       // estimated nominal instant of the source's next job (valid once it has produced)
     };
 
+    // nMisses / maxLateness / maxResponseTime are per-block, per-job: response = completion - release, where release
+    // is the nominal due instant for a paced source with a known period and the arrival (next-probe) instant for every
+    // other block, judged against the block's own relative deadline. This is not the end-to-end chain tardiness the
+    // benchmarks measure at their sinks; a chain of implicit-deadline blocks can miss end-to-end while every block
+    // meets its own. Jobs that never complete are not counted.
     struct Statistics {
         std::uint64_t nDispatches      = 0UZ; // work() calls issued by policy selection
-        std::uint64_t nMisses          = 0UZ;
+        std::uint64_t nMisses          = 0UZ; // jobs whose response exceeded the block's OWN relative deadline (see nMisses note below)
         Duration      maxLateness{};
         std::uint64_t nSelections      = 0UZ; // dispatch passes that found a ready released job
         std::uint64_t nSweeps          = 0UZ; // dispatch passes that used the bounded fallback sweep
@@ -851,8 +856,16 @@ private:
             available = task.jobs.hasPendingJob() ? 0UZ : task.parameters.batchSize;
         }
 
+        // A paced source's job is due at its nominal instant, not at whichever probe happened to notice output room
+        // for it. Once the source has produced, nextDue -- maintained from actual production and never earlier
+        // than the true grid -- is that instant, so the release is stamped min(now, nextDue): the due time when
+        // detection ran late, the detection instant otherwise. Withdrawn re-releases converge on the same stamp,
+        // so pokes no longer move a job's deadline. Every other block is released by its producer's completion,
+        // which the very next probe observes, so `now` already is the arrival instant there.
+        const bool      nominalKnown = task.parameters.source && task.parameters.period > Duration::zero() && !task.parameters.periodFromFallback && task.lastProduction != TimePoint{};
+        const TimePoint releaseAt    = nominalKnown ? std::min(now, task.nextDue) : now;
         const std::uint64_t releasedBefore = task.jobs.nReleased;
-        task.jobs.observeReleases(available, task.parameters.batchSize, now);
+        task.jobs.observeReleases(available, task.parameters.batchSize, releaseAt);
         const std::uint64_t newlyReleased = task.jobs.nReleased - releasedBefore;        if (newlyReleased > 0UZ) {
             if constexpr (kTracing) {
                 trace->instantEvent("scheduler.job.release", "scheduler", {
@@ -861,6 +874,8 @@ private:
                     {"batch", traceInt(task.parameters.batchSize)},
                     {"deadline_ms", traceMs(std::chrono::duration_cast<Duration>(task.jobs.earliestDeadline(task.effectiveDeadline).value_or(TimePoint::max()).time_since_epoch()).count())},
                     {"relative_ms", static_cast<double>(task.effectiveDeadline.count()) / 1e6},
+                    {"release_ms", traceMs(std::chrono::duration_cast<Duration>(releaseAt.time_since_epoch()).count())},
+                    {"own_ms", static_cast<double>(task.relativeDeadline.count()) / 1e6},
                 });
             }
         }
@@ -870,7 +885,9 @@ private:
 
     template<profiling::ProfilerHandlerLike THandler>
     void observeCompletion(Task& task, std::size_t performedWork, TimePoint now, std::uint64_t completedBefore, std::uint64_t missesBefore, THandler trace) {
-        task.jobs.observeCompletion(performedWork, task.parameters.batchSize, task.effectiveDeadline, now);
+        // Judged against the block's own deadline: effectiveDeadline is an ordering key (it inherits downstream
+        // urgency through precedence) and a producer that meets its declared deadline has not missed anything.
+        task.jobs.observeCompletion(performedWork, task.parameters.batchSize, task.relativeDeadline, now);
         task.absoluteDeadline = task.jobs.earliestDeadline(task.effectiveDeadline).value_or(TimePoint::max());
         const std::uint64_t newlyCompleted = task.jobs.nCompleted - completedBefore;
         if (newlyCompleted > 0UZ) {
@@ -890,6 +907,7 @@ private:
                     {"block", std::string(task.block->name())},
                     {"jobs", traceInt(newlyMissed)},
                     {"lateness_ns", traceInt(task.jobs.maxLateness.count())},
+                    {"judged_ms", static_cast<double>(task.relativeDeadline.count()) / 1e6},
                 });
                 trace->counterEvent("scheduler.deadline_misses", "scheduler", {{"count", traceInt(task.jobs.nMissed)}});
             }
@@ -934,7 +952,11 @@ private:
                     task.firstDispatchOrder = gr::atomic_ref(nextDispatchOrder).fetch_add(1UZ);
                 }
             }
-            observeCompletion(task, performedWork, TClock::now(), completedBefore, missesBefore, trace);
+            const TimePoint completedAt = TClock::now();
+            if (performedWork > 0UZ && task.parameters.source) {
+                noteProduction(task, performedWork, completedAt); // keeps nextDue honest when the sweep, not selection, ran the source
+            }
+            observeCompletion(task, performedWork, completedAt, completedBefore, missesBefore, trace);
 
             if (status == work::Status::ERROR) {
                 return {reportedRequest, performedWorkAllBlocks, work::Status::ERROR};
