@@ -108,6 +108,15 @@ struct LatencySink : gr::Block<LatencySink> {
     }
 };
 
+// two-input merge for the fork-join topology; both branches carry the same nominal stamp, so max() preserves it
+struct Join : gr::Block<Join> {
+    gr::PortIn<std::int64_t>  in0;
+    gr::PortIn<std::int64_t>  in1;
+    gr::PortOut<std::int64_t> out;
+    GR_MAKE_REFLECTABLE(Join, in0, in1, out);
+    [[nodiscard]] constexpr std::int64_t processOne(std::int64_t a, std::int64_t b) const noexcept { return std::max(a, b); }
+};
+
 // the identical dependent-chain kernel as BusyWork::processOne, timed to convert C_i into ops_per_sample
 [[nodiscard]] double calibrateNsPerOp() {
     constexpr std::uint64_t kOps = 40'000'000UZ;
@@ -124,9 +133,15 @@ struct LatencySink : gr::Block<LatencySink> {
     return static_cast<double>(std::chrono::duration_cast<std::chrono::nanoseconds>(stop - start).count()) / static_cast<double>(kOps);
 }
 
+// chain: src -> load -> sink. forkJoin: src -> {loadA, loadB} -> join -> sink with the cost split across the branches.
+// forkJoinNonTopological is the same graph with join and sink emplaced BEFORE the branches, so a sweep in insertion
+// order reaches the join before its inputs exist and needs a second pass per job; release-aware dispatch should not care.
+enum class Topology { chain, forkJoin, forkJoinNonTopological };
+
 struct TaskSpec {
     std::int64_t periodNs = 0;
     std::int64_t costNs   = 0;
+    Topology     topology = Topology::chain;
 };
 
 struct TaskChain {
@@ -167,25 +182,58 @@ struct BuiltGraph {
         const auto rate      = static_cast<float>(1e9 * static_cast<double>(kChunk) / static_cast<double>(spec.periodNs));
         const auto ops       = static_cast<gr::Size_t>(std::max(1.0, std::round(static_cast<double>(spec.costNs) / (static_cast<double>(kChunk) * nsPerOp))));
 
+        const auto annotate = [&spec, &priority, index](gr::property_map& meta) {
+            meta[std::string(kBatchSizeKey)] = kChunk;
+            meta[std::string(kPeriodKey)]    = static_cast<std::uint64_t>(spec.periodNs);
+            meta[std::string(kDeadlineKey)]  = static_cast<std::uint64_t>(spec.periodNs); // implicit deadline
+            meta[std::string(kPriorityKey)]  = priority[index];
+        };
+        constexpr gr::Size_t     kBuffer = static_cast<gr::Size_t>(kChunk) * 32U;
+        const gr::EdgeParameters edge{.minBufferSize = kBuffer};
+
         auto& source = built.flow.emplaceBlock<NominalTimeSource>({{"name", std::format("src{}", index)}, {"sample_rate", rate}});
-        auto& load   = built.flow.emplaceBlock<BusyWork>({{"name", std::format("load{}", index)}, {"ops_per_sample", ops}});
-        auto& sink   = built.flow.emplaceBlock<LatencySink>({{"name", std::format("sink{}", index)}});
-        sink.latenciesNs.reserve(1UZ << 20);
+        annotate(source.meta_information.value);
 
-        for (auto* annotated : std::initializer_list<gr::property_map*>{
-                 std::addressof(source.meta_information.value), std::addressof(load.meta_information.value), std::addressof(sink.meta_information.value)}) {
-            (*annotated)[std::string(kBatchSizeKey)] = kChunk;
-            (*annotated)[std::string(kPeriodKey)]    = static_cast<std::uint64_t>(spec.periodNs);
-            (*annotated)[std::string(kDeadlineKey)]  = static_cast<std::uint64_t>(spec.periodNs); // implicit deadline
-            (*annotated)[std::string(kPriorityKey)]  = priority[index];
+        if (spec.topology == Topology::chain) {
+            auto& load = built.flow.emplaceBlock<BusyWork>({{"name", std::format("load{}", index)}, {"ops_per_sample", ops}});
+            auto& sink = built.flow.emplaceBlock<LatencySink>({{"name", std::format("sink{}", index)}});
+            sink.latenciesNs.reserve(1UZ << 20);
+            annotate(load.meta_information.value);
+            annotate(sink.meta_information.value);
+            if (!built.flow.connect<"out", "in">(source, load, edge).has_value() || !built.flow.connect<"out", "in">(load, sink, edge).has_value()) {
+                throw std::runtime_error("failed to connect task chain");
+            }
+            built.chains.push_back(TaskChain{.sink = std::addressof(sink), .spec = spec, .ops = ops});
+            continue;
         }
 
-        constexpr gr::Size_t kBuffer = static_cast<gr::Size_t>(kChunk) * 32U;
-        if (!built.flow.connect<"out", "in">(source, load, {.minBufferSize = kBuffer}).has_value() || //
-            !built.flow.connect<"out", "in">(load, sink, {.minBufferSize = kBuffer}).has_value()) {
-            throw std::runtime_error("failed to connect task chain");
+        const bool       nonTopological = spec.topology == Topology::forkJoinNonTopological;
+        const gr::Size_t half           = std::max(1U, ops / 2U);
+        Join*            join           = nullptr;
+        LatencySink*     sink           = nullptr;
+        const auto       emplaceTail    = [&] {
+            join = std::addressof(built.flow.emplaceBlock<Join>({{"name", std::format("join{}", index)}}));
+            sink = std::addressof(built.flow.emplaceBlock<LatencySink>({{"name", std::format("sink{}", index)}}));
+            sink->latenciesNs.reserve(1UZ << 20);
+            annotate(join->meta_information.value);
+            annotate(sink->meta_information.value);
+        };
+        if (nonTopological) {
+            emplaceTail(); // the sweep will visit join and sink before the branches that feed them
         }
-        built.chains.push_back(TaskChain{.sink = std::addressof(sink), .spec = spec, .ops = ops});
+        auto& branchA = built.flow.emplaceBlock<BusyWork>({{"name", std::format("loadA{}", index)}, {"ops_per_sample", half}});
+        auto& branchB = built.flow.emplaceBlock<BusyWork>({{"name", std::format("loadB{}", index)}, {"ops_per_sample", half}});
+        annotate(branchA.meta_information.value);
+        annotate(branchB.meta_information.value);
+        if (!nonTopological) {
+            emplaceTail();
+        }
+        if (!built.flow.connect<"out", "in">(source, branchA, edge).has_value() || !built.flow.connect<"out", "in">(source, branchB, edge).has_value() ||
+            !built.flow.connect<"out", "in0">(branchA, *join, edge).has_value() || !built.flow.connect<"out", "in1">(branchB, *join, edge).has_value() ||
+            !built.flow.connect<"out", "in">(*join, *sink, edge).has_value()) {
+            throw std::runtime_error("failed to connect fork-join task");
+        }
+        built.chains.push_back(TaskChain{.sink = sink, .spec = spec, .ops = ops});
     }
     return built;
 }
@@ -240,7 +288,7 @@ void runOnce(std::string_view policy, const std::vector<TaskSpec>& specs, double
 
 int main(int argc, char** argv) {
     if (argc < 4) {
-        std::println("usage: {} <rr|edf|fp|edf-trace|fp-trace> <seconds> <period_ns:cost_ns> [<period_ns:cost_ns> ...]", argv[0]);
+        std::println("usage: {} <rr|edf|fp|edf-trace|fp-trace> <seconds> <period_ns:cost_ns[:fj|:fjx]> ...  (fj = fork-join, fjx = fork-join with join emplaced before its branches)", argv[0]);
         return 1;
     }
     const std::string_view policy(argv[1]);
@@ -248,12 +296,16 @@ int main(int argc, char** argv) {
 
     std::vector<TaskSpec> specs;
     for (int arg = 3; arg < argc; ++arg) {
-        const std::string_view pair(argv[arg]);
-        const std::size_t      colon = pair.find(':');
-        if (colon == std::string_view::npos) {
-            throw std::invalid_argument("task spec must be <period_ns:cost_ns>");
+        const std::string_view text(argv[arg]);
+        const std::size_t      first  = text.find(':');
+        const std::size_t      second = first == std::string_view::npos ? first : text.find(':', first + 1);
+        if (first == std::string_view::npos) {
+            throw std::invalid_argument("task spec must be <period_ns:cost_ns[:fj|:fjx]>");
         }
-        specs.push_back(TaskSpec{.periodNs = readInt(pair.substr(0, colon), "period_ns"), .costNs = readInt(pair.substr(colon + 1), "cost_ns")});
+        const std::string_view kind     = second == std::string_view::npos ? std::string_view{} : text.substr(second + 1);
+        const Topology         topology = kind.empty() ? Topology::chain : kind == "fj" ? Topology::forkJoin : kind == "fjx" ? Topology::forkJoinNonTopological : throw std::invalid_argument("task kind must be fj or fjx");
+        const std::string_view costText = second == std::string_view::npos ? text.substr(first + 1) : text.substr(first + 1, second - first - 1);
+        specs.push_back(TaskSpec{.periodNs = readInt(text.substr(0, first), "period_ns"), .costNs = readInt(costText, "cost_ns"), .topology = topology});
     }
 
     const double nsPerOp = calibrateNsPerOp();

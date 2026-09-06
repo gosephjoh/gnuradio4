@@ -11,6 +11,9 @@
 #include <memory>
 #include <mutex>
 #include <set>
+#include <array>
+#include <map>
+#include <string>
 #include <vector>
 
 namespace {
@@ -899,6 +902,96 @@ const boost::ut::suite<"EDFPacedSources"> edfPacedSourceTests = [] {
 
         const auto statistics = sched.statistics();
         expect(that % statistics.nWithdrawn >= static_cast<std::uint64_t>(kRefusals)) << "every premature release must be withdrawn, not left pending";
+    };
+};
+
+namespace {
+
+struct ForkJoinGraph {
+    gr::Graph                               flow;
+    gr::testing::AtomicCountingSink<float>* sink = nullptr;
+};
+
+// src -> {branchA, branchB} -> join -> sink. With joinFirst the join and sink are emplaced BEFORE the branches, so a
+// sweep in insertion order reaches the join before either input exists; a release-aware policy must not care.
+ForkJoinGraph makeForkJoin(gr::Size_t nSamples, bool joinFirst) {
+    using namespace gr::testing;
+    ForkJoinGraph built;
+    auto& source = built.flow.emplaceBlock<CountingSource<float>>({{"name", "src"}, {"n_samples_max", nSamples}});
+    Adder<float>*              join = nullptr;
+    AtomicCountingSink<float>* sink = nullptr;
+    const auto emplaceTail = [&] {
+        join = std::addressof(built.flow.emplaceBlock<Adder<float>>({{"name", "join"}}));
+        sink = std::addressof(built.flow.emplaceBlock<AtomicCountingSink<float>>({{"name", "sink"}}));
+    };
+    if (joinFirst) {
+        emplaceTail();
+    }
+    auto& branchA = built.flow.emplaceBlock<Copy<float>>({{"name", "branchA"}});
+    auto& branchB = built.flow.emplaceBlock<Copy<float>>({{"name", "branchB"}});
+    if (!joinFirst) {
+        emplaceTail();
+    }
+    for (const std::shared_ptr<gr::BlockModel>& block : built.flow.blocks()) {
+        block->metaInformation()[std::string(gr::scheduler::kBatchSizeKey)] = std::uint64_t{100};
+    }
+    boost::ut::expect(built.flow.connect<"out", "in">(source, branchA).has_value());
+    boost::ut::expect(built.flow.connect<"out", "in">(source, branchB).has_value());
+    boost::ut::expect(built.flow.connect<"out", "addend0">(branchA, *join).has_value());
+    boost::ut::expect(built.flow.connect<"out", "addend1">(branchB, *join).has_value());
+    boost::ut::expect(built.flow.connect<"sum", "in">(*join, *sink).has_value());
+    built.sink = sink;
+    return built;
+}
+
+} // namespace
+
+const boost::ut::suite<"EDFTopology"> topologyTests = [] {
+    using namespace boost::ut;
+    using gr::scheduler::EarliestDeadlineFirst;
+    using gr::scheduler::ExecutionPolicy;
+
+    "dispatch order on a fork-join graph is invariant to block insertion order"_test = [] {
+        constexpr gr::Size_t kSamples = 2000U;
+        constexpr std::array kBlocks{"src", "branchA", "branchB", "join", "sink"};
+
+        struct Observed {
+            std::map<std::string, std::uint64_t> firstDispatch;
+            std::map<std::string, std::uint64_t> nDispatches;
+        };
+        const auto run = [&](bool joinFirst) {
+            ForkJoinGraph built = makeForkJoin(kSamples, joinFirst);
+            EarliestDeadlineFirst<ExecutionPolicy::singleThreaded> sched;
+            expect(sched.exchange(std::move(built.flow)).has_value()) << fatal;
+            expect(sched.runAndWait().has_value()) << fatal;
+            expect(that % built.sink->loadCount() == kSamples) << "the fork-join graph must run to completion";
+            Observed observed;
+            for (const char* name : kBlocks) {
+                const auto* task = sched.findTask(name);
+                expect(task != nullptr) << fatal;
+                observed.firstDispatch[name] = task->firstDispatchOrder;
+                observed.nDispatches[name]   = task->nDispatches;
+            }
+            return observed;
+        };
+        const Observed topological    = run(false);
+        const Observed nonTopological = run(true);
+
+        // data flow, not list position, decides when the join and the sink first run
+        for (const Observed& observed : {topological, nonTopological}) {
+            expect(observed.firstDispatch.at("join") > observed.firstDispatch.at("branchA")) << "the join ran before branch A had produced";
+            expect(observed.firstDispatch.at("join") > observed.firstDispatch.at("branchB")) << "the join ran before branch B had produced";
+            expect(observed.firstDispatch.at("sink") > observed.firstDispatch.at("join")) << "the sink ran before the join had produced";
+        }
+
+        // the same relative first-dispatch order and the same dispatch counts in both insertion orders
+        const auto ranking = [&](const Observed& observed) {
+            std::vector<std::string> names(kBlocks.begin(), kBlocks.end());
+            std::ranges::sort(names, [&observed](const std::string& a, const std::string& b) { return observed.firstDispatch.at(a) < observed.firstDispatch.at(b); });
+            return names;
+        };
+        expect(ranking(topological) == ranking(nonTopological)) << "EDF's first-dispatch order changed with block insertion order";
+        expect(topological.nDispatches == nonTopological.nDispatches) << "per-block dispatch counts changed with block insertion order";
     };
 };
 
