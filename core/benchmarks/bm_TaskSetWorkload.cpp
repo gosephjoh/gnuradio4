@@ -239,9 +239,9 @@ struct BuiltGraph {
 }
 
 template<typename TScheduler>
-void runOnce(std::string_view policy, const std::vector<TaskSpec>& specs, double seconds, double nsPerOp, std::string_view traceFile = {}) {
+void runOnce(std::string_view policy, const std::vector<TaskSpec>& specs, double seconds, double nsPerOp, std::string_view traceFile = {}, std::int64_t traceLevel = 2) {
     BuiltGraph built = makeGraph(specs, nsPerOp);
-    TScheduler scheduler({{"max_work_items", static_cast<std::size_t>(kChunk)}});
+    TScheduler scheduler({{"max_work_items", static_cast<std::size_t>(kChunk)}, {"sched_settings", gr::property_map{{"trace_level", traceLevel}}}});
     // a traced run writes the scheduler's release/dispatch/complete/miss events (Chrome trace JSON) to traceFile
     auto exchanged = traceFile.empty() ? scheduler.exchange(std::move(built.flow)) : scheduler.exchange(std::move(built.flow), gr::profiling::Options{.output_file = std::string(traceFile), .output_mode = gr::profiling::OutputMode::File});
     if (!exchanged.has_value()) {
@@ -261,7 +261,14 @@ void runOnce(std::string_view policy, const std::vector<TaskSpec>& specs, double
     }
     if constexpr (requires(const TScheduler& instance) { instance.statistics(); }) {
         const auto statistics = scheduler.statistics();
-        std::println("# sched,{},dispatches={},selections={},sweeps={},withdrawn={},probes={},misses={}", policy, statistics.nDispatches, statistics.nSelections, statistics.nSweeps, statistics.nWithdrawn, statistics.nProbes, statistics.nMisses);
+        std::println("# sched,{},dispatches={},selections={},sweeps={},withdrawn={},probes={},misses={},gaps={},merges={}", policy, statistics.nDispatches, statistics.nSelections, statistics.nSweeps, statistics.nWithdrawn, statistics.nProbes, statistics.nMisses, statistics.nInheritanceGaps, statistics.nProductionMerges);
+        // the scheduler's own per-block counters (no trace needed): the sinks' rows are directly comparable with the
+        // in-graph `task` rows below, since a sink job's deadline is inherited from the source job it consumes
+        if constexpr (requires(const TScheduler& instance) { instance.blockStatistics(); }) {
+            for (const auto& block : scheduler.blockStatistics()) {
+                std::println("# block,{},{},batch={},released={},completed={},missed={},max_response_us={:.1f},mean_response_us={:.1f},gaps={}", policy, block.name, block.batchSize, block.nReleased, block.nCompleted, block.nMissed, static_cast<double>(block.maxResponseTime.count()) / 1e3, static_cast<double>(block.meanResponseTime.count()) / 1e3, block.nInheritanceGaps);
+            }
+        }
     }
 
     // per-job response = the latest arrival among the job's chunk of samples; a job misses when it exceeds
@@ -288,7 +295,7 @@ void runOnce(std::string_view policy, const std::vector<TaskSpec>& specs, double
 
 int main(int argc, char** argv) {
     if (argc < 4) {
-        std::println("usage: {} <rr|edf|fp|edf-trace|fp-trace> <seconds> <period_ns:cost_ns[:fj|:fjx]> ...  (fj = fork-join, fjx = fork-join with join emplaced before its branches)", argv[0]);
+        std::println("usage: {} <rr|edf|fp|edf-trace|fp-trace|edf-trace1> <seconds> <period_ns:cost_ns[:fj|:fjx]> ...  (fj = fork-join, fjx = fork-join with join emplaced before its branches)", argv[0]);
         return 1;
     }
     const std::string_view policy(argv[1]);
@@ -324,7 +331,10 @@ int main(int argc, char** argv) {
     } else if (policy == "fp-trace") {
         using Traced = gr::scheduler::FixedPriority<gr::scheduler::ExecutionPolicy::singleThreaded, std::chrono::steady_clock, gr::profiling::Profiler>;
         runOnce<Traced>("fp", specs, seconds, nsPerOp, "taskset_fp.trace.json");
+    } else if (policy == "edf-trace1") {
+        using Traced = gr::scheduler::EarliestDeadlineFirst<gr::scheduler::ExecutionPolicy::singleThreaded, std::chrono::steady_clock, gr::profiling::Profiler>;
+        runOnce<Traced>("edf", specs, seconds, nsPerOp, "taskset_edf1.trace.json", 1); // job events only: no candidate lists, no idle pokes
     } else {
-        throw std::invalid_argument("policy must be rr, edf, or fp");
+        throw std::invalid_argument("policy must be rr, edf, fp, edf-trace, fp-trace or edf-trace1");
     }
 }

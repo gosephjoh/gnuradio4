@@ -37,6 +37,9 @@ inline constexpr std::string_view kPartitioningKey           = "deadline_partiti
 inline constexpr std::string_view kImplicitDeadlineKey       = "implicit_deadlines";
 inline constexpr std::string_view kBufferPressureDeadlineKey = "buffer_pressure_deadlines";
 inline constexpr std::string_view kRealTimePriorityKey       = "rt_priority"; // 0 disables; otherwise SCHED_FIFO priority
+inline constexpr std::string_view kTraceLevelKey            = "trace_level";      // 0: counters only, 1: job events, 2: everything (default)
+inline constexpr std::string_view kVerifySelectionKey       = "verify_selection"; // debug: count heap selections that disagree with a linear scan
+inline constexpr std::string_view kHeapSelectionKey         = "heap_selection";   // 1: heap always, 0: linear scan always, -1 (default): heap once a worker holds more than kHeapThreshold tasks
 
 /**
  * @brief Non-preemptive job-aware scheduler, using EDF unless another release-aware policy is supplied.
@@ -72,20 +75,27 @@ struct EarliestDeadlineFirst : SchedulerBase<EarliestDeadlineFirst<execution, TC
         std::shared_ptr<BlockModel> block;
         JobParameters               parameters{};
         JobState<TClock>            jobs{};
+        ProductionLog<TClock>       production{};        // deadlines carried by this block's released output, for its consumers to inherit
         Duration                    relativeDeadline{};
         Duration                    effectiveDeadline{}; // relativeDeadline after precedence modification; ORDERING ONLY, never miss accounting
-        TimePoint                   absoluteDeadline{};
-        std::int64_t                fixedPriority     = std::numeric_limits<std::int64_t>::max();
-        std::uint64_t               nDispatches       = 0UZ;
+        TimePoint                   absoluteDeadline{};  // deadline of the oldest outstanding job (inherited or own); valid while one is pending
+        std::int64_t                fixedPriority      = std::numeric_limits<std::int64_t>::max();
+        std::uint64_t               nDispatches        = 0UZ;
         std::uint64_t               firstDispatchOrder = std::numeric_limits<std::uint64_t>::max();
-        bool                        retired           = false; // work() reported DONE; excluded from selection
+        std::uint64_t               nInheritanceGaps   = 0UZ; // release groups for which a feeding log had nothing to inherit (own deadline used)
+        std::uint64_t               outputNumerator    = 1UZ; // output units per work unit = outputNumerator / outputDenominator (resampling ratio)
+        std::uint64_t               outputDenominator  = 1UZ;
+        bool                        retired            = false; // work() reported DONE; excluded from selection
 
         // Incremental-scan state. A block's port occupancy only changes when it runs or when a graph
-        // neighbour runs, and JobState::observeReleases is idempotent for unchanged occupancy, so a task that
+        // neighbour runs, and the release observation is idempotent for unchanged occupancy, so a task that
         // is not dirty needs neither a release observation nor a readiness probe.
         std::vector<std::size_t> consumers{};              // indices into this runner's task vector
         std::vector<std::size_t> producers{};              // indices into this runner's task vector
+        std::vector<std::size_t> feeds{};                  // producers over forward edges on this runner: the logs this block inherits deadlines from
+        std::vector<std::size_t> fed{};                    // consumers over forward edges on this runner: their completed units bound what the log keeps
         bool                     dirty       = true;
+        bool                     queued      = false;      // sits in the selector's dirty queue
         bool                     ready       = false;      // cached result of isReady(), valid while !dirty
         bool                     alwaysDirty = false;      // async ports, or a neighbour on another worker
         bool                     eligible    = false;      // released, ready and not retired; valid while !dirty
@@ -98,16 +108,19 @@ struct EarliestDeadlineFirst : SchedulerBase<EarliestDeadlineFirst<execution, TC
         TimePoint   stalledUntil{};                  // ... and, for a source with a known period, until it can be due again
         TimePoint   lastProduction{};                // last dispatch at which a source actually produced
         TimePoint   nextDue{};                       // estimated nominal instant of the source's next job (valid once it has produced)
+
+        /// cumulative work units -> cumulative output units, i.e. what a consumer counts as input units
+        [[nodiscard]] std::uint64_t outputUnits(std::uint64_t workUnits) const noexcept { return workUnits * outputNumerator / outputDenominator; }
     };
 
-    // nMisses / maxLateness / maxResponseTime are per-block, per-job: response = completion - release, where release
-    // is the nominal due instant for a paced source with a known period and the arrival (next-probe) instant for every
-    // other block, judged against the block's own relative deadline. This is not the end-to-end chain tardiness the
-    // benchmarks measure at their sinks; a chain of implicit-deadline blocks can miss end-to-end while every block
-    // meets its own. Jobs that never complete are not counted.
+    // nMisses / maxLateness / maxResponseTime are per job: response = completion - release, where release is the
+    // nominal due instant for a paced source with a known period and the arrival (next-probe) instant for every other
+    // block. A job misses when it completes after its absolute deadline, which it inherits from the producer jobs
+    // whose output it consumes (never later than its own release + relative deadline), so a miss at a sink is the
+    // end-to-end tardiness the benchmarks measure there. Jobs that never complete are not counted.
     struct Statistics {
         std::uint64_t nDispatches      = 0UZ; // work() calls issued by policy selection
-        std::uint64_t nMisses          = 0UZ; // jobs whose response exceeded the block's OWN relative deadline (see nMisses note below)
+        std::uint64_t nMisses          = 0UZ; // jobs completed after their (inherited or own) absolute deadline
         Duration      maxLateness{};
         std::uint64_t nSelections      = 0UZ; // dispatch passes that found a ready released job
         std::uint64_t nSweeps          = 0UZ; // dispatch passes that used the bounded fallback sweep
@@ -119,6 +132,129 @@ struct EarliestDeadlineFirst : SchedulerBase<EarliestDeadlineFirst<execution, TC
         std::uint64_t nPending         = 0UZ;
         std::uint64_t nReleaseOverflows = 0UZ;
         Duration      maxResponseTime{};
+        std::uint64_t nInheritanceGaps     = 0UZ; // release groups that found no producer record to inherit a deadline from
+        std::uint64_t nProductionMerges    = 0UZ; // production-log overflows; each one makes some inherited deadline pessimistic
+        std::uint64_t nSelectionMismatches = 0UZ; // heap selections that disagreed with a linear scan (only counted with verify_selection)
+    };
+
+    /// per-block counters: the always-on, allocation-free alternative to a full event trace
+    struct BlockStatistics {
+        std::string   name;
+        std::size_t   batchSize = 0UZ;
+        Duration      period{};
+        Duration      relativeDeadline{};
+        Duration      effectiveDeadline{};
+        std::uint64_t nDispatches      = 0UZ;
+        std::uint64_t nReleased        = 0UZ;
+        std::uint64_t nCompleted       = 0UZ;
+        std::uint64_t nMissed          = 0UZ;
+        std::uint64_t nWithdrawn       = 0UZ;
+        std::uint64_t nInheritanceGaps = 0UZ;
+        Duration      maxResponseTime{};
+        Duration      meanResponseTime{};
+        Duration      maxLateness{};
+        std::array<std::uint64_t, JobState<TClock>::kHistogramBuckets> responseHistogram{}; // see JobState::kHistogramBuckets
+    };
+
+    // Per-worker selection state: an indexed min-heap of the eligible tasks keyed by the policy, the queue of
+    // tasks whose key may have moved since they were last probed, and the list of parked tasks. A selection then
+    // costs O(dirty * log n) rather than a scan over every task. The heap holds exactly the tasks a linear scan
+    // would consider and orders them by the same key -- which ends in the task index, so it is a total order --
+    // hence it yields the very task the scan would; `verify_selection` asserts that at run time.
+    struct Selector {
+        using Key = decltype(std::declval<const TPolicy&>().key(std::declval<const BlockModel&>(), std::declval<const SchedState&>()));
+        static constexpr std::size_t kNotInHeap = std::numeric_limits<std::size_t>::max();
+
+        std::vector<std::size_t> heap;        // task indices ordered by key; heap[0] is the most urgent
+        std::vector<std::size_t> position;    // task index -> heap slot, or kNotInHeap
+        std::vector<Key>         keys;        // valid while the task is in the heap
+        std::vector<std::size_t> dirtyQueue;  // tasks to (re-)probe before the next selection
+        std::vector<std::size_t> parked;      // tasks waiting for progress and/or time before they may be re-probed
+        std::vector<std::size_t> alwaysDirty; // async ports or off-worker neighbours: re-probed on every selection
+
+        void reset(std::size_t nTasks) {
+            heap.clear();
+            heap.reserve(nTasks);
+            position.assign(nTasks, kNotInHeap);
+            keys.assign(nTasks, Key{});
+            dirtyQueue.clear();
+            dirtyQueue.reserve(nTasks);
+            parked.clear();
+            parked.reserve(nTasks);
+            alwaysDirty.clear();
+        }
+
+        [[nodiscard]] bool        empty() const noexcept { return heap.empty(); }
+        [[nodiscard]] std::size_t top() const noexcept { return heap.front(); }
+        [[nodiscard]] bool        contains(std::size_t index) const noexcept { return position[index] != kNotInHeap; }
+
+        void update(std::size_t index, const Key& key) {
+            keys[index] = key;
+            if (position[index] == kNotInHeap) {
+                position[index] = heap.size();
+                heap.push_back(index);
+                siftUp(position[index]);
+                return;
+            }
+            siftDown(siftUp(position[index]));
+        }
+
+        void erase(std::size_t index) noexcept {
+            const std::size_t slot = position[index];
+            if (slot == kNotInHeap) {
+                return;
+            }
+            const std::size_t last = heap.size() - 1UZ;
+            if (slot != last) {
+                swapSlots(slot, last);
+            }
+            heap.pop_back();
+            position[index] = kNotInHeap;
+            if (slot < heap.size()) {
+                siftDown(siftUp(slot));
+            }
+        }
+
+    private:
+        [[nodiscard]] bool less(std::size_t slotA, std::size_t slotB) const noexcept { return keys[heap[slotA]] < keys[heap[slotB]]; }
+
+        void swapSlots(std::size_t slotA, std::size_t slotB) noexcept {
+            std::swap(heap[slotA], heap[slotB]);
+            position[heap[slotA]] = slotA;
+            position[heap[slotB]] = slotB;
+        }
+
+        std::size_t siftUp(std::size_t slot) noexcept {
+            while (slot > 0UZ) {
+                const std::size_t parent = (slot - 1UZ) / 2UZ;
+                if (!less(slot, parent)) {
+                    break;
+                }
+                swapSlots(slot, parent);
+                slot = parent;
+            }
+            return slot;
+        }
+
+        std::size_t siftDown(std::size_t slot) noexcept {
+            const std::size_t n = heap.size();
+            while (true) {
+                const std::size_t left     = 2UZ * slot + 1UZ;
+                const std::size_t right    = left + 1UZ;
+                std::size_t       smallest = slot;
+                if (left < n && less(left, smallest)) {
+                    smallest = left;
+                }
+                if (right < n && less(right, smallest)) {
+                    smallest = right;
+                }
+                if (smallest == slot) {
+                    return slot;
+                }
+                swapSlots(slot, smallest);
+                slot = smallest;
+            }
+        }
     };
 
     // The null profiler's handler methods are no-ops, but their arguments are still evaluated at every call
@@ -127,26 +263,37 @@ struct EarliestDeadlineFirst : SchedulerBase<EarliestDeadlineFirst<execution, TC
     static constexpr bool kTracing = !std::same_as<TProfiler, profiling::null::Profiler>;
 
     static constexpr Duration kFallbackDeadline = std::chrono::milliseconds(10);
+    // Below this many tasks per worker a linear scan over the eligible set is cheaper than keeping the heap
+    // ordered on every probe (measured on an 8-block chain at 64-sample batches: the heap's per-probe sift and
+    // key bookkeeping cost more than the scan it replaces); above it the O(log n) selection wins.
+    static constexpr std::size_t kHeapThreshold = 32UZ;
     static constexpr Duration kMinimumDeadline  = std::chrono::nanoseconds(1); // floor for the precedence fixpoint
 
     using base_t::base_t;
 
     std::vector<std::vector<Task>> tasksPerRunner; // indexed by runnerID; disjoint, so lock-free on the dispatch path
+    std::vector<Selector>          selectorPerRunner;
     std::vector<std::uint64_t>     nSelectionsPerRunner;
     std::vector<std::uint64_t>     nSweepsPerRunner;
+    std::vector<std::uint64_t>     nProbesPerRunner; // port probes on the dispatch path; per worker so no write is shared
+    std::vector<std::uint64_t>     nMismatchesPerRunner;
     std::vector<std::uint8_t>      rtAppliedPerRunner;
     RateMap                        propagatedRates;
-    std::unordered_map<const BlockModel*, std::vector<const BlockModel*>> consumersOf; // block -> blocks it feeds
-    std::unordered_map<const BlockModel*, std::vector<const BlockModel*>> producersOf; // block -> blocks feeding it
+    std::unordered_map<const BlockModel*, std::vector<const BlockModel*>> consumersOf;  // block -> blocks it feeds
+    std::unordered_map<const BlockModel*, std::vector<const BlockModel*>> producersOf;  // block -> blocks feeding it
+    std::set<BlockEdge>                                                   backEdges;    // loop-closing edges: no deadline flows across them
+    std::unordered_map<const BlockModel*, std::size_t>                    bufferBounds; // block -> smallest buffer on any of its edges
     Duration                       defaultDeadline          = kFallbackDeadline;
     bool                           precedenceDeadlines      = true;
     bool                           deadlinePartitioning     = true;
     bool                           implicitDeadlines        = true;  // unannotated deadline equals the fixed-batch period
     bool                           bufferPressureDeadlines  = false; // optional secondary EDF key adjustment
+    bool                           verifySelection          = false; // debug: cross-check every heap selection against a linear scan
+    int                            heapSelection            = -1;    // see kHeapSelectionKey
+    int                            traceLevel               = 2;     // 0: counters only; 1: job events, no candidate lists or idle pokes; 2: everything
     int                            realTimePriority         = 0;     // opt-in: 0 leaves worker threads on the default policy
     std::size_t                    nInfeasibleDeadlines     = 0UZ;   // precedence constraints that cannot meet their deadlines
     std::uint64_t                  nextDispatchOrder        = 0UZ;
-    mutable std::uint64_t          nProbesTotal             = 0UZ; // instrumentation: port probes issued on the dispatch path
     TimePoint                      traceEpoch{};                    // reference instant for trace time stamps
 
     void customInit() {
@@ -157,6 +304,8 @@ struct EarliestDeadlineFirst : SchedulerBase<EarliestDeadlineFirst<execution, TC
         const gr::Graph                               flatGraph = gr::graph::flatten(*this->_graph);
         const std::vector<std::shared_ptr<BlockModel>> blockList(flatGraph.blocks().begin(), flatGraph.blocks().end());
         const std::size_t                             nBatches = batchCount(blockList.size());
+        backEdges                                              = collectBackEdges(flatGraph);
+        bufferBounds                                           = computeBufferBounds(flatGraph);
         propagatedRates                                        = computePropagatedRates(flatGraph, blockList);
         std::tie(consumersOf, producersOf)                     = computeAdjacency(flatGraph);
 
@@ -173,15 +322,18 @@ struct EarliestDeadlineFirst : SchedulerBase<EarliestDeadlineFirst<execution, TC
         *this->_executionOrder = std::move(jobs);
 
         tasksPerRunner.assign(nBatches, {});
+        selectorPerRunner.assign(nBatches, {});
         nSelectionsPerRunner.assign(nBatches, 0UZ);
         nSweepsPerRunner.assign(nBatches, 0UZ);
+        nProbesPerRunner.assign(nBatches, 0UZ);
+        nMismatchesPerRunner.assign(nBatches, 0UZ);
         rtAppliedPerRunner.assign(nBatches, 0U);
         nextDispatchOrder = 0UZ;
 
         const TimePoint now = TClock::now();
         traceEpoch          = now;
         for (std::size_t runnerID = 0UZ; runnerID < nBatches; ++runnerID) {
-            syncTasks(tasksPerRunner[runnerID], (*this->_executionOrder)[runnerID]);
+            syncTasks(runnerID, (*this->_executionOrder)[runnerID]);
             for (Task& task : tasksPerRunner[runnerID]) {
                 task.effectiveDeadline = effective.at(task.block.get());
                 task.absoluteDeadline  = now + task.effectiveDeadline;
@@ -198,8 +350,9 @@ struct EarliestDeadlineFirst : SchedulerBase<EarliestDeadlineFirst<execution, TC
 
         applyRealTimePriorityOnce(runnerID);
 
-        std::vector<Task>& tasks = tasksPerRunner[runnerID];
-        syncTasks(tasks, blocks);
+        syncTasks(runnerID, blocks);
+        std::vector<Task>& tasks    = tasksPerRunner[runnerID];
+        Selector&          selector = selectorPerRunner[runnerID];
 
         auto* trace = this->_profiler.forThisThread();
 
@@ -215,7 +368,7 @@ struct EarliestDeadlineFirst : SchedulerBase<EarliestDeadlineFirst<execution, TC
 
         TimePoint now = TClock::now();
         for (std::size_t dispatch = 0UZ; dispatch < maxDispatches; ++dispatch) {
-            Task* selected = selectNextReady(tasks, now, trace);
+            Task* selected = selectNextReady(runnerID, now, trace);
 
             if (selected == nullptr) {
                 if (dispatch > 0UZ) {
@@ -224,13 +377,14 @@ struct EarliestDeadlineFirst : SchedulerBase<EarliestDeadlineFirst<execution, TC
                 // No complete fixed batch is ready. A bounded sweep preserves GR4's DONE detection and drains
                 // a final partial batch while still feeding every observed release/completion into the tracker.
                 nSweepsPerRunner[runnerID]++;
-                std::ranges::for_each(tasks, [](Task& task) { task.dirty = true; });
-                const work::Result swept = trackedFallbackSweep(tasks, trace);
+                markAllDirty(runnerID);
+                const work::Result swept = trackedFallbackSweep(runnerID, trace);
                 if (swept.status != work::Status::DONE) {
                     std::ranges::for_each(tasks, [](Task& task) { task.retired = false; });
                 }
                 return swept;
             }
+            const auto index = static_cast<std::size_t>(selected - tasks.data());
             nSelectionsPerRunner[runnerID]++;
             selected->nDispatches++;
             if (selected->firstDispatchOrder == std::numeric_limits<std::uint64_t>::max()) {
@@ -240,28 +394,43 @@ struct EarliestDeadlineFirst : SchedulerBase<EarliestDeadlineFirst<execution, TC
             const std::size_t requestedWork   = std::min(this->max_work_items.value, selected->parameters.batchSize);
             const auto        missesBefore    = selected->jobs.nMissed;
             const auto        completedBefore = selected->jobs.nCompleted;
-            [[maybe_unused]] auto dispatchEvent = [&] {
-                if constexpr (kTracing) {
-                    return trace->startCompleteEvent("scheduler.job.dispatch", "scheduler", {
-                        {"block", std::string(selected->block->name())},
-                        {"batch", traceInt(requestedWork)},
-                        {"priority", traceInt(selected->fixedPriority)},
-                        {"now_ms", traceMs(std::chrono::duration_cast<Duration>(now.time_since_epoch()).count())},
-                        {"deadline_ms", traceMs(selected->keyDeadlineNs)},
-                        {"release_ms", traceMs(static_cast<std::int64_t>(selected->keyReleaseNs))},
-                        {"candidates", eligibleCandidates(tasks, *selected)},
-                    });
-                } else {
-                    return trace->startCompleteEvent("scheduler.job.dispatch");
-                }
-            }();
 
             // sampled before work() so a timer tick that fires during the call still counts as fresh progress
             const bool        timeGatedRelease   = selected->parameters.source || !selected->parameters.tracked;
             const std::size_t progressBeforeWork = timeGatedRelease ? this->_graph->progress().value() : 0UZ;
 
-            const auto [reportedRequest, performedWork, status] = selected->block->work(requestedWork);
-            dispatchEvent.finish();
+            work::Result result{};
+            if constexpr (kTracing) {
+                if (traceLevel >= 2) {
+                    auto dispatchEvent = trace->startCompleteEvent("scheduler.job.dispatch", "scheduler", {
+                        {"block", std::string(selected->block->name())},
+                        {"batch", traceInt(requestedWork)},
+                        {"priority", traceInt(selected->fixedPriority)},
+                        {"now_ms", traceMs(nanosecondsOf(now))},
+                        {"deadline_ms", traceMs(selected->keyDeadlineNs)},
+                        {"release_ms", traceMs(static_cast<std::int64_t>(selected->keyReleaseNs))},
+                        {"candidates", eligibleCandidates(tasks, *selected)},
+                    });
+                    result = selected->block->work(requestedWork);
+                    dispatchEvent.finish();
+                } else if (traceLevel == 1) {
+                    auto dispatchEvent = trace->startCompleteEvent("scheduler.job.dispatch", "scheduler", {
+                        {"block", std::string(selected->block->name())},
+                        {"batch", traceInt(requestedWork)},
+                        {"priority", traceInt(selected->fixedPriority)},
+                        {"now_ms", traceMs(nanosecondsOf(now))},
+                        {"deadline_ms", traceMs(selected->keyDeadlineNs)},
+                        {"release_ms", traceMs(static_cast<std::int64_t>(selected->keyReleaseNs))},
+                    });
+                    result = selected->block->work(requestedWork);
+                    dispatchEvent.finish();
+                } else {
+                    result = selected->block->work(requestedWork);
+                }
+            } else {
+                result = selected->block->work(requestedWork);
+            }
+            const auto [reportedRequest, performedWork, status] = result;
             now = TClock::now(); // also serves as the next selection's release-observation instant
             observeCompletion(*selected, performedWork, now, completedBefore, missesBefore, trace);
             if (performedWork > 0UZ && selected->parameters.source) {
@@ -270,19 +439,15 @@ struct EarliestDeadlineFirst : SchedulerBase<EarliestDeadlineFirst<execution, TC
 
             // A consumer gained input, so its availability genuinely moved. A producer only gained output
             // room: unless output room was what capped it, available = min(input, output) is unchanged and
-            // observeReleases would be a no-op, making the probe pure waste.
-            // Re-probing the block that just ran is normally a no-op that can be proven away: observeReleases
-            // keys on (nWorkUnits + available) / batchSize, and the work() call grew nWorkUnits by exactly the
-            // amount it drained from available, so the release count cannot have moved. Once it has drained
-            // everything it had, nothing can make it eligible again until a producer feeds it -- and that
-            // producer's dispatch marks it dirty. Anything less certain falls back to a real probe.
-            selected->dirty = true;
+            // the release observation would be a no-op, making the probe pure waste. The block that just ran
+            // is re-probed because it may have another complete batch waiting.
+            markDirty(runnerID, index);
             for (const std::size_t consumer : selected->consumers) {
-                tasks[consumer].dirty = true;
+                markDirty(runnerID, consumer);
             }
             for (const std::size_t producer : selected->producers) {
                 if (tasks[producer].outputLimited) {
-                    tasks[producer].dirty = true;
+                    markDirty(runnerID, producer);
                 }
             }
 
@@ -290,8 +455,8 @@ struct EarliestDeadlineFirst : SchedulerBase<EarliestDeadlineFirst<execution, TC
                 return {reportedRequest, performedWorkThisPass + performedWork, work::Status::ERROR};
             }
             if (status == work::Status::DONE) {
-                selected->retired = true;
-                selected->jobs.cancelPending();
+                retire(*selected, trace);
+                selector.erase(index);
             } else if (performedWork == 0UZ && timeGatedRelease) {
                 // The probe can only see that the block *may* run (output room, message arrival), not that it
                 // is due: a paced source that is not due yet performs no work but keeps the earliest deadline,
@@ -299,11 +464,13 @@ struct EarliestDeadlineFirst : SchedulerBase<EarliestDeadlineFirst<execution, TC
                 // release -- withdrawn, not cancelled, so the next observation may re-release it -- and park the
                 // task until global progress moves: work performed elsewhere, or the wake a paced source's
                 // timer thread raises when its next chunk falls due.
-                selected->jobs.withdrawPendingReleases();
+                withdrawPremature(*selected, trace);
                 selected->stalledAtProgress = progressBeforeWork;
                 selected->stalledUntil      = repokeNotBefore(*selected, now);
                 selected->eligible          = false;
                 selected->dirty             = false;
+                selector.erase(index);
+                selector.parked.push_back(index);
             }
 
             requestedWorkThisPass += requestedWork;
@@ -329,11 +496,41 @@ struct EarliestDeadlineFirst : SchedulerBase<EarliestDeadlineFirst<execution, TC
                 summary.nPending += task.jobs.nPendingJobs();
                 summary.nReleaseOverflows += task.jobs.nReleaseOverflows;
                 summary.maxResponseTime = std::max(summary.maxResponseTime, task.jobs.maxResponseTime);
+                summary.nInheritanceGaps += task.nInheritanceGaps;
+                summary.nProductionMerges += task.production.nMerged;
             }
         }
-        summary.nSelections = std::accumulate(nSelectionsPerRunner.begin(), nSelectionsPerRunner.end(), std::uint64_t{0});
-        summary.nSweeps     = std::accumulate(nSweepsPerRunner.begin(), nSweepsPerRunner.end(), std::uint64_t{0});
-        summary.nProbes     = nProbesTotal;
+        summary.nSelections          = std::accumulate(nSelectionsPerRunner.begin(), nSelectionsPerRunner.end(), std::uint64_t{0});
+        summary.nSweeps              = std::accumulate(nSweepsPerRunner.begin(), nSweepsPerRunner.end(), std::uint64_t{0});
+        summary.nProbes              = std::accumulate(nProbesPerRunner.begin(), nProbesPerRunner.end(), std::uint64_t{0});
+        summary.nSelectionMismatches = std::accumulate(nMismatchesPerRunner.begin(), nMismatchesPerRunner.end(), std::uint64_t{0});
+        return summary;
+    }
+
+    // per-block view of the same counters plus each block's response-time histogram; same read conditions
+    [[nodiscard]] std::vector<BlockStatistics> blockStatistics() const {
+        std::vector<BlockStatistics> summary;
+        for (const std::vector<Task>& tasks : tasksPerRunner) {
+            for (const Task& task : tasks) {
+                summary.push_back(BlockStatistics{
+                    .name              = std::string(task.block->name()),
+                    .batchSize         = task.parameters.batchSize,
+                    .period            = task.parameters.period,
+                    .relativeDeadline  = task.relativeDeadline,
+                    .effectiveDeadline = task.effectiveDeadline,
+                    .nDispatches       = task.nDispatches,
+                    .nReleased         = task.jobs.nReleased,
+                    .nCompleted        = task.jobs.nCompleted,
+                    .nMissed           = task.jobs.nMissed,
+                    .nWithdrawn        = task.jobs.nWithdrawn,
+                    .nInheritanceGaps  = task.nInheritanceGaps,
+                    .maxResponseTime   = task.jobs.maxResponseTime,
+                    .meanResponseTime  = task.jobs.nCompleted > 0UZ ? task.jobs.totalResponseTime / static_cast<Duration::rep>(task.jobs.nCompleted) : Duration::zero(),
+                    .maxLateness       = task.jobs.maxLateness,
+                    .responseHistogram = task.jobs.responseHistogram,
+                });
+            }
+        }
         return summary;
     }
 
@@ -370,6 +567,18 @@ private:
         if (const auto it = settings.find(kBufferPressureDeadlineKey); it != settings.end()) {
             const auto       entry  = (*it).second;
             bufferPressureDeadlines = entry.value_or<bool>(false);
+        }
+        if (const auto it = settings.find(kVerifySelectionKey); it != settings.end()) {
+            const auto entry = (*it).second;
+            verifySelection  = entry.value_or<bool>(false);
+        }
+        if (const auto it = settings.find(kHeapSelectionKey); it != settings.end()) {
+            const auto entry = (*it).second;
+            heapSelection    = static_cast<int>(std::clamp<std::int64_t>(entry.value_or<std::int64_t>(-1), -1, 1));
+        }
+        if (const auto it = settings.find(kTraceLevelKey); it != settings.end()) {
+            const auto entry = (*it).second;
+            traceLevel       = static_cast<int>(std::clamp<std::int64_t>(entry.value_or<std::int64_t>(2), 0, 2));
         }
         if (const auto it = settings.find(kRealTimePriorityKey); it != settings.end()) {
             const auto       entry    = (*it).second;
@@ -460,36 +669,89 @@ private:
 
     // Resolves each task's neighbour list to indices within this worker's task vector. A neighbour owned by
     // another worker cannot be tracked from here, so the task is pinned dirty instead; the same applies to
-    // async ports, whose occupancy can change without any block in this graph running.
-    void linkNeighbours(std::vector<Task>& tasks) const {
+    // async ports, whose occupancy can change without any block in this graph running. Forward (non-loop)
+    // edges between in-worker tasks additionally become deadline-inheritance feeds. The selector is rebuilt
+    // from scratch: every task starts dirty, and a task that was parked stays parked.
+    void linkNeighbours(std::vector<Task>& tasks, Selector& selector) const {
         std::unordered_map<const BlockModel*, std::size_t> position;
         position.reserve(tasks.size());
         for (std::size_t index = 0UZ; index < tasks.size(); ++index) {
             position.emplace(tasks[index].block.get(), index);
         }
 
-        for (Task& task : tasks) {
+        selector.reset(tasks.size());
+        for (std::size_t index = 0UZ; index < tasks.size(); ++index) {
+            Task& task = tasks[index];
             task.consumers.clear();
             task.producers.clear();
+            task.feeds.clear();
+            task.fed.clear();
             task.dirty       = true;
+            task.queued      = false;
+            task.eligible    = false;
             task.alwaysDirty = task.block->hasAsyncInputPorts() || task.block->hasAsyncOutputPorts();
 
-            const auto resolve = [&](const Adjacency& map, std::vector<std::size_t>& into) {
+            const auto resolve = [&](const Adjacency& map, std::vector<std::size_t>& into, std::vector<std::size_t>& forward, bool neighbourIsProducer) {
                 const auto found = map.find(task.block.get());
                 if (found == map.end()) {
                     return;
                 }
                 for (const BlockModel* neighbour : found->second) {
-                    if (const auto at = position.find(neighbour); at != position.end()) {
-                        into.push_back(at->second);
-                    } else {
+                    const auto at = position.find(neighbour);
+                    if (at == position.end()) {
                         task.alwaysDirty = true; // lives on another worker; its effect on us is unobservable here
+                        continue;
+                    }
+                    into.push_back(at->second);
+                    const BlockEdge edge = neighbourIsProducer ? BlockEdge{neighbour, task.block.get()} : BlockEdge{task.block.get(), neighbour};
+                    if (!backEdges.contains(edge)) {
+                        forward.push_back(at->second);
                     }
                 }
             };
-            resolve(consumersOf, task.consumers);
-            resolve(producersOf, task.producers);
+            resolve(consumersOf, task.consumers, task.fed, false);
+            resolve(producersOf, task.producers, task.feeds, true);
+
+            if (task.alwaysDirty) {
+                selector.alwaysDirty.push_back(index);
+            }
+            if (task.stalledAtProgress != Task::kNotStalled) {
+                selector.parked.push_back(index);
+            } else {
+                task.queued = true;
+                selector.dirtyQueue.push_back(index);
+            }
         }
+    }
+
+    // smallest buffer on any edge touching a block: an upper bound on the batch a job can ever be released with
+    [[nodiscard]] static std::unordered_map<const BlockModel*, std::size_t> computeBufferBounds(const gr::Graph& flatGraph) {
+        std::unordered_map<const BlockModel*, std::size_t> bounds;
+        for (const gr::Edge& edge : flatGraph.edges()) {
+            const std::size_t size = edge.minBufferSize();
+            if (size == 0UZ || size == std::numeric_limits<std::size_t>::max()) {
+                continue;
+            }
+            for (const BlockModel* block : {static_cast<const BlockModel*>(edge.sourceBlock().get()), static_cast<const BlockModel*>(edge.destinationBlock().get())}) {
+                if (block == nullptr) {
+                    continue;
+                }
+                if (const auto [at, inserted] = bounds.try_emplace(block, size); !inserted) {
+                    at->second = std::min(at->second, size);
+                }
+            }
+        }
+        return bounds;
+    }
+
+    // the batch an unannotated block gets: the scheduler's work quantum, or -- when that is unbounded -- one full
+    // buffer, the same quantum round-robin processes per work() call. 0 when neither is known.
+    [[nodiscard]] std::size_t defaultBatchFor(const BlockModel* block) const {
+        std::size_t batch = this->max_work_items.value;
+        if (const auto bound = bufferBounds.find(block); bound != bufferBounds.end()) {
+            batch = std::min(batch, bound->second);
+        }
+        return batch == std::numeric_limits<std::size_t>::max() ? 0UZ : batch;
     }
 
     [[nodiscard]] static std::set<BlockEdge> collectBackEdges(const gr::Graph& flatGraph) {
@@ -524,13 +786,13 @@ private:
             }
 
             if (const std::uint64_t periodNs = detail::readUnsigned(block->metaInformation(), kPeriodKey); periodNs > 0UZ) {
-                const JobParameters parameters = deriveJobParameters(*block, defaultDeadline);
+                const JobParameters parameters = deriveJobParameters(*block, defaultDeadline, std::nullopt, defaultBatchFor(block.get()));
                 rates[block.get()] = static_cast<float>(static_cast<double>(parameters.batchSize) * 1e9 / static_cast<double>(periodNs));
                 pinned.insert(block.get());
             }
         }
 
-        const std::set<BlockEdge> backEdges = collectBackEdges(flatGraph);
+        // `backEdges` (member) was resolved from this graph in customInit() before either pass runs
         for (std::size_t round = 0UZ; round < blockList.size(); ++round) {
             bool changed = false;
             for (const gr::Edge& edge : flatGraph.edges()) {
@@ -596,7 +858,7 @@ private:
         DeadlineMap effective;
         DeadlineMap cost;
         for (const std::shared_ptr<BlockModel>& block : blockList) {
-            const JobParameters parameters = deriveJobParameters(*block, defaultDeadline, propagatedRateFor(block.get()));
+            const JobParameters parameters = deriveJobParameters(*block, defaultDeadline, propagatedRateFor(block.get()), defaultBatchFor(block.get()));
             effective[block.get()] = relativeDeadlineFor(*block, parameters);
             cost[block.get()]      = readDuration(block->metaInformation(), kWcetKey, Duration::zero());
         }
@@ -606,7 +868,7 @@ private:
             return effective;
         }
 
-        const std::set<BlockEdge> backEdges = collectBackEdges(flatGraph);
+        // `backEdges` (member) was resolved from this graph in customInit() before either pass runs
 
         for (std::size_t round = 0UZ; round < blockList.size(); ++round) {
             bool changed = false;
@@ -681,8 +943,10 @@ private:
     }
 
     [[nodiscard]] Task makeTask(const std::shared_ptr<BlockModel>& block) const {
-        const JobParameters parameters = deriveJobParameters(*block, defaultDeadline, propagatedRateFor(block.get()));
+        const JobParameters parameters = deriveJobParameters(*block, defaultDeadline, propagatedRateFor(block.get()), defaultBatchFor(block.get()));
         const Duration      relative   = relativeDeadlineFor(*block, parameters);
+        const gr::Ratio     ratio      = block->resamplingRatio();
+        const bool          scaled     = !parameters.source && ratio.numerator > 0 && ratio.denominator > 0;
         return Task{
             .block             = block,
             .parameters        = parameters,
@@ -690,12 +954,15 @@ private:
             .effectiveDeadline = relative,
             .absoluteDeadline  = TClock::now() + relative,
             .fixedPriority     = readFixedPriority(*block),
+            .outputNumerator   = scaled ? static_cast<std::uint64_t>(ratio.denominator) : 1UZ,
+            .outputDenominator = scaled ? static_cast<std::uint64_t>(ratio.numerator) : 1UZ,
         };
     }
 
     // block adoption and removal mutate a worker's list mid-run, so the task table is reconciled rather than
     // assumed stable; per-task statistics survive as long as the block does.
-    void syncTasks(std::vector<Task>& tasks, const std::vector<std::shared_ptr<BlockModel>>& blocks) const {
+    void syncTasks(std::size_t runnerID, const std::vector<std::shared_ptr<BlockModel>>& blocks) {
+        std::vector<Task>& tasks = tasksPerRunner[runnerID];
         if (tasks.size() == blocks.size() && std::ranges::equal(tasks, blocks, {}, &Task::block)) {
             return;
         }
@@ -707,7 +974,22 @@ private:
             reconciled.push_back(known != tasks.end() ? *known : makeTask(block));
         }
         tasks = std::move(reconciled);
-        linkNeighbours(tasks);
+        linkNeighbours(tasks, selectorPerRunner[runnerID]);
+    }
+
+    void markDirty(std::size_t runnerID, std::size_t index) {
+        Task& task = tasksPerRunner[runnerID][index];
+        task.dirty = true;
+        if (!task.queued) {
+            task.queued = true;
+            selectorPerRunner[runnerID].dirtyQueue.push_back(index);
+        }
+    }
+
+    void markAllDirty(std::size_t runnerID) {
+        for (std::size_t index = 0UZ; index < tasksPerRunner[runnerID].size(); ++index) {
+            markDirty(runnerID, index);
+        }
     }
 
     // Progress alone is a poor wake signal when many paced sources share a worker: every real dispatch moves
@@ -739,57 +1021,104 @@ private:
     }
 
     template<profiling::ProfilerHandlerLike THandler>
-    [[nodiscard]] Task* selectNextReady(std::vector<Task>& tasks, TimePoint now, THandler trace) {
-        const TPolicy policy{};
-        using Key = decltype(policy.key(std::declval<const BlockModel&>(), std::declval<const SchedState&>()));
+    [[nodiscard]] Task* selectNextReady(std::size_t runnerID, TimePoint now, THandler trace) {
+        std::vector<Task>& tasks    = tasksPerRunner[runnerID];
+        Selector&          selector = selectorPerRunner[runnerID];
 
-        Task*                      selected = nullptr;
-        std::optional<Key>         selectedKey;
+        // parked tasks return to the probe queue once their time gate has passed and progress has moved
         std::optional<std::size_t> progressNow; // fetched lazily; only parked tasks need it
+        for (std::size_t slot = 0UZ; slot < selector.parked.size();) {
+            const std::size_t index = selector.parked[slot];
+            Task&             task  = tasks[index];
+            if (now < task.stalledUntil) {
+                ++slot; // cannot be due yet
+                continue;
+            }
+            if (!progressNow.has_value()) {
+                progressNow = this->_graph->progress().value();
+            }
+            if (*progressNow == task.stalledAtProgress) {
+                ++slot; // nothing has happened that could make the block producible
+                continue;
+            }
+            task.stalledAtProgress = Task::kNotStalled;
+            selector.parked[slot]  = selector.parked.back();
+            selector.parked.pop_back();
+            markDirty(runnerID, index); // re-probe so the release is re-observed at its true instant
+        }
+        for (const std::size_t index : selector.alwaysDirty) {
+            markDirty(runnerID, index);
+        }
+
+        // Everything the key is built from -- release instant, deadline, readiness -- can only move when the
+        // block's occupancy or job state moves, so only queued tasks are probed, in index order so that the
+        // outcome is the one a full scan in list order would produce, and their heap entries updated.
+        const bool useHeap = heapSelection == 1 || (heapSelection < 0 && tasks.size() > kHeapThreshold);
+        if (selector.dirtyQueue.size() > 1UZ) {
+            std::ranges::sort(selector.dirtyQueue);
+        }
+        for (const std::size_t index : selector.dirtyQueue) {
+            Task& task  = tasks[index];
+            task.queued = false;
+            if (task.stalledAtProgress != Task::kNotStalled) {
+                continue; // parked: left dirty, re-queued on revival
+            }
+            nProbesPerRunner[runnerID]++;
+            const Probe probe = probeBlock(*task.block);
+            observeReleases(tasks, task, now, trace, probe.available);
+            task.ready         = probe.ready;
+            task.outputLimited = probe.outputLimited;
+            task.dirty         = false;
+
+            const typename JobState<TClock>::PendingRelease* oldest = task.jobs.oldestPending();
+            task.eligible                                           = !task.retired && oldest != nullptr && task.ready;
+            if (task.eligible) {
+                // ordered by the job's inherited deadline, or by the precedence-tightened own deadline when that
+                // is earlier (it is what carries downstream urgency to a producer whose consumers annotate tighter
+                // deadlines than it inherits from further upstream)
+                const Duration  keyRelative = bufferPressureDeadlines ? pressureAdjusted(*task.block, task.effectiveDeadline) : task.effectiveDeadline;
+                const TimePoint keyDeadline = std::min(oldest->deadline, oldest->releaseTime + keyRelative);
+                task.absoluteDeadline       = oldest->deadline;
+                task.keyDeadlineNs          = nanosecondsOf(keyDeadline);
+                task.keyReleaseNs           = static_cast<std::uint64_t>(nanosecondsOf(oldest->releaseTime));
+                if (useHeap) {
+                    selector.update(index, keyOf(task, index));
+                }
+            } else if (useHeap) {
+                selector.erase(index);
+            }
+        }
+        selector.dirtyQueue.clear();
+
+        if (!useHeap) {
+            return linearSelection(tasks);
+        }
+        Task* selected = selector.empty() ? nullptr : std::addressof(tasks[selector.top()]);
+        if (verifySelection && selected != linearSelection(tasks)) {
+            nMismatchesPerRunner[runnerID]++;
+        }
+        return selected;
+    }
+
+    [[nodiscard]] static typename Selector::Key keyOf(const Task& task, std::size_t index) {
+        return TPolicy{}.key(*task.block, SchedState{
+                                              .index              = index,
+                                              .absoluteDeadlineNs = task.keyDeadlineNs,
+                                              .releaseOrder       = task.keyReleaseNs,
+                                              .priority           = task.fixedPriority,
+                                          });
+    }
+
+    // the reference implementation the heap is checked against: the eligible task with the smallest key
+    [[nodiscard]] static Task* linearSelection(std::vector<Task>& tasks) {
+        Task*                                selected = nullptr;
+        std::optional<typename Selector::Key> selectedKey;
         for (std::size_t index = 0UZ; index < tasks.size(); ++index) {
             Task& task = tasks[index];
-            if (task.stalledAtProgress != Task::kNotStalled) {
-                if (now < task.stalledUntil) {
-                    continue; // cannot be due yet
-                }
-                if (!progressNow.has_value()) {
-                    progressNow = this->_graph->progress().value();
-                }
-                if (*progressNow == task.stalledAtProgress) {
-                    continue; // nothing has happened that could make the block producible
-                }
-                task.stalledAtProgress = Task::kNotStalled;
-                task.dirty             = true; // re-probe so the release is re-observed at its true instant
-            }
-            if (task.dirty || task.alwaysDirty) {
-                // Everything the key is built from -- release instant, deadline, readiness -- can only move
-                // when the block's occupancy or job state moves, so it is resolved here and cached. A clean
-                // task then costs one predicate and one key comparison instead of two time-point conversions.
-                nProbesTotal++;
-                const Probe probe = probeBlock(*task.block);
-                observeReleases(task, now, trace, probe.available);
-                task.ready               = probe.ready;
-                task.outputLimited       = probe.outputLimited;
-                task.dirty               = false;
-
-                const std::optional<TimePoint> release = task.jobs.oldestReleaseTime();
-                task.eligible                          = !task.retired && task.jobs.hasPendingJob() && task.ready && release.has_value();                if (task.eligible) {
-                    const Duration keyDeadline = bufferPressureDeadlines ? pressureAdjusted(*task.block, task.effectiveDeadline) : task.effectiveDeadline;
-                    task.absoluteDeadline      = *release + keyDeadline;
-                    task.keyDeadlineNs         = std::chrono::duration_cast<Duration>(task.absoluteDeadline.time_since_epoch()).count();
-                    task.keyReleaseNs          = static_cast<std::uint64_t>(std::chrono::duration_cast<Duration>(release->time_since_epoch()).count());
-                }
-            }
             if (!task.eligible) {
                 continue;
             }
-
-            const auto key = policy.key(*task.block, SchedState{
-                                                         .index              = index,
-                                                         .absoluteDeadlineNs = task.keyDeadlineNs,
-                                                         .releaseOrder       = task.keyReleaseNs,
-                                                         .priority           = task.fixedPriority,
-                                                     });
+            const auto key = keyOf(task, index);
             if (!selectedKey.has_value() || key < *selectedKey) {
                 selected    = std::addressof(task);
                 selectedKey = key;
@@ -797,6 +1126,8 @@ private:
         }
         return selected;
     }
+
+    [[nodiscard]] static std::int64_t nanosecondsOf(TimePoint instant) noexcept { return std::chrono::duration_cast<Duration>(instant.time_since_epoch()).count(); }
 
     [[nodiscard]] Duration relativeDeadlineFor(BlockModel& block, const JobParameters& parameters) const {
         const Duration annotated = readDuration(block.metaInformation(), kDeadlineKey, Duration::zero());
@@ -841,7 +1172,7 @@ private:
     }
 
     template<profiling::ProfilerHandlerLike THandler>
-    void observeReleases(Task& task, TimePoint now, THandler trace, std::size_t probedAvailable) {
+    void observeReleases(std::vector<Task>& tasks, Task& task, TimePoint now, THandler trace, std::size_t probedAvailable) {
         if (task.retired) {
             return;
         }
@@ -858,66 +1189,152 @@ private:
 
         // A paced source's job is due at its nominal instant, not at whichever probe happened to notice output room
         // for it. Once the source has produced, nextDue -- maintained from actual production and never earlier
-        // than the true grid -- is that instant, so the release is stamped min(now, nextDue): the due time when
-        // detection ran late, the detection instant otherwise. Withdrawn re-releases converge on the same stamp,
-        // so pokes no longer move a job's deadline. Every other block is released by its producer's completion,
-        // which the very next probe observes, so `now` already is the arrival instant there.
+        // than the true grid -- is that instant, so the release is stamped nextDue: when detection ran late the
+        // stamp is still the due time, and when a probe found room before the job was due (the usual premature
+        // release, withdrawn once the source refuses to run) the stamp is not the poke but the instant the data
+        // will actually exist. Every consumer inherits this stamp's deadline, so an early stamp would count misses
+        // at every sink that the sink's own clock does not see. Every other block is released by its producer's
+        // completion, which the very next probe observes, so `now` already is the arrival instant there.
         const bool      nominalKnown = task.parameters.source && task.parameters.period > Duration::zero() && !task.parameters.periodFromFallback && task.lastProduction != TimePoint{};
-        const TimePoint releaseAt    = nominalKnown ? std::min(now, task.nextDue) : now;
-        const std::uint64_t releasedBefore = task.jobs.nReleased;
-        task.jobs.observeReleases(available, task.parameters.batchSize, releaseAt);
-        const std::uint64_t newlyReleased = task.jobs.nReleased - releasedBefore;        if (newlyReleased > 0UZ) {
-            if constexpr (kTracing) {
-                trace->instantEvent("scheduler.job.release", "scheduler", {
-                    {"block", std::string(task.block->name())},
-                    {"jobs", traceInt(newlyReleased)},
-                    {"batch", traceInt(task.parameters.batchSize)},
-                    {"deadline_ms", traceMs(std::chrono::duration_cast<Duration>(task.jobs.earliestDeadline(task.effectiveDeadline).value_or(TimePoint::max()).time_since_epoch()).count())},
-                    {"relative_ms", static_cast<double>(task.effectiveDeadline.count()) / 1e6},
-                    {"release_ms", traceMs(std::chrono::duration_cast<Duration>(releaseAt.time_since_epoch()).count())},
-                    {"own_ms", static_cast<double>(task.relativeDeadline.count()) / 1e6},
-                });
+        const TimePoint releaseAt    = nominalKnown ? task.nextDue : now;
+        const std::size_t batchSize  = task.parameters.batchSize;
+
+        // Each job's deadline is fixed here. A source's is its own: release + D. Any other job inherits the
+        // earliest deadline among the producer jobs whose output it consumes -- the record covering its first
+        // input unit, since deadlines never decrease along a stream -- capped by its own release + D. Jobs that
+        // fall inside the same producer records share a deadline and are released as one group.
+        std::uint64_t remaining = task.jobs.releasable(available, batchSize);
+        while (remaining > 0UZ) {
+            const std::uint64_t firstUnit = task.jobs.nextReleaseUnit(batchSize);
+            TimePoint           deadline  = releaseAt + task.relativeDeadline;
+            std::uint64_t       nJobs     = remaining;
+            bool                inherited = false;
+            for (const std::size_t feed : task.feeds) {
+                const std::optional<typename ProductionLog<TClock>::Cover> found = tasks[feed].production.cover(firstUnit);
+                if (!found.has_value()) {
+                    // nothing logged for these units yet (a producer ran in the fallback sweep ahead of its own
+                    // release observation, or its log was truncated by a withdrawal); nor for any later unit, so
+                    // the whole group falls back to the precedence-tightened own deadline
+                    task.nInheritanceGaps++;
+                    deadline = std::min(deadline, releaseAt + task.effectiveDeadline);
+                    continue;
+                }
+                inherited = true;
+                deadline  = std::min(deadline, found->deadline);
+                nJobs     = std::min(nJobs, std::max<std::uint64_t>(1UZ, (found->validUntil - firstUnit) / batchSize));
             }
+            task.jobs.release(nJobs, releaseAt, deadline);
+            publishDeadline(tasks, task, deadline);
+            if constexpr (kTracing) {
+                if (traceLevel >= 1) {
+                    trace->instantEvent("scheduler.job.release", "scheduler", {
+                        {"block", std::string(task.block->name())},
+                        {"jobs", traceInt(nJobs)},
+                        {"batch", traceInt(batchSize)},
+                        {"deadline_ms", traceMs(nanosecondsOf(deadline))},
+                        {"relative_ms", static_cast<double>(task.effectiveDeadline.count()) / 1e6},
+                        {"release_ms", traceMs(nanosecondsOf(releaseAt))},
+                        {"own_ms", static_cast<double>(task.relativeDeadline.count()) / 1e6},
+                        {"inherited", inherited ? 1 : 0},
+                    });
+                }
+            }
+            remaining -= nJobs;
         }
 
-        task.absoluteDeadline = task.jobs.earliestDeadline(task.effectiveDeadline).value_or(TimePoint::max());
+        task.absoluteDeadline = task.jobs.earliestDeadline().value_or(TimePoint::max());
+    }
+
+    // Extends the block's production log to the units its released jobs will publish, so in-worker consumers can
+    // inherit `deadline`. Records every such consumer has already completed are dropped on the way.
+    void publishDeadline(std::vector<Task>& tasks, Task& task, TimePoint deadline) {
+        if (task.fed.empty()) {
+            return; // nobody on this worker inherits from it
+        }
+        std::uint64_t retireBefore = std::numeric_limits<std::uint64_t>::max();
+        for (const std::size_t consumer : task.fed) {
+            const Task& fed = tasks[consumer];
+            retireBefore    = std::min(retireBefore, fed.jobs.nCompleted * static_cast<std::uint64_t>(fed.parameters.batchSize));
+        }
+        task.production.publishUntil(task.outputUnits(task.jobs.nextReleaseUnit(task.parameters.batchSize)), deadline, retireBefore);
     }
 
     template<profiling::ProfilerHandlerLike THandler>
     void observeCompletion(Task& task, std::size_t performedWork, TimePoint now, std::uint64_t completedBefore, std::uint64_t missesBefore, THandler trace) {
-        // Judged against the block's own deadline: effectiveDeadline is an ordering key (it inherits downstream
-        // urgency through precedence) and a producer that meets its declared deadline has not missed anything.
-        task.jobs.observeCompletion(performedWork, task.parameters.batchSize, task.relativeDeadline, now);
-        task.absoluteDeadline = task.jobs.earliestDeadline(task.effectiveDeadline).value_or(TimePoint::max());
+        TimePoint lastRetiredDeadline{};
+        task.jobs.observeCompletion(performedWork, task.parameters.batchSize, now, [&lastRetiredDeadline](std::uint64_t, TimePoint deadline) { lastRetiredDeadline = deadline; });
+        task.absoluteDeadline = task.jobs.earliestDeadline().value_or(TimePoint::max());
         const std::uint64_t newlyCompleted = task.jobs.nCompleted - completedBefore;
         if (newlyCompleted > 0UZ) {
             if constexpr (kTracing) {
-                trace->instantEvent("scheduler.job.complete", "scheduler", {
-                    {"block", std::string(task.block->name())},
-                    {"jobs", traceInt(newlyCompleted)},
-                    {"work", traceInt(performedWork)},
-                });
+                if (traceLevel >= 1) {
+                    trace->instantEvent("scheduler.job.complete", "scheduler", {
+                        {"block", std::string(task.block->name())},
+                        {"jobs", traceInt(newlyCompleted)},
+                        {"work", traceInt(performedWork)},
+                        {"deadline_ms", traceMs(nanosecondsOf(lastRetiredDeadline))},
+                    });
+                }
             }
         }
 
         const std::uint64_t newlyMissed = task.jobs.nMissed - missesBefore;
         if (newlyMissed > 0UZ) {
             if constexpr (kTracing) {
-                trace->instantEvent("scheduler.job.deadline_miss", "scheduler", {
-                    {"block", std::string(task.block->name())},
-                    {"jobs", traceInt(newlyMissed)},
-                    {"lateness_ns", traceInt(task.jobs.maxLateness.count())},
-                    {"judged_ms", static_cast<double>(task.relativeDeadline.count()) / 1e6},
-                });
-                trace->counterEvent("scheduler.deadline_misses", "scheduler", {{"count", traceInt(task.jobs.nMissed)}});
+                if (traceLevel >= 1) {
+                    trace->instantEvent("scheduler.job.deadline_miss", "scheduler", {
+                        {"block", std::string(task.block->name())},
+                        {"jobs", traceInt(newlyMissed)},
+                        {"lateness_ns", traceInt(task.jobs.maxLateness.count())},
+                        {"deadline_ms", traceMs(nanosecondsOf(lastRetiredDeadline))},
+                        {"completed_ms", traceMs(nanosecondsOf(now))},
+                    });
+                    trace->counterEvent("scheduler.deadline_misses", "scheduler", {{"count", traceInt(task.jobs.nMissed)}});
+                }
             }
         }
     }
 
     template<profiling::ProfilerHandlerLike THandler>
-    [[nodiscard]] work::Result trackedFallbackSweep(std::vector<Task>& tasks, THandler trace) {
-        std::size_t performedWorkAllBlocks = 0UZ;
-        bool        unfinishedBlocksExist  = false;
+    void traceWithdrawal(const Task& task, std::uint64_t nJobs, std::string_view reason, THandler trace) const {
+        if constexpr (kTracing) {
+            if (traceLevel >= 1 && nJobs > 0UZ) {
+                trace->instantEvent("scheduler.job.withdraw", "scheduler", {
+                    {"block", std::string(task.block->name())},
+                    {"jobs", traceInt(nJobs)},
+                    {"reason", std::string(reason)},
+                });
+            }
+        } else {
+            std::ignore = trace;
+        }
+    }
+
+    // work() reported DONE: outstanding jobs will never complete and are cancelled (they stay counted in nReleased)
+    template<profiling::ProfilerHandlerLike THandler>
+    void retire(Task& task, THandler trace) const {
+        task.retired                 = true;
+        task.eligible                = false;
+        const std::uint64_t pending = task.jobs.nPendingJobs();
+        task.jobs.cancelPending();
+        traceWithdrawal(task, pending, "done", trace);
+    }
+
+    // a release the block could not act on (not due yet): taken back so the next observation may re-release it,
+    // and the units it announced are struck from the production log
+    template<profiling::ProfilerHandlerLike THandler>
+    void withdrawPremature(Task& task, THandler trace) const {
+        const std::uint64_t withdrawnBefore = task.jobs.nWithdrawn;
+        task.jobs.withdrawPendingReleases();
+        task.production.truncate(task.outputUnits(task.jobs.nextReleaseUnit(task.parameters.batchSize)));
+        traceWithdrawal(task, task.jobs.nWithdrawn - withdrawnBefore, "not_due", trace);
+    }
+
+    template<profiling::ProfilerHandlerLike THandler>
+    [[nodiscard]] work::Result trackedFallbackSweep(std::size_t runnerID, THandler trace) {
+        std::vector<Task>& tasks                  = tasksPerRunner[runnerID];
+        std::size_t        performedWorkAllBlocks = 0UZ;
+        bool               unfinishedBlocksExist  = false;
 
         for (Task& task : tasks) {
             if (task.retired) {
@@ -929,22 +1346,35 @@ private:
                 unfinishedBlocksExist = true; // parked in time: poking it would only repeat the withdrawn release
                 continue;
             }
-            observeReleases(task, now, trace, probeBlock(*task.block).available);
-            const std::size_t requestedWork = std::min(this->max_work_items.value, task.parameters.batchSize);
+            observeReleases(tasks, task, now, trace, probeBlock(*task.block).available);
+            const std::size_t requestedWork   = std::min(this->max_work_items.value, task.parameters.batchSize);
             const auto        completedBefore = task.jobs.nCompleted;
             const auto        missesBefore    = task.jobs.nMissed;
-            [[maybe_unused]] auto dispatchEvent = [&] {
-                if constexpr (kTracing) {
-                    return trace->startCompleteEvent("scheduler.job.fallback", "scheduler", {
+
+            work::Result result{};
+            if constexpr (kTracing) {
+                if (traceLevel >= 2) {
+                    auto dispatchEvent = trace->startCompleteEvent("scheduler.job.fallback", "scheduler", {
                         {"block", std::string(task.block->name())},
                         {"batch", traceInt(requestedWork)},
                     });
+                    result = task.block->work(requestedWork);
+                    dispatchEvent.finish();
                 } else {
-                    return trace->startCompleteEvent("scheduler.job.fallback");
+                    result = task.block->work(requestedWork);
+                    if (traceLevel == 1 && result.performed_work > 0UZ) {
+                        // idle pokes are the bulk of a trace and carry no information; only productive ones are kept
+                        trace->instantEvent("scheduler.job.fallback", "scheduler", {
+                            {"block", std::string(task.block->name())},
+                            {"batch", traceInt(requestedWork)},
+                            {"work", traceInt(result.performed_work)},
+                        });
+                    }
                 }
-            }();
-            const auto [reportedRequest, performedWork, status] = task.block->work(requestedWork);
-            dispatchEvent.finish();
+            } else {
+                result = task.block->work(requestedWork);
+            }
+            const auto [reportedRequest, performedWork, status] = result;
             performedWorkAllBlocks += performedWork;
             if (performedWork > 0UZ) {
                 task.nDispatches++;
@@ -962,8 +1392,7 @@ private:
                 return {reportedRequest, performedWorkAllBlocks, work::Status::ERROR};
             }
             if (status == work::Status::DONE) {
-                task.retired = true;
-                task.jobs.cancelPending();
+                retire(task, trace);
             } else {
                 unfinishedBlocksExist = true;
             }

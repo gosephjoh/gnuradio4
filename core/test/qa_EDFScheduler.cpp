@@ -10,10 +10,12 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <set>
 #include <array>
 #include <map>
 #include <string>
+#include <variant>
 #include <vector>
 
 namespace {
@@ -84,11 +86,18 @@ struct TickClock {
     static void       reset() noexcept { elapsed.store(0, std::memory_order_relaxed); }
 };
 
+struct RecordedEvent {
+    std::string                                                    name;
+    std::map<std::string, std::variant<std::string, int, double>> args;
+};
+
 struct TraceCounters {
     std::atomic<std::uint64_t> releases{0UZ};
     std::atomic<std::uint64_t> completions{0UZ};
     std::atomic<std::uint64_t> misses{0UZ};
     std::atomic<std::uint64_t> dispatches{0UZ};
+    std::atomic<std::uint64_t> withdrawals{0UZ};
+    std::vector<RecordedEvent> events; // every event with its arguments; single-threaded tests only
 };
 
 struct RecordingEvent {
@@ -103,22 +112,34 @@ struct RecordingStepEvent {
 struct RecordingHandler {
     TraceCounters* counters = nullptr;
 
-    void instantEvent(std::string_view name, std::string_view = {}, std::initializer_list<gr::profiling::arg_value> = {}) noexcept {
+    void record(std::string_view name, std::initializer_list<gr::profiling::arg_value> args) {
+        RecordedEvent event{.name = std::string(name), .args = {}};
+        for (const auto& [key, value] : args) {
+            event.args.emplace(key, value);
+        }
+        counters->events.push_back(std::move(event));
+    }
+
+    void instantEvent(std::string_view name, std::string_view = {}, std::initializer_list<gr::profiling::arg_value> args = {}) {
         if (name == "scheduler.job.release") {
             counters->releases.fetch_add(1UZ, std::memory_order_relaxed);
         } else if (name == "scheduler.job.complete") {
             counters->completions.fetch_add(1UZ, std::memory_order_relaxed);
         } else if (name == "scheduler.job.deadline_miss") {
             counters->misses.fetch_add(1UZ, std::memory_order_relaxed);
+        } else if (name == "scheduler.job.withdraw") {
+            counters->withdrawals.fetch_add(1UZ, std::memory_order_relaxed);
         }
+        record(name, args);
     }
 
     void counterEvent(std::string_view, std::string_view = {}, std::initializer_list<gr::profiling::arg_value> = {}) const noexcept {}
 
-    [[nodiscard]] RecordingEvent startCompleteEvent(std::string_view name, std::string_view = {}, std::initializer_list<gr::profiling::arg_value> = {}) noexcept {
+    [[nodiscard]] RecordingEvent startCompleteEvent(std::string_view name, std::string_view = {}, std::initializer_list<gr::profiling::arg_value> args = {}) {
         if (name == "scheduler.job.dispatch" || name == "scheduler.job.fallback") {
             counters->dispatches.fetch_add(1UZ, std::memory_order_relaxed);
         }
+        record(name, args);
         return {};
     }
 
@@ -133,8 +154,22 @@ struct RecordingProfiler {
     void              reset() noexcept {}
     RecordingHandler* forThisThread() noexcept { return std::addressof(handler); }
 };
-
 static_assert(gr::profiling::ProfilerLike<RecordingProfiler>);
+
+// per block, one entry per released job (a release event covers `jobs` jobs), in release order
+[[nodiscard]] std::map<std::string, std::vector<double>> releasedJobDeadlines(const std::vector<RecordedEvent>& events) {
+    std::map<std::string, std::vector<double>> deadlines;
+    for (const RecordedEvent& event : events) {
+        if (event.name != "scheduler.job.release") {
+            continue;
+        }
+        const auto&  block    = std::get<std::string>(event.args.at("block"));
+        const auto   jobs     = static_cast<std::size_t>(std::get<int>(event.args.at("jobs")));
+        const double deadline = std::get<double>(event.args.at("deadline_ms"));
+        deadlines[block].insert(deadlines[block].end(), jobs, deadline);
+    }
+    return deadlines;
+}
 
 template<typename T>
 struct Adder : gr::Block<Adder<T>> {
@@ -368,6 +403,10 @@ const boost::ut::suite<"EDFDeadlineAccounting"> edfDeadlineTests = [] {
         withDeadlines(built, 1U); // 1 ns: every re-release is already overdue
 
         EarliestDeadlineFirst<ExecutionPolicy::singleThreaded> sched;
+        // unannotated blocks take the work quantum as their batch; a 2000-sample stream needs a bounded one to form jobs
+        expect(sched.settings().set({{"max_work_items", std::size_t{64}}}).empty());
+        std::ignore = sched.settings().activateContext();
+        std::ignore = sched.settings().applyStagedParameters();
         expect(sched.exchange(std::move(built.flow)).has_value()) << fatal;
         expect(sched.runAndWait().has_value());
 
@@ -660,19 +699,19 @@ const boost::ut::suite<"JobTracking"> jobTrackingTests = [] {
 
         State state;
         const TimePoint release{1'000ns};
-        state.observeReleases(16UZ, 8UZ, release);
+        state.observeReleases(16UZ, 8UZ, release, 100ns);
 
         expect(that % state.nReleased == 2UZ);
         expect(that % state.nPendingJobs() == 2UZ);
-        expect(that % state.earliestDeadline(100ns)->time_since_epoch().count() == 1'100);
+        expect(that % state.earliestDeadline()->time_since_epoch().count() == 1'100);
 
-        state.observeCompletion(4UZ, 8UZ, 100ns, TimePoint{1'050ns});
+        state.observeCompletion(4UZ, 8UZ, TimePoint{1'050ns});
         expect(that % state.nCompleted == 0UZ) << "a partial batch must not complete a job";
-        expect(that % state.earliestDeadline(100ns)->time_since_epoch().count() == 1'100) << "dispatch must not push the deadline forward";
+        expect(that % state.earliestDeadline()->time_since_epoch().count() == 1'100) << "dispatch must not push the deadline forward";
 
-        state.observeCompletion(4UZ, 8UZ, 100ns, TimePoint{1'080ns});
+        state.observeCompletion(4UZ, 8UZ, TimePoint{1'080ns});
         expect(that % state.nCompleted == 1UZ);
-        state.observeCompletion(8UZ, 8UZ, 100ns, TimePoint{1'200ns});
+        state.observeCompletion(8UZ, 8UZ, TimePoint{1'200ns});
         expect(that % state.nCompleted == 2UZ);
         expect(that % state.nMissed == 1UZ);
         expect(that % state.maxLateness.count() == 100);
@@ -764,6 +803,9 @@ const boost::ut::suite<"JobTracing"> jobTracingTests = [] {
 
         EarliestDeadlineFirst<ExecutionPolicy::singleThreaded, TickClock, RecordingProfiler> sched;
         TickClock::reset();
+        expect(sched.settings().set({{"max_work_items", std::size_t{8}}}).empty());
+        std::ignore = sched.settings().activateContext();
+        std::ignore = sched.settings().applyStagedParameters();
         expect(sched.exchange(std::move(built.flow)).has_value()) << fatal;
         expect(sched.runAndWait().has_value());
 
@@ -992,6 +1034,306 @@ const boost::ut::suite<"EDFTopology"> topologyTests = [] {
         };
         expect(ranking(topological) == ranking(nonTopological)) << "EDF's first-dispatch order changed with block insertion order";
         expect(topological.nDispatches == nonTopological.nDispatches) << "per-block dispatch counts changed with block insertion order";
+    };
+};
+
+// ---------------------------------------------------------------------------------------------------------------
+// Deadline inheritance: a job's absolute deadline travels with its samples along forward edges.
+// ---------------------------------------------------------------------------------------------------------------
+const boost::ut::suite<"EDFDeadlineInheritance"> inheritanceTests = [] {
+    using namespace boost::ut;
+    using gr::scheduler::EarliestDeadlineFirst;
+    using gr::scheduler::ExecutionPolicy;
+
+    auto boundQuantum = [](auto& sched, std::size_t quantum) {
+        expect(sched.settings().set({{"max_work_items", quantum}}).empty());
+        std::ignore = sched.settings().activateContext();
+        std::ignore = sched.settings().applyStagedParameters();
+    };
+
+    "every job downstream carries the source job's deadline"_test = [&] {
+        constexpr gr::Size_t  kSamples = 4096U;
+        constexpr std::size_t kBatch   = 256UZ;
+        LinearGraph           built    = makeLinearGraph(kSamples);
+        built.source->meta_information.value[std::string(gr::scheduler::kDeadlineKey)] = std::uint64_t{1'000'000}; // 1 ms; downstream keeps the 10 ms default
+
+        EarliestDeadlineFirst<ExecutionPolicy::singleThreaded, TickClock, RecordingProfiler> sched;
+        TickClock::reset();
+        boundQuantum(sched, kBatch);
+        expect(sched.exchange(std::move(built.flow)).has_value()) << fatal;
+        expect(sched.runAndWait().has_value()) << fatal;
+
+        const auto            deadlines = releasedJobDeadlines(sched.profiler().counters.events);
+        constexpr std::size_t kJobs     = kSamples / kBatch;
+        for (const char* name : {"src", "copyA", "copyB", "sink"}) {
+            expect(deadlines.contains(name)) << name << " released nothing" << fatal;
+            expect(that % deadlines.at(name).size() == kJobs) << name;
+        }
+        for (const char* name : {"copyA", "copyB", "sink"}) {
+            expect(deadlines.at(name) == deadlines.at("src")) << name << " did not inherit the source's job deadlines one-to-one";
+        }
+        const auto* sink = sched.findTask("sink");
+        expect(sink != nullptr) << fatal;
+        expect(sink->relativeDeadline > std::chrono::milliseconds(1)) << "the sink's own deadline must be looser than the inherited one for this to mean anything";
+        expect(that % sink->feeds.size() == 1UZ) << "the sink inherits from exactly one producer";
+        const auto stats = sched.statistics();
+        expect(that % stats.nInheritanceGaps == 0UZ) << "every job found the record it inherits from";
+        expect(that % stats.nProductionMerges == 0UZ);
+    };
+
+    "an end-to-end miss shows at the sink although each hop meets its own deadline"_test = [&] {
+        constexpr gr::Size_t  kSamples = 4096U;
+        constexpr std::size_t kBatch   = 256UZ;
+        LinearGraph           built    = makeLinearGraph(kSamples);
+        // two virtual-clock ticks: no sample can cross three more dispatches within that, so every job the sink
+        // completes is late against the deadline it inherited -- while the sink's own 10 ms deadline is always met
+        built.source->meta_information.value[std::string(gr::scheduler::kDeadlineKey)] = std::uint64_t{2'000};
+
+        EarliestDeadlineFirst<ExecutionPolicy::singleThreaded, TickClock> sched;
+        TickClock::reset();
+        boundQuantum(sched, kBatch);
+        expect(sched.exchange(std::move(built.flow)).has_value()) << fatal;
+        expect(sched.runAndWait().has_value()) << fatal;
+
+        const auto* source = sched.findTask("src");
+        const auto* sink   = sched.findTask("sink");
+        expect(source != nullptr && sink != nullptr) << fatal;
+        std::println("inherited misses along the chain: src {} | copyA {} | copyB {} | sink {} of {} jobs", source->jobs.nMissed, sched.findTask("copyA")->jobs.nMissed, sched.findTask("copyB")->jobs.nMissed, sink->jobs.nMissed, kSamples / kBatch);
+        expect(that % sink->jobs.nMissed == kSamples / kBatch) << "every sample reaches the sink after the deadline it was born with";
+        expect(sink->jobs.maxResponseTime < sink->relativeDeadline) << "the sink met its own 10 ms deadline on every job: the misses are inherited, not its own";
+        expect(sink->jobs.maxLateness > std::chrono::nanoseconds::zero());
+    };
+
+    "a primed feedback edge carries no deadline back into the loop"_test = [&] {
+        constexpr gr::Size_t  kSamples = 2000U;
+        constexpr std::size_t kBatch   = 100UZ;
+        FeedbackGraph         built    = makeFeedbackGraph(kSamples);
+        built.source->meta_information.value[std::string(gr::scheduler::kDeadlineKey)] = std::uint64_t{1'000'000};
+
+        EarliestDeadlineFirst<ExecutionPolicy::singleThreaded, TickClock, RecordingProfiler> sched;
+        TickClock::reset();
+        boundQuantum(sched, kBatch);
+        expect(sched.exchange(std::move(built.flow)).has_value()) << fatal;
+        expect(sched.runAndWait().has_value()) << fatal;
+
+        const auto* adder    = sched.findTask("adder");
+        const auto* loopBack = sched.findTask("loopBack");
+        expect(adder != nullptr && loopBack != nullptr) << fatal;
+        expect(that % adder->feeds.size() == 1UZ) << "only the forward edge feeds the adder";
+        expect(loopBack->fed.empty()) << "the loop-closing edge is not a feed";
+
+        const auto deadlines = releasedJobDeadlines(sched.profiler().counters.events);
+        expect(deadlines.contains("src") && deadlines.contains("adder") && deadlines.contains("sink")) << fatal;
+        expect(that % deadlines.at("src").size() == static_cast<std::size_t>(kSamples) / kBatch);
+        expect(deadlines.at("adder") == deadlines.at("src")) << "the adder inherits from the source alone";
+        expect(deadlines.at("sink") == deadlines.at("src")) << "the sink inherits through the adder";
+    };
+};
+
+// ---------------------------------------------------------------------------------------------------------------
+// Batch default: an unannotated block's job is the scheduler's work quantum, or one buffer when that is unbounded.
+// ---------------------------------------------------------------------------------------------------------------
+const boost::ut::suite<"EDFBatchDefault"> batchDefaultTests = [] {
+    using namespace boost::ut;
+    using gr::scheduler::EarliestDeadlineFirst;
+    using gr::scheduler::ExecutionPolicy;
+
+    "an unannotated block's batch is the scheduler's work quantum"_test = [] {
+        constexpr gr::Size_t  kSamples = 65'536U;
+        constexpr std::size_t kQuantum = 4'096UZ;
+        LinearGraph           built    = makeLinearGraph(kSamples);
+
+        EarliestDeadlineFirst<ExecutionPolicy::singleThreaded> sched;
+        expect(sched.settings().set({{"max_work_items", kQuantum}}).empty());
+        std::ignore = sched.settings().activateContext();
+        std::ignore = sched.settings().applyStagedParameters();
+        expect(sched.exchange(std::move(built.flow)).has_value()) << fatal;
+        expect(sched.runAndWait().has_value()) << fatal;
+
+        constexpr std::uint64_t kJobs = kSamples / kQuantum;
+        for (const char* name : {"src", "copyA", "copyB", "sink"}) {
+            const auto* task = sched.findTask(name);
+            expect(task != nullptr) << name << fatal;
+            expect(that % task->parameters.batchSize == kQuantum) << name;
+            expect(task->parameters.batchDefaulted) << name;
+            // GR4 reports performed_work = 0 on the call that returns DONE, so the source's last job is cancelled, not completed
+            const std::uint64_t accounted = task->jobs.nCompleted + task->jobs.nCancelled;
+            expect(that % accounted == kJobs) << name;
+            // one work() call per job; the source may take one more to report DONE
+            expect(task->nDispatches >= kJobs && task->nDispatches <= kJobs + 1UZ) << name << " dispatched " << task->nDispatches << " times";
+        }
+    };
+
+    "an unbounded work quantum makes one buffer the batch"_test = [] {
+        LinearGraph built = makeLinearGraph(1000U);
+
+        EarliestDeadlineFirst<ExecutionPolicy::singleThreaded> sched;
+        expect(sched.exchange(std::move(built.flow)).has_value()) << fatal;
+        expect(sched.runAndWait().has_value()) << fatal;
+
+        for (const char* name : {"src", "copyA", "copyB", "sink"}) {
+            const auto* task = sched.findTask(name);
+            expect(task != nullptr) << name << fatal;
+            expect(that % task->parameters.batchSize == gr::graph::defaultMinBufferSize(true)) << name;
+            expect(task->parameters.batchDefaulted) << name;
+        }
+    };
+
+    "an annotated batch overrides the default"_test = [] {
+        LinearGraph built = makeLinearGraph(4096U);
+        built.copyA->meta_information.value[std::string(gr::scheduler::kBatchSizeKey)] = std::uint64_t{128UZ};
+
+        EarliestDeadlineFirst<ExecutionPolicy::singleThreaded> sched;
+        expect(sched.settings().set({{"max_work_items", std::size_t{1024}}}).empty());
+        std::ignore = sched.settings().activateContext();
+        std::ignore = sched.settings().applyStagedParameters();
+        expect(sched.exchange(std::move(built.flow)).has_value()) << fatal;
+        expect(sched.runAndWait().has_value()) << fatal;
+
+        const auto* annotated = sched.findTask("copyA");
+        const auto* plain     = sched.findTask("copyB");
+        expect(annotated != nullptr && plain != nullptr) << fatal;
+        expect(that % annotated->parameters.batchSize == 128UZ);
+        expect(not annotated->parameters.batchDefaulted);
+        expect(that % plain->parameters.batchSize == 1024UZ);
+        expect(plain->parameters.batchDefaulted);
+        expect(that % annotated->jobs.nCompleted == 32UZ) << "4096 samples in jobs of 128";
+        expect(that % plain->jobs.nCompleted == 4UZ) << "4096 samples in jobs of 1024";
+    };
+};
+
+// ---------------------------------------------------------------------------------------------------------------
+// Selection: the indexed heap must pick exactly the task a linear scan over the eligible set would pick.
+// ---------------------------------------------------------------------------------------------------------------
+const boost::ut::suite<"EDFSelector"> selectorTests = [] {
+    using namespace boost::ut;
+    using gr::scheduler::EarliestDeadlineFirst;
+    using gr::scheduler::ExecutionPolicy;
+    using gr::scheduler::FixedPriority;
+
+    auto verified = []<typename TScheduler>(TScheduler& sched, gr::Graph flow, std::string_view label) {
+        gr::property_map edfSettings;
+        edfSettings[std::string(gr::scheduler::kVerifySelectionKey)] = true;
+        edfSettings[std::string(gr::scheduler::kHeapSelectionKey)]   = std::int64_t{1}; // these graphs are below the automatic threshold
+        expect(sched.settings().set({{"sched_settings", edfSettings}, {"max_work_items", std::size_t{64}}}).empty());
+        std::ignore = sched.settings().activateContext();
+        std::ignore = sched.settings().applyStagedParameters();
+        expect(sched.exchange(std::move(flow)).has_value()) << fatal;
+        expect(sched.runAndWait().has_value()) << fatal;
+        const auto stats = sched.statistics();
+        std::println("{}: {} selections, {} heap/scan mismatches, {} sweeps", label, stats.nSelections, stats.nSelectionMismatches, stats.nSweeps);
+        expect(stats.nSelections > 100UZ) << label << " made too few selections to test anything";
+        expect(that % stats.nSelectionMismatches == 0UZ) << label;
+    };
+
+    "the heap selects exactly what a linear scan would"_test = [&] {
+        EarliestDeadlineFirst<ExecutionPolicy::singleThreaded> chain;
+        verified(chain, makeLinearFlow(20'000U), "chain");
+        EarliestDeadlineFirst<ExecutionPolicy::singleThreaded> forkJoin;
+        verified(forkJoin, std::move(makeForkJoin(20'000U, true).flow), "fork-join");
+        EarliestDeadlineFirst<ExecutionPolicy::singleThreaded> parallel;
+        verified(parallel, makeParallelChains(4UZ, 5'000U, 5'000U), "parallel chains");
+        FixedPriority<ExecutionPolicy::singleThreaded> fixed;
+        verified(fixed, std::move(makeForkJoin(20'000U, false).flow), "fixed-priority fork-join");
+    };
+};
+
+// ---------------------------------------------------------------------------------------------------------------
+// Lightweight tracking: withdrawals are traced, trace levels cut volume, and counters carry a response histogram.
+// ---------------------------------------------------------------------------------------------------------------
+const boost::ut::suite<"EDFLightweightTracking"> lightweightTrackingTests = [] {
+    using namespace boost::ut;
+    using gr::scheduler::EarliestDeadlineFirst;
+    using gr::scheduler::ExecutionPolicy;
+    using Traced = EarliestDeadlineFirst<ExecutionPolicy::singleThreaded, TickClock, RecordingProfiler>;
+
+    auto configure = [](Traced& sched, std::int64_t traceLevel) {
+        gr::property_map edfSettings;
+        edfSettings[std::string(gr::scheduler::kTraceLevelKey)] = traceLevel;
+        expect(sched.settings().set({{"sched_settings", edfSettings}, {"max_work_items", std::size_t{64}}}).empty());
+        std::ignore = sched.settings().activateContext();
+        std::ignore = sched.settings().applyStagedParameters();
+    };
+    auto count = [](const std::vector<RecordedEvent>& events, std::string_view name) { return std::ranges::count_if(events, [name](const RecordedEvent& event) { return event.name == name; }); };
+
+    "withdrawn releases are traced"_test = [&] {
+        LinearGraph built = makeLinearGraph(512U);
+        Traced      sched;
+        TickClock::reset();
+        configure(sched, 2);
+        expect(sched.exchange(std::move(built.flow)).has_value()) << fatal;
+        expect(sched.runAndWait().has_value()) << fatal;
+
+        const auto& events = sched.profiler().counters.events;
+        const auto  stats  = sched.statistics();
+        expect(that % stats.nCancelled + stats.nWithdrawn > 0UZ) << "the job released ahead of the source's DONE is taken back" << fatal;
+        std::uint64_t traced = 0UZ;
+        for (const RecordedEvent& event : events) {
+            if (event.name == "scheduler.job.withdraw") {
+                traced += static_cast<std::uint64_t>(std::get<int>(event.args.at("jobs")));
+                expect(event.args.contains("reason"));
+            }
+        }
+        expect(that % traced == stats.nCancelled + stats.nWithdrawn) << "every withdrawn or cancelled job appears in the trace";
+    };
+
+    "trace level 0 keeps counters only"_test = [&] {
+        LinearGraph built = makeLinearGraph(4096U);
+        Traced      sched;
+        TickClock::reset();
+        configure(sched, 0);
+        expect(sched.exchange(std::move(built.flow)).has_value()) << fatal;
+        expect(sched.runAndWait().has_value()) << fatal;
+
+        const auto& events = sched.profiler().counters.events;
+        expect(that % count(events, "scheduler.job.release") == 0);
+        expect(that % count(events, "scheduler.job.dispatch") == 0);
+        expect(that % count(events, "scheduler.job.complete") == 0);
+        expect(that % count(events, "scheduler.job.fallback") == 0);
+        const auto stats = sched.statistics();
+        expect(stats.nCompleted > 0UZ) << "the counters keep working without events";
+        const std::uint64_t accounted = stats.nCompleted + stats.nCancelled;
+        expect(that % accounted == 4UZ * 64UZ) << "4096 samples through four blocks in jobs of 64 (the source's DONE call reports no work)";
+    };
+
+    "trace level 1 drops candidate lists and idle pokes"_test = [&] {
+        LinearGraph built = makeLinearGraph(4096U);
+        Traced      sched;
+        TickClock::reset();
+        configure(sched, 1);
+        expect(sched.exchange(std::move(built.flow)).has_value()) << fatal;
+        expect(sched.runAndWait().has_value()) << fatal;
+
+        const auto& events = sched.profiler().counters.events;
+        expect(count(events, "scheduler.job.release") > 0) << fatal;
+        expect(count(events, "scheduler.job.dispatch") > 0) << fatal;
+        for (const RecordedEvent& event : events) {
+            if (event.name == "scheduler.job.dispatch") {
+                expect(not event.args.contains("candidates")) << "level 1 must not spend a string per dispatch on the candidate list";
+            }
+            if (event.name == "scheduler.job.fallback") {
+                expect(std::get<int>(event.args.at("work")) > 0) << "level 1 records only productive fallback pokes";
+            }
+        }
+    };
+
+    "block statistics carry a response histogram"_test = [&] {
+        LinearGraph built = makeLinearGraph(4096U);
+        Traced      sched;
+        TickClock::reset();
+        configure(sched, 0);
+        expect(sched.exchange(std::move(built.flow)).has_value()) << fatal;
+        expect(sched.runAndWait().has_value()) << fatal;
+
+        const auto perBlock = sched.blockStatistics();
+        expect(that % perBlock.size() == 4UZ) << fatal;
+        for (const auto& block : perBlock) {
+            const std::uint64_t counted = std::accumulate(block.responseHistogram.begin(), block.responseHistogram.end(), std::uint64_t{0});
+            expect(that % counted == block.nCompleted) << block.name << ": every completed job lands in exactly one bucket";
+            expect(block.nCompleted > 0UZ) << block.name;
+            expect(block.meanResponseTime <= block.maxResponseTime) << block.name;
+            expect(block.meanResponseTime > std::chrono::nanoseconds::zero()) << block.name << ": the virtual clock advances at least one tick per job";
+        }
     };
 };
 

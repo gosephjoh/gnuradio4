@@ -8,6 +8,7 @@
 #include <array>
 #include <charconv>
 #include <chrono>
+#include <cstdlib>
 #include <cmath>
 #include <cstdint>
 #include <format>
@@ -78,7 +79,10 @@ struct GraphAndSink {
 template<typename TScheduler>
 [[nodiscard]] RunResult runOnce(gr::Size_t nSamples, std::size_t depth, std::size_t batchSize) {
     GraphAndSink graph = makeGraph(nSamples, depth, batchSize);
-    TScheduler  scheduler({{"max_work_items", batchSize}});
+    // EDF_HEAP=<-1|0|1> selects the deadline schedulers' selection structure (automatic, linear scan, heap)
+    const char*        heapEnv   = std::getenv("EDF_HEAP");
+    const std::int64_t heapMode  = heapEnv == nullptr ? std::int64_t{-1} : static_cast<std::int64_t>(std::atoi(heapEnv));
+    TScheduler         scheduler({{"max_work_items", batchSize}, {"sched_settings", gr::property_map{{"heap_selection", heapMode}}}});
     if (auto exchanged = scheduler.exchange(std::move(graph.graph)); !exchanged.has_value()) {
         throw std::runtime_error(std::format("scheduler exchange failed: {}", exchanged.error()));
     }

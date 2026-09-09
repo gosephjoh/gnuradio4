@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <chrono>
 #include <cstdint>
 #include <limits>
@@ -37,7 +38,12 @@ inline constexpr std::string_view kMaxBatchSizeKey = "gr:max_batch_size";
  *   job k          := work units [k * batchSize, (k + 1) * batchSize)
  *   release of k   := the first observation at which enough data (and output room) exists to run job k
  *   completion of k:= the first observation at which the cumulative work count has passed (k + 1) * batchSize
- *   deadline of k  := releaseTime(k) + relativeDeadline, with implicit deadlines relativeDeadline == period
+ *   deadline of k  := an absolute instant fixed at release and stored with the job. The scheduler decides it:
+ *                     releaseTime(k) + D for a source, D being the block's own relative deadline (implicit
+ *                     D == period); for every other block the earliest deadline carried by the producer jobs
+ *                     whose output job k consumes (see ProductionLog), and never later than the block's own
+ *                     releaseTime(k) + D. A sample's deadline therefore travels with it through the graph, and
+ *                     a miss at a sink is an end-to-end miss rather than a per-hop one.
  *
  * "Best effort" is meant literally and is the central caveat: GR4 gives no callback when data arrives, so both
  * instants are observed at scheduler poll boundaries rather than when they actually occur. Every recorded
@@ -54,15 +60,20 @@ struct JobState {
     using TimePoint = typename TClock::time_point;
     using Duration  = std::chrono::nanoseconds;
 
-    /// distinct release instants that can be outstanding at once; the dispatch path must not allocate, and a
-    /// block further behind than this is already a diagnosed failure rather than a case worth tracking exactly
+    /// distinct (release instant, deadline) groups that can be outstanding at once; the dispatch path must not
+    /// allocate, and a block further behind than this is already a diagnosed failure rather than a case worth
+    /// tracking exactly
     static constexpr std::size_t kMaxPendingReleases = 32UZ;
+    /// response-time histogram: bucket b counts completed jobs whose response lies in [2^b, 2^(b+1)) microseconds;
+    /// bucket 0 also takes everything below 2 us and the last bucket everything above 2^23 us (~8 s). Always on,
+    /// one increment per completed job, never allocates: the counter-only alternative to a full trace.
+    static constexpr std::size_t kHistogramBuckets = 24UZ;
 
     struct PendingRelease {
         TimePoint     releaseTime{};
+        TimePoint     deadline{}; // absolute; every job in the group is judged and ordered against it
         std::uint64_t nJobs = 0UZ;
     };
-
     std::array<PendingRelease, kMaxPendingReleases> pending{};
     std::size_t                                     oldest   = 0UZ; // ring index of the earliest outstanding release
     std::size_t                                     nEntries = 0UZ;
@@ -75,13 +86,18 @@ struct JobState {
     std::uint64_t nMissed           = 0UZ;
     std::uint64_t nReleaseOverflows = 0UZ; // releases merged into the newest entry because the ring was full
     Duration      maxResponseTime{};
+    Duration      totalResponseTime{}; // over completed jobs; mean response = totalResponseTime / nCompleted
     Duration      maxLateness{};
+    std::array<std::uint64_t, kHistogramBuckets> responseHistogram{};
 
     [[nodiscard]] bool hasPendingJob() const noexcept { return nEntries > 0UZ; }
 
     [[nodiscard]] std::uint64_t nPendingJobs() const noexcept { return nReleased - nCompleted - nCancelled; }
 
-    /// release instant of the oldest outstanding job, i.e. the one whose deadline governs the block's urgency
+    /// the group holding the oldest outstanding job, i.e. the one whose deadline governs the block's urgency
+    [[nodiscard]] const PendingRelease* oldestPending() const noexcept { return nEntries > 0UZ ? std::addressof(pending[oldest]) : nullptr; }
+
+    /// release instant of the oldest outstanding job
     [[nodiscard]] std::optional<TimePoint> oldestReleaseTime() const noexcept {
         if (nEntries == 0UZ) {
             return std::nullopt;
@@ -89,26 +105,46 @@ struct JobState {
         return pending[oldest].releaseTime;
     }
 
-    [[nodiscard]] std::optional<TimePoint> earliestDeadline(Duration relativeDeadline) const noexcept {
-        const std::optional<TimePoint> release = oldestReleaseTime();
-        return release.has_value() ? std::optional<TimePoint>{*release + relativeDeadline} : std::nullopt;
+    /// absolute deadline of the oldest outstanding job; deadlines are non-decreasing in job order, so this is
+    /// also the earliest one outstanding
+    [[nodiscard]] std::optional<TimePoint> earliestDeadline() const noexcept {
+        if (nEntries == 0UZ) {
+            return std::nullopt;
+        }
+        return pending[oldest].deadline;
     }
 
-    /// records every job whose data has arrived since the previous observation as released at `now`
-    void observeReleases(std::size_t availableWorkUnits, std::size_t batchSize, TimePoint now) {
+    /// index of the first work unit of the next job to be released
+    [[nodiscard]] std::uint64_t nextReleaseUnit(std::size_t batchSize) const noexcept { return nReleased * static_cast<std::uint64_t>(batchSize); }
+
+    /// jobs whose data has arrived (and whose output room exists) but that have not been recorded as released
+    [[nodiscard]] std::uint64_t releasable(std::size_t availableWorkUnits, std::size_t batchSize) const noexcept {
         if (batchSize == 0UZ) {
-            return;
+            return 0UZ;
         }
         const std::uint64_t nReleasable = (nWorkUnits + static_cast<std::uint64_t>(availableWorkUnits)) / static_cast<std::uint64_t>(batchSize);
-        if (nReleasable <= nReleased) {
-            return;
-        }
-        pushReleases(nReleasable - nReleased, now);
-        nReleased = nReleasable;
+        return nReleasable > nReleased ? nReleasable - nReleased : 0UZ;
     }
 
-    /// credits one work() call and retires every job it finished, counting a miss for each that finished late
-    void observeCompletion(std::size_t performedWork, std::size_t batchSize, Duration relativeDeadline, TimePoint now) {
+    /// records `nJobs` further jobs as released at `releaseTime`, each with the absolute deadline `deadline`
+    void release(std::uint64_t nJobs, TimePoint releaseTime, TimePoint deadline) {
+        if (nJobs == 0UZ) {
+            return;
+        }
+        pushReleases(nJobs, releaseTime, deadline);
+        nReleased += nJobs;
+    }
+
+    /// releases every job whose data has arrived, all at `now` and with the block's own deadline `now + relativeDeadline`
+    void observeReleases(std::size_t availableWorkUnits, std::size_t batchSize, TimePoint now, Duration relativeDeadline) {
+        release(releasable(availableWorkUnits, batchSize), now, now + relativeDeadline);
+    }
+
+    /// credits one work() call and retires every job it finished, counting a miss for each that finished after its
+    /// deadline. `onRetired(nJobs, deadline)` is invoked once per retired group, oldest first, so a caller can
+    /// pass the retired jobs' deadlines on (e.g. to a ProductionLog).
+    template<typename TOnRetired>
+    void observeCompletion(std::size_t performedWork, std::size_t batchSize, TimePoint now, TOnRetired&& onRetired) {
         nWorkUnits += static_cast<std::uint64_t>(performedWork);
         if (batchSize == 0UZ) {
             return;
@@ -120,8 +156,12 @@ struct JobState {
         }
         // a job cannot complete before it has been observed as released; releases are recorded first on every
         // pass, so this only clamps the fallback sweep path where the two observations coincide
-        popCompletions(nCreditable - nCompleted, relativeDeadline, now);
+        popCompletions(nCreditable - nCompleted, now, onRetired);
         nCompleted = nCreditable;
+    }
+
+    void observeCompletion(std::size_t performedWork, std::size_t batchSize, TimePoint now) {
+        observeCompletion(performedWork, batchSize, now, [](std::uint64_t, TimePoint) {});
     }
 
     void clear() noexcept { *this = JobState{}; }
@@ -148,37 +188,50 @@ struct JobState {
         nEntries = 0UZ;
     }
 
+    [[nodiscard]] static constexpr std::size_t histogramBucket(Duration response) noexcept {
+        const auto us = static_cast<std::uint64_t>(std::max<typename Duration::rep>(0, response.count()) / 1000);
+        if (us < 2UZ) {
+            return 0UZ;
+        }
+        return std::min(kHistogramBuckets - 1UZ, static_cast<std::size_t>(std::bit_width(us)) - 1UZ);
+    }
+
 private:
-    void pushReleases(std::uint64_t nJobs, TimePoint now) {
+    void pushReleases(std::uint64_t nJobs, TimePoint releaseTime, TimePoint deadline) {
         if (nEntries > 0UZ) {
             PendingRelease& newest = pending[(oldest + nEntries - 1UZ) % kMaxPendingReleases];
-            if (newest.releaseTime == now) {
+            if (newest.releaseTime == releaseTime && newest.deadline == deadline) {
                 newest.nJobs += nJobs;
                 return;
             }
             if (nEntries == kMaxPendingReleases) {
                 // keep the oldest entry exact so the governing deadline stays correct, and attribute the
-                // overflow to the newest known release instant
+                // overflow to the newest known group; its deadline can only move earlier, i.e. pessimistic
                 newest.nJobs += nJobs;
+                newest.deadline = std::min(newest.deadline, deadline);
                 nReleaseOverflows += nJobs;
                 return;
             }
         }
-        pending[(oldest + nEntries) % kMaxPendingReleases] = PendingRelease{.releaseTime = now, .nJobs = nJobs};
+        pending[(oldest + nEntries) % kMaxPendingReleases] = PendingRelease{.releaseTime = releaseTime, .deadline = deadline, .nJobs = nJobs};
         nEntries++;
     }
 
-    void popCompletions(std::uint64_t nJobs, Duration relativeDeadline, TimePoint now) {
+    template<typename TOnRetired>
+    void popCompletions(std::uint64_t nJobs, TimePoint now, TOnRetired&& onRetired) {
         while (nJobs > 0UZ && nEntries > 0UZ) {
             PendingRelease&     entry   = pending[oldest];
             const std::uint64_t retired = std::min(nJobs, entry.nJobs);
 
             const Duration response = std::chrono::duration_cast<Duration>(now - entry.releaseTime);
             maxResponseTime         = std::max(maxResponseTime, response);
-            if (response > relativeDeadline) {
+            totalResponseTime += response * static_cast<typename Duration::rep>(retired);
+            responseHistogram[histogramBucket(response)] += retired;
+            if (now > entry.deadline) {
                 nMissed += retired;
-                maxLateness = std::max(maxLateness, response - relativeDeadline);
+                maxLateness = std::max(maxLateness, std::chrono::duration_cast<Duration>(now - entry.deadline));
             }
+            onRetired(retired, entry.deadline);
 
             entry.nJobs -= retired;
             nJobs -= retired;
@@ -190,6 +243,113 @@ private:
     }
 };
 
+/**
+ * @brief The deadlines carried by a block's released output, indexed by cumulative output unit.
+ *
+ * Every release group appends one record: the cumulative output unit the group's jobs reach once run, and the
+ * jobs' absolute deadline. A consumer releasing a job that starts at input unit u asks `cover(u)` for the
+ * record containing u — its deadline is the earliest one over the whole job, because deadlines are non-decreasing
+ * in unit order — and that is how a deadline inherits along an edge. Output units are the producer's work units
+ * scaled by its resampling ratio, which is exactly what the consumer counts as input units.
+ *
+ * The ring is fixed-size and never allocates on the dispatch path. Records every in-worker consumer has finished
+ * with are retired on the next publish; if a consumer lags further than the ring holds, the two oldest records
+ * are merged and keep the earlier deadline, which can only make an inherited deadline pessimistic (`nMerged`).
+ * Withdrawn releases truncate the log so a re-release can restate its units.
+ */
+template<typename TClock>
+struct ProductionLog {
+    using TimePoint = typename TClock::time_point;
+
+    static constexpr std::size_t kMaxRecords = 64UZ;
+
+    struct Record {
+        std::uint64_t endUnit = 0UZ; // units [previous record's endUnit, endUnit) carry `deadline`
+        TimePoint     deadline{};
+    };
+    struct Cover {
+        TimePoint     deadline{};
+        std::uint64_t validUntil = 0UZ; // every unit in [queried unit, validUntil) carries the same deadline
+    };
+
+    std::array<Record, kMaxRecords> records{};
+    std::size_t                     oldest    = 0UZ;
+    std::size_t                     nRecords  = 0UZ;
+    std::uint64_t                   firstUnit = 0UZ; // where records[oldest] begins
+    std::uint64_t                   endUnit   = 0UZ; // cumulative units covered by the log
+    std::uint64_t                   nMerged   = 0UZ; // overflow merges; each one makes some inherited deadline pessimistic
+
+    /// extends the log up to cumulative unit `end` with `deadline`; records at or below `retireBefore` are dropped first
+    void publishUntil(std::uint64_t end, TimePoint deadline, std::uint64_t retireBefore) {
+        retire(retireBefore);
+        if (end <= endUnit) {
+            return;
+        }
+        endUnit = end;
+        if (nRecords > 0UZ) {
+            Record& newest = at(nRecords - 1UZ);
+            if (newest.deadline == deadline) {
+                newest.endUnit = end;
+                return;
+            }
+            if (nRecords == kMaxRecords) {
+                Record& second  = at(1UZ);
+                second.deadline = std::min(at(0UZ).deadline, second.deadline);
+                oldest          = (oldest + 1UZ) % kMaxRecords; // `second` now spans from firstUnit
+                nRecords--;
+                nMerged++;
+            }
+        }
+        at(nRecords) = Record{.endUnit = end, .deadline = deadline};
+        nRecords++;
+    }
+
+    /// the record containing `unit`, or nullopt when the log does not (or no longer) cover it
+    [[nodiscard]] std::optional<Cover> cover(std::uint64_t unit) const noexcept {
+        if (unit < firstUnit || unit >= endUnit) {
+            return std::nullopt;
+        }
+        for (std::size_t index = 0UZ; index < nRecords; ++index) {
+            const Record& record = records[(oldest + index) % kMaxRecords];
+            if (unit < record.endUnit) {
+                return Cover{.deadline = record.deadline, .validUntil = record.endUnit};
+            }
+        }
+        return std::nullopt;
+    }
+
+    /// forgets everything at or beyond cumulative unit `newEnd` (a withdrawn release)
+    void truncate(std::uint64_t newEnd) noexcept {
+        if (newEnd >= endUnit) {
+            return;
+        }
+        while (nRecords > 0UZ && startOf(nRecords - 1UZ) >= newEnd) {
+            nRecords--;
+        }
+        if (nRecords > 0UZ) {
+            at(nRecords - 1UZ).endUnit = std::min(at(nRecords - 1UZ).endUnit, newEnd);
+        } else {
+            firstUnit = std::min(firstUnit, newEnd);
+        }
+        endUnit = newEnd;
+    }
+
+    void retire(std::uint64_t before) noexcept {
+        while (nRecords > 0UZ && at(0UZ).endUnit <= before) {
+            firstUnit = at(0UZ).endUnit;
+            oldest    = (oldest + 1UZ) % kMaxRecords;
+            nRecords--;
+        }
+    }
+
+    void clear() noexcept { *this = ProductionLog{}; }
+
+private:
+    [[nodiscard]] Record&       at(std::size_t index) noexcept { return records[(oldest + index) % kMaxRecords]; }
+    [[nodiscard]] const Record& at(std::size_t index) const noexcept { return records[(oldest + index) % kMaxRecords]; }
+    [[nodiscard]] std::uint64_t startOf(std::size_t index) const noexcept { return index == 0UZ ? firstUnit : at(index - 1UZ).endUnit; }
+};
+
 /// static per-block job parameters, resolved once when the schedule is formed
 struct JobParameters {
     std::size_t              batchSize           = 1UZ; // fixed work units per job
@@ -198,6 +358,7 @@ struct JobParameters {
     std::chrono::nanoseconds period{};                   // minimum inter-arrival time of jobs
     bool                     periodFromSampleRate = false;
     bool                     periodFromFallback   = false; // neither annotated nor rate-derived: not a real inter-arrival bound
+    bool                     batchDefaulted       = false; // no gr:batch_size: the scheduler's work quantum (or buffer) chose the batch
     bool                     tracked              = true;  // false when port occupancy cannot describe readiness
     bool                     source               = false; // source releases are observed one job at a time
 };
@@ -268,16 +429,18 @@ namespace detail {
  *
  * The minimum defaults to the block's own chunking — input_chunk_size for a normal block, widened to whatever
  * minimum its ports insist on. `gr:min_batch_size` can raise that floor and `gr:max_batch_size` can cap it.
- * `gr:batch_size` selects the fixed value within those bounds; without it, the minimum is used. Contradictory
- * bounds are normalised by raising the maximum to the minimum, because running below a port's indivisible
- * chunk would never be valid.
+ * `gr:batch_size` selects the fixed value within those bounds; without it, `defaultBatch` -- the scheduler's work
+ * quantum, or the smallest buffer the block touches when that quantum is unbounded -- is used, and only when
+ * neither is known does the batch fall to the minimum. One sample per work() call would otherwise be the job
+ * size of every unannotated block, which is pure dispatch overhead. Contradictory bounds are normalised by
+ * raising the maximum to the minimum, because running below a port's indivisible chunk would never be valid.
  *
  * The period is derived from the fixed batch and declared sample rate where the graph provides one, which is
  * the only place a real-time period can honestly come from in a dataflow graph. A rate propagated from an
  * upstream source can fill an otherwise undeclared port rate. Absent either, the period falls back to the
  * caller's default; `periodFromSampleRate` records when a declared or propagated rate was used.
  */
-[[nodiscard]] inline JobParameters deriveJobParameters(BlockModel& block, std::chrono::nanoseconds fallbackPeriod, std::optional<float> propagatedRate = std::nullopt) {
+[[nodiscard]] inline JobParameters deriveJobParameters(BlockModel& block, std::chrono::nanoseconds fallbackPeriod, std::optional<float> propagatedRate = std::nullopt, std::size_t defaultBatch = 0UZ) {
     const property_map& meta = block.metaInformation();
     JobParameters       parameters;
 
@@ -298,8 +461,9 @@ namespace detail {
 
     parameters.minBatchSize = annotatedMin > 0UZ ? std::max(intrinsicMinimum, static_cast<std::size_t>(annotatedMin)) : intrinsicMinimum;
     parameters.maxBatchSize = annotatedMax > 0UZ ? std::max(parameters.minBatchSize, static_cast<std::size_t>(annotatedMax)) : std::numeric_limits<std::size_t>::max();
-    const std::size_t preferred = annotatedBatch > 0UZ ? static_cast<std::size_t>(annotatedBatch) : parameters.minBatchSize;
+    const std::size_t preferred = annotatedBatch > 0UZ ? static_cast<std::size_t>(annotatedBatch) : defaultBatch > 0UZ ? defaultBatch : parameters.minBatchSize;
     parameters.batchSize        = std::clamp(preferred, parameters.minBatchSize, parameters.maxBatchSize);
+    parameters.batchDefaulted   = annotatedBatch == 0UZ;
 
     if (const std::uint64_t annotatedPeriod = detail::readUnsigned(meta, kPeriodKey); annotatedPeriod > 0UZ) {
         parameters.period = std::chrono::nanoseconds(static_cast<std::int64_t>(annotatedPeriod));
