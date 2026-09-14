@@ -8,7 +8,9 @@
 #include <format>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <queue>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -183,7 +185,85 @@ namespace detail {
 
 [[nodiscard]] inline bool isResampling(const BlockModel& block) { return settingAsSize(block, "input_chunk_size", 1UZ) != 1UZ || settingAsSize(block, "output_chunk_size", 1UZ) != 1UZ; }
 
+/// Combines per-port availability into the single quantity that gates invocation, using exactly the
+/// rule `RateAccumulator` uses for rates: the slowest synchronous port, the fastest asynchronous
+/// one, and the faster of the two where both are present. Sharing one rule is what stops eligibility
+/// and rate derivation from disagreeing about when a block runs.
+///
+/// `std::nullopt` means nothing is connected, which the caller must interpret -- for an input span it
+/// identifies a source, for an output span a block that can make no progress at all.
+[[nodiscard]] inline std::optional<std::size_t> gatingAvailability(std::span<const std::size_t> available, std::span<const port::BitMask> types) {
+    std::size_t syncMin  = gr::undefined_size;
+    std::size_t asyncMax = 0UZ;
+    bool        hasSync  = false;
+    bool        hasAsync = false;
+
+    for (std::size_t i = 0UZ; i < std::min(available.size(), types.size()); ++i) {
+        const port::BitMask mask = types[i];
+        if (!port::isConnected(mask)) {
+            continue; // an unconnected optional port reports `undefined_size` and gates nothing
+        }
+        if (port::isSynchronous(mask)) {
+            syncMin = std::min(syncMin, available[i]);
+            hasSync = true;
+        } else {
+            asyncMax = std::max(asyncMax, available[i]);
+            hasAsync = true;
+        }
+    }
+
+    if (hasSync && hasAsync) {
+        return std::max(syncMin, asyncMax);
+    }
+    if (hasSync) {
+        return syncMin;
+    }
+    if (hasAsync) {
+        return asyncMax;
+    }
+    return std::nullopt;
+}
+
 } // namespace detail
+
+/// Non-destructive answer to "would this block make progress?", obtained without invoking `work()`.
+///
+/// `available` is the gating quantity, in input samples -- or, for a block with no connected input,
+/// in output samples: a source is bounded by the space it can write into, which is the only thing
+/// that limits the work it can do.
+struct Readiness {
+    std::size_t available = 0UZ;
+    bool        runnable  = false;
+
+    /// Nothing connected constrains `available`, so a batch cannot be derived from it and must come
+    /// from the block's ceiling instead -- and no job may be issued where that ceiling is itself
+    /// unbounded, since `work(SIZE_MAX)` is not a batch.
+    [[nodiscard]] constexpr bool unbounded() const noexcept { return available == gr::undefined_size; }
+};
+
+/// N.B. forces a re-read of the port caches: an upstream publish leaves the consumer's
+/// `_dirtyAvailable` set, so a cached read would report pre-publish occupancy.
+[[nodiscard]] inline Readiness inputReadiness(BlockModel& block, std::size_t threshold) {
+    const std::span<const std::size_t>   inputAvailable = block.availableInputSamples(true);
+    const std::span<const port::BitMask> inputTypes     = block.blockInputTypes();
+
+    std::optional<std::size_t> gating = detail::gatingAvailability(inputAvailable, inputTypes);
+    if (!gating.has_value()) {
+        const std::span<const std::size_t>   outputAvailable = block.availableOutputSamples(true);
+        const std::span<const port::BitMask> outputTypes     = block.blockOutputTypes();
+        gating                                               = detail::gatingAvailability(outputAvailable, outputTypes);
+    }
+    if (!gating.has_value()) {
+        return {};
+    }
+    return {.available = *gating, .runnable = *gating >= std::max(threshold, 1UZ)};
+}
+
+/// `available - assigned`, saturating at zero. Availability can legitimately fall below what
+/// outstanding jobs already hold -- under the asynchronous `max` rule the gating port may change
+/// between detection points -- and unsigned wrap-around there would open the data gate wide instead
+/// of closing it. Saturating fails closed: the gate stays shut until the outstanding jobs drain.
+[[nodiscard]] constexpr std::size_t unassignedSamples(std::size_t available, std::size_t assigned) noexcept { return available > assigned ? available - assigned : 0UZ; }
 
 /// A period is only as sound as the batch it was computed at, so its provenance follows the
 /// batch's: configuration where a value was configured, `derivedFromRate` where the rate model
