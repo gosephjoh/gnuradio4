@@ -852,6 +852,20 @@ const boost::ut::suite<"multi-threaded release tracking"> threadedTests = [] {
         expect(eq(heapB, kThreadedSamples));
     };
 
+    "task-level fixed priority works across workers today"_test = [] {
+        // `RateMonotonicPolicy` is `fixedTask`, so `hasStaticKey` holds, the list is pre-sorted and
+        // the polling selection loop runs -- no release tracking, and therefore none of the
+        // cross-worker problem. It is the deadline-derived ordering that *is* available under
+        // threads right now (DEVLOG_M3 §17).
+        const auto [crossA, crossB] = runThreaded<RateMonotonicPolicy>(Placement::crossWorker, kThreadedSamples);
+        expect(eq(crossA, kThreadedSamples));
+        expect(eq(crossB, kThreadedSamples));
+
+        const auto [sameA, sameB] = runThreaded<RateMonotonicPolicy>(Placement::sameWorker, kThreadedSamples);
+        expect(eq(sameA, kThreadedSamples));
+        expect(eq(sameB, kThreadedSamples));
+    };
+
     "round robin is unaffected"_test = [] {
         // The behaviour-neutrality baseline: the same graphs under the default policy, which does no
         // release tracking at all.
