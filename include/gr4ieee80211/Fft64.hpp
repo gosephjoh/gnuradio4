@@ -20,6 +20,9 @@
 #include "wifi_codec.hpp"
 
 #include <vector>
+#include <cstdio>
+#include <cstdlib>
+#include <string>
 
 namespace gr4wifi {
 
@@ -34,7 +37,17 @@ struct Fft64 : gr::Block<Fft64, gr::Resampling<64UZ, 64UZ, true>, gr::NoTagPropa
     gr::algorithm::FFT<cf, cf> _fft;
     std::vector<cf>            _in  = std::vector<cf>(64);
     std::vector<cf>            _out = std::vector<cf>(64);
-    uint64_t                   _items = 0;
+    uint64_t                   _items = 0, _tags_in = 0, _tags_out = 0, _calls = 0;
+    std::FILE*                 _trace = nullptr;
+
+    void start() {
+        if (const char* t = std::getenv("GR4_SYNCLONG_TRACE")) {
+            _trace = std::fopen((std::string(t) + "." + std::string(this->name.value)).c_str(), "w");
+        }
+    }
+    void stop() {
+        if (_trace) { std::fclose(_trace); _trace = nullptr; }
+    }
 
     gr::work::Status processBulk(gr::InputSpanLike auto& sIn, gr::OutputSpanLike auto& sOut) {
         const std::size_t n = std::min(sIn.size(), sOut.size()) / 64 * 64;
@@ -45,9 +58,13 @@ struct Fft64 : gr::Block<Fft64, gr::Resampling<64UZ, 64UZ, true>, gr::NoTagPropa
             std::copy_n(_out.begin() + 32, 32, sOut.begin() + static_cast<std::ptrdiff_t>(k));
             std::copy_n(_out.begin(), 32, sOut.begin() + static_cast<std::ptrdiff_t>(k + 32));
         }
+        _calls++;
         for (const auto& [rel, map] : sIn.tags()) {
+            _tags_in++;
+            if (_trace) { std::fprintf(_trace, "%llu,in=%zu,out=%zu,n=%zu,tag_rel=%td\n", static_cast<unsigned long long>(_calls), sIn.size(), sOut.size(), n, static_cast<std::ptrdiff_t>(rel)); }
             if (rel >= 0 && static_cast<std::size_t>(rel) < n) {
                 sOut.publishTag(map.get(), static_cast<std::size_t>(rel));
+                _tags_out++;
             }
         }
         _items += n;

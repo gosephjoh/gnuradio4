@@ -61,6 +61,23 @@ Wiring is `src/chain.cpp`; it is the connection map of
    not sample payloads (decision 0035 question 7).
 7. **`csi` is not attached** to the frame tag; nothing downstream reads it.
 
+## A GR4 rule GR3 does not have: a call that publishes nothing loses its tags
+
+`Block::finaliseIO` sets `tagsPublished = 0` on every output span when the
+call published no samples. Upstream's `sync_short` tags the *next* output
+item and returns without producing it (SEARCH→COPY, and the in-COPY
+re-trigger); under GR3 the tag survives, under GR4 it is discarded whenever
+the trigger lands on the first sample of a call. The symptom was one frame
+lost at `sync_long` in roughly one two-chain real-time run of three, never
+unthrottled, never on a fixture cell — found with the per-call trace
+(`GR4_SYNCLONG_TRACE=<path>` writes one CSV per sync_long / Fft64 /
+FrameEqualizer instance) showing a tag published by sync_short that
+sync_long never received. Both `wifi_start` tags of `SyncShort` are now held
+and published on the first sample of the next COPY call; the index is the
+same. Twelve two-chain real-time runs of the 1000-frame random-length cell
+after the fix: 24 000 of 24 000 frames. The same rule is why
+`FrameEqualizer` holds its frame tag until the first data symbol is written.
+
 ## GR4 stock blocks that did not work on this tree
 
 Measured with `apps/probe.cpp`, kept as the diagnostic:
@@ -90,6 +107,17 @@ blocks.
   equaliser's `exp`/`arg`. The symbols plane is therefore toleranced
   (`max|Δ| ≤ 1e-5`, NMSE ≤ −80 dB) and the decoded planes are bit-exact,
   which is exactly what `compare --rx-only` asserts.
+
+## Diagnostics kept in the code
+
+Per-stage item and tag counters are in every own block and reported under
+`counts` in `latency_summary.json` (`sync_short_detections`,
+`sync_long_frames`, `fft_tags_in/out`, `eq_tags_in`, `signal_ok/bad`,
+`frames_started/decoded`, `crc_failed`, `sl_*`). `GR4_SYNCLONG_TRACE=<path>`
+enables the per-call traces. `apps/probe.cpp` builds sub-graphs
+(`fsrc`, `raw`, `stamp`, `m1..m5`, `full`, `full10`; third argument
+`single` for the single-threaded scheduler) and prints every block's
+lifecycle state and the stage counters.
 
 ## Verification
 

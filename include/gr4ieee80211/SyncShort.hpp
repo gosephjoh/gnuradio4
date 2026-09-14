@@ -7,9 +7,14 @@
  * = the frequency offset in radians/sample) at the frame's first sample.
  *
  * Differences from upstream, all outside the arithmetic: no tag propagation
- * (upstream sets TPP_DONT); the SEARCH->COPY tag, which upstream attaches to
- * the *next* output item before producing it, is held and published on the
- * first item of the COPY that follows -- same absolute index.
+ * (upstream sets TPP_DONT); both `wifi_start` tags, which upstream attaches to
+ * the *next* output item before producing it, are held and published on the
+ * first item of the COPY call that follows -- same absolute index.  Publishing
+ * them immediately loses a frame whenever the trigger lands on the first
+ * sample of a call: that call publishes no sample, and GR4 then discards its
+ * tags (Block::finaliseIO), which GR3 never does.  Found with the sync_long
+ * trace (GR4_SYNCLONG_TRACE) on a two-chain real-time run: one frame in
+ * roughly three runs of 2 000.
  */
 #pragma once
 
@@ -97,10 +102,16 @@ struct SyncShort : gr::Block<SyncShort, gr::NoTagPropagation> {
                     if (_plateau < static_cast<int>(min_plateau)) {
                         _plateau++;
                     } else if (_copied > MIN_GAP) {
+                        // another frame: upstream tags the NEXT output item here
+                        // and breaks.  GR4 discards every tag of a call that
+                        // publishes no sample (Block::finaliseIO), which is
+                        // exactly this call when o == 0, so the tag is held and
+                        // published with that item on the next call -- the
+                        // same absolute index either way.
                         _copied      = 0;
                         _plateau     = 0;
                         _freq_offset = std::arg(in_a[o]) / 16;
-                        sOut.publishTag(gr::property_map{{"wifi_start", static_cast<double>(_freq_offset)}}, static_cast<std::size_t>(o));
+                        _pending_tag = static_cast<double>(_freq_offset);
                         _frames_detected++;
                         break;
                     }

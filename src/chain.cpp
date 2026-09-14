@@ -122,6 +122,8 @@ ChainBlocks buildChain(gr::Graph& g, const ChainConfig& cfg) {
         c.too_large             = dec._too_large;
         c.items_avgpow = avgpow._items; c.items_dly16 = dly16._items; c.items_avgcor = avgcor._items; c.items_ss = ss._items; c.items_dly320 = dly320._items;
         c.items_sl = sl._items; c.items_fft = fft._items; c.items_eq = eq._items; c.items_dec = dec._items; c.calls_ss = ss._calls; c.calls_sl = sl._calls; c.max_cor = ss._max_cor;
+        c.fft_tags_in = fft._tags_in; c.fft_tags_out = fft._tags_out; c.eq_tags_in = eq._tags_in;
+        c.sl_neg_tags = sl._neg_tags; c.sl_far_tags = sl._far_tags; c.sl_tags_seen = sl._tags_seen; c.sl_max_copy_run = sl._max_copy_run; c.sl_short_calls = sl._short_calls;
         return c;
     };
     return cb;

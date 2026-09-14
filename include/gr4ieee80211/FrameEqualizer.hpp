@@ -31,6 +31,9 @@
 #include <cmath>
 #include <numbers>
 #include <optional>
+#include <cstdio>
+#include <cstdlib>
+#include <string>
 
 namespace gr4wifi {
 
@@ -60,7 +63,17 @@ struct FrameEqualizer : gr::Block<FrameEqualizer, gr::NoTagPropagation> {
     ViterbiDecoder                 _decoder;
     std::optional<gr::property_map> _pending_tag;
     uint64_t                        _signal_ok = 0, _signal_bad = 0;
-    uint64_t                        _items = 0, _calls = 0;
+    uint64_t                        _items = 0, _calls = 0, _tags_in = 0;
+    std::FILE*                      _trace = nullptr;
+
+    void start() {
+        if (const char* t = std::getenv("GR4_SYNCLONG_TRACE")) {
+            _trace = std::fopen((std::string(t) + "." + std::string(this->name.value)).c_str(), "w");
+        }
+    }
+    void stop() {
+        if (_trace) { std::fclose(_trace); _trace = nullptr; }
+    }
 
     gr::work::Status processBulk(gr::InputSpanLike auto& sIn, gr::OutputSpanLike auto& sOut, gr::OutputSpanLike auto& sSym) {
         const cf* inp      = sIn.data();
@@ -72,7 +85,10 @@ struct FrameEqualizer : gr::Block<FrameEqualizer, gr::NoTagPropagation> {
 
         // wifi_start tags of this span, by input symbol index
         std::vector<std::pair<std::size_t, double>> starts;
+        _calls++;
         for (const auto& [rel, map] : sIn.tags()) {
+            _tags_in++;
+            if (_trace) { std::fprintf(_trace, "%llu,in=%zu,out=%zu,sym=%zu,nsym=%zu,tag_rel=%td\n", static_cast<unsigned long long>(_calls), sIn.size(), sOut.size(), sSym.size(), nsym_in, static_cast<std::ptrdiff_t>(rel)); }
             if (rel >= 0 && static_cast<std::size_t>(rel) < nsym_in * 64) {
                 const auto v = map.get().template value_or<double>("wifi_start", std::numeric_limits<double>::quiet_NaN());
                 if (!std::isnan(v)) {

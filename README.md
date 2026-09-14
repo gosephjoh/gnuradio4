@@ -65,9 +65,11 @@ Either add `--run` to the `rt-run4` line, or run the receiver line it printed:
     --rate 10000000 --chains 2 --chunk 4096 --deadline-ms 100
 ```
 
-While it runs, `htop -t` shows one thread per GR4 scheduler worker (8 on this
-box, named after the scheduler) plus the throttles' timer threads; GR4 is not
-thread-per-block, so do not expect one thread per receiver block as with GR3.
+While it runs, `htop -t` shows the GR4 scheduler's worker threads
+`default_cpu#1..8` (one per hardware thread on this box), the IO-pool threads
+`default_io#k` that run the throttles' timers, and the main thread. GR4 is
+not thread-per-block, so there is no thread per receiver block as with GR3;
+the per-block picture comes from the stage counters in `latency_summary.json`.
 The run ends by itself at the end of the file; a per-chain line is printed:
 
 ```

@@ -48,6 +48,8 @@ struct ChainCounters {
     // items consumed per stage (diagnostics)
     uint64_t items_avgpow = 0, items_dly16 = 0, items_avgcor = 0, items_ss = 0, items_dly320 = 0, items_sl = 0, items_fft = 0, items_eq = 0, items_dec = 0;
     uint64_t calls_ss = 0, calls_sl = 0;
+    uint64_t fft_tags_in = 0, fft_tags_out = 0, eq_tags_in = 0;
+    uint64_t sl_neg_tags = 0, sl_far_tags = 0, sl_tags_seen = 0, sl_max_copy_run = 0, sl_short_calls = 0;
     float    max_cor = 0;
 };
 

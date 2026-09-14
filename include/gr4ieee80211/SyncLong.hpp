@@ -25,6 +25,8 @@
 
 #include <algorithm>
 #include <print>
+#include <cstdio>
+#include <cstdlib>
 #include <utility>
 #include <vector>
 
@@ -53,12 +55,24 @@ struct SyncLong : gr::Block<SyncLong, gr::NoTagPropagation> {
     std::vector<std::pair<cf, int>>   _cor;
     uint64_t                          _frames_aligned = 0;
     uint64_t                          _items = 0, _calls = 0;
+    // diagnostics: tags seen with a negative relative index (consumed past),
+    // tags seen beyond ninput, longest COPY run between tags, tags total
+    uint64_t _neg_tags = 0, _far_tags = 0, _tags_seen = 0, _copy_run = 0, _max_copy_run = 0, _short_calls = 0;
+    std::FILE* _trace = nullptr; // GR4_SYNCLONG_TRACE=<path>: one line per call
 
     void start() {
+        if (const char* t = std::getenv("GR4_SYNCLONG_TRACE")) {
+            _trace = std::fopen((std::string(t) + "." + std::string(this->name.value)).c_str(), "w");
+            if (_trace) { std::fprintf(_trace, "call,state_in,offset_in,nin,ndel,nout,tag_rel,tag_val,i,o,state_out,offset_out,aligned,frame_start\n"); }
+        }
         _correlation.assign(8192, cf{});
         _cor.clear();
         _cor.reserve(sync_length + 1);
         _state = SYNC; _count = 0; _offset = 0;
+    }
+
+    void stop() {
+        if (_trace) { std::fclose(_trace); _trace = nullptr; }
     }
 
     // fir_filter_ccc(LONG).filterN(out, in, n): reversed taps.
@@ -84,9 +98,9 @@ struct SyncLong : gr::Block<SyncLong, gr::NoTagPropagation> {
         int    tag_rel   = 0;
         double tag_value = 0;
         for (const auto& [rel, map] : sIn.tags()) {
-            if (rel < 0 || rel >= ninput) {
-                continue;
-            }
+            if (rel < 0) { _neg_tags++; continue; }
+            if (rel >= ninput) { _far_tags++; continue; }
+            _tags_seen++;
             const auto v = map.get().template value_or<double>("wifi_start", std::numeric_limits<double>::quiet_NaN());
             if (std::isnan(v)) {
                 continue;
@@ -113,6 +127,9 @@ struct SyncLong : gr::Block<SyncLong, gr::NoTagPropagation> {
         }
 
         int i = 0, o = 0;
+        if (ninput < 64) { _short_calls++; }
+        const int state_in = _state, offset_in = _offset;
+        const int nin_raw = static_cast<int>(sIn.size()), ndel_raw = static_cast<int>(sDel.size());
 
         if (_state == RESET) {
             while (o < noutput) {
@@ -163,7 +180,11 @@ struct SyncLong : gr::Block<SyncLong, gr::NoTagPropagation> {
             }
         }
 
+        if (_trace) {
+            std::fprintf(_trace, "%llu,%d,%d,%d,%d,%d,%d,%.6g,%d,%d,%d,%d,%llu,%d\n", static_cast<unsigned long long>(_calls), state_in, offset_in, nin_raw, ndel_raw, noutput, have_tag ? tag_rel : -1, have_tag ? tag_value : 0.0, i, o, static_cast<int>(_state), _offset, static_cast<unsigned long long>(_frames_aligned), _frame_start);
+        }
         _count += o;
+        if (_state == COPY) { _copy_run += static_cast<uint64_t>(i); _max_copy_run = std::max(_max_copy_run, _copy_run); } else { _copy_run = 0; }
         _items += static_cast<uint64_t>(i);
         _calls++;
         std::ignore = sIn.consume(static_cast<std::size_t>(i));
