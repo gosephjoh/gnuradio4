@@ -22,35 +22,118 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=g++-15
 cmake --build build -j1 --target rx_latency4      # ~6 min the first time; one TU needs 2.4 GB
 ```
 
-## Run — the same levers as GR3's `rt-run`
+## Quick start — generate samples, run, read the response times
+
+All commands run from this folder (`cd ~/gr4-ieee80211`). The GR3 project
+must be built too (`~/gr3-ieee802-11-project/build/`): it generates the
+samples, and its `compare` tool is the correctness judge.
+
+### 1. Generate the samples
+
+One command takes the same levers as GR3's `rt-run` and makes (or reuses)
+the sample file, so GR3 and GR4 replay identical bytes:
 
 ```
 ./scripts/rt-run4 MIN MAX RATE CHAINS [--packets N] [--mcs NAME] [--seed S] [--chunk N] [--deadline-ms F] [--run]
-./scripts/rt-run4 8 1500 10e6 1 --packets 1000     # random sizes, real time, one receiver
-./scripts/rt-run4 300 300 0 4 --packets 102934     # one size, unthrottled, four receivers
+
+./scripts/rt-run4 8 1500 10e6 1 --packets 1000       # payloads 8..1500 B, 1000 packets, real time, one receiver
+./scripts/rt-run4 300 300 10e6 2 --packets 102934    # one payload size, 60 s of air, two receivers
 ```
 
-It reuses the cell the GR3 project generated for the same MIN/MAX/packets/
-MCS/seed (`~/gr3-ieee802-11-project/data/phase10/rt_<MIN>_<MAX>_<N>_<MCS>_s<seed>/`,
-or generates it there with GR3's `rt-gen` — both runtimes must replay the
-identical bytes), creates `<cell>/runs4/rate<R>_chains<C>/` beside GR3's
-`runs/`, and prints: `htop -t` for a second terminal, the `rx_latency4`
-line, a one-liner that reads `latency_summary.json`, and the GR3-vs-GR4
-packet-for-packet comparison. `--run` executes the receiver.
+- `MIN MAX` payload bytes, drawn uniformly per packet; `MIN == MAX` is one size (8..1500).
+- `RATE` throttle in samples/s: `10e6` = 802.11p real time, `20e6` twice that, `0` unthrottled.
+- `CHAINS` concurrent receivers on the same file in one process.
+- The cell lands in `~/gr3-ieee802-11-project/data/phase10/rt_<MIN>_<MAX>_<N>_<MCS>_s<seed>/`
+  (4.8 GB and ~65 s per 60-second cell, once; reused afterwards). Without `--run`
+  the script only generates and **prints the commands** below, so you can start
+  `htop -t` in another terminal first.
 
-The binary itself:
+To generate by hand instead (what `rt-run4` calls):
+
+```
+( cd ~/gr3-ieee802-11-project && ./scripts/rt-gen 300 300 102934 --out data/phase10/rt_300_300_102934_QPSK_1_2_s1 )
+```
+
+### 2. Execute
+
+Either add `--run` to the `rt-run4` line, or run the receiver line it printed:
+
+```
+./build/rx_latency4 --run-dir ~/gr3-ieee802-11-project/data/phase10/rt_300_300_102934_QPSK_1_2_s1 \
+    --input ~/gr3-ieee802-11-project/data/phase10/rt_300_300_102934_QPSK_1_2_s1/rx_stimulus.cf32 \
+    --out-dir ~/gr3-ieee802-11-project/data/phase10/rt_300_300_102934_QPSK_1_2_s1/runs4/rate10000000_chains2 \
+    --rate 10000000 --chains 2 --chunk 4096 --deadline-ms 100
+```
+
+While it runs, `htop -t` shows one thread per GR4 scheduler worker (8 on this
+box, named after the scheduler) plus the throttles' timer threads; GR4 is not
+thread-per-block, so do not expect one thread per receiver block as with GR3.
+The run ends by itself at the end of the file; a per-chain line is printed:
+
+```
+rx_latency4: chain 0 -- 102934/102934 decoded, 0 missing, 0 dup, 0 unpairable, 0 wrong payload;
+             last->decode us: first 1131.0 p50 1188.8 p95 3886.2 p99 5121.1 max 6257.2; 0 over 100 ms; ...
+```
+
+### 3. Look at the response times
+
+Outputs are in `<cell>/runs4/rate<R>_chains<C>/`, beside GR3's `runs/` for the
+same configuration:
+
+```
+OUT=~/gr3-ieee802-11-project/data/phase10/rt_300_300_102934_QPSK_1_2_s1/runs4/rate10000000_chains2
+
+# the summary: per chain decoded/frames, p50/p95/p99/max of last-sample-to-decode, deadline misses
+python3 -c "import json; s=json.load(open('$OUT/latency_summary.json')); [print('chain %d: %d/%d decoded (%s wrong payload), last->decode us p50 %.0f p95 %.0f p99 %.0f max %.0f, %d over %g ms' % (c['chain'], c['decoded'], c['frames'], c['wrong_payload'], c['p50_us'], c['p95_us'], c['p99_us'], c['max_us'], c['deadline_misses'], s['latency']['deadline_ms'])) for c in s['per_chain']]"
+
+# every packet: chain,seq,length,t_first_ns,t_last_ns,t_decode_ns,lat_first_us,lat_last_us,decoded,correct
+head -5 $OUT/latency.csv
+
+# GR3 vs GR4 on the same cell, packet for packet (run GR3's ./scripts/rt-run for the same levers first)
+python3 scripts/compare-runs.py ${OUT/runs4/runs}/latency.csv $OUT/latency.csv
+```
+
+`lat_last_us` is the headline number: the frame's last sample released by
+the throttle to the decoded packet, in microseconds. `lat_first_us` adds the
+frame's air time. `correct` is 1 when the decoded payload matched
+`payloads.bin`. `latency_summary.json` also carries per-stage counts
+(`sync_short_detections`, `sync_long_frames`, `signal_ok`, `crc_failed`).
+
+### Packet counts for 60 seconds, and the load configurations GR3 measured
+
+The replay lasts `total_samples / RATE`; these counts give 60 s at 10 Msps
+(double them for 20 Msps). Same cells as the GR3 README, so the comparison
+is on identical bytes.
+
+| payload | `--packets` for 60 s at 10 Msps |
+|---|---|
+| 8..1500 | 50509 |
+| 8..8 | 314301 |
+| 100..100 | 192988 |
+| 300..300 | 102934 |
+| 1500..1500 | 27486 |
+
+```
+./scripts/rt-run4 300 300 10e6 1 --packets 102934 --run    # GR3: 2.3 cores busy
+./scripts/rt-run4 300 300 10e6 2 --packets 102934 --run    # GR3: 4.7 cores
+./scripts/rt-run4 300 300 10e6 3 --packets 102934 --run    # GR3: 5.9 cores, still real time
+./scripts/rt-run4 300 300 10e6 4 --packets 102934 --run    # GR3: 6.5 cores, throttle 14 % behind
+./scripts/rt-run4 300 300 20e6 1 --packets 205867 --run    # GR3: 4.2 cores at twice real time
+```
+
+The GR3 numbers are `~/gr3-ieee802-11-project/results/phase10/load/README.md`;
+GR4's are not measured yet — run the lines above and read the CPU bars.
+
+The binary's own options:
 
 ```
 ./build/rx_latency4 --run-dir DIR [--input F] [--out-dir D] [--rate SPS] [--chunk N]
                     [--chains N] [--deadline-ms F] [--timeout-s S] [--record] [--no-check]
 ```
 
-Outputs (`--out-dir`): `latency.csv` — GR3's columns plus `correct` (the
-decoded payload matched `payloads.bin`) — and `latency_summary.json` — GR3's
-fields plus `wrong_payload`, the per-stage `counts`, `runtime`, `scheduler`,
-`hw_threads`. `--record` adds `rx_pdus.bin`, `rx_log.csv`, `rx_symbols.cf32`,
-`rx_symbols.csv` in the GR3 formats for `compare`. The GR3 run directory is
-never written to.
+`--record` adds `rx_pdus.bin`, `rx_log.csv`, `rx_symbols.cf32`, `rx_symbols.csv`
+in the GR3 formats for `compare`; `--no-check` skips the payload check. The GR3
+run directory is never written to.
 
 ## Verification
 
