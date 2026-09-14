@@ -1,0 +1,209 @@
+/*
+ * basic_blocks.hpp -- the GR3 stock blocks the receiver uses that GR4 does
+ * not ship: throttle, sample delay, |x|^2, conjugate, moving average.
+ * Each reproduces the GR3 block's arithmetic (findings/cpp-build-notes.md
+ * of the GR3 project names the block and its parameters; the GR3 sources are
+ * gr-blocks/lib/{throttle,delay,moving_average}_impl.cc, maint-3.10).
+ */
+#pragma once
+
+#include <gnuradio-4.0/Block.hpp>
+#include <gnuradio-4.0/BlockingSync.hpp>
+
+#include <algorithm>
+#include <complex>
+#include <numeric>
+#include <vector>
+
+namespace gr4wifi {
+
+/*
+ * Throttle -- GR3's blocks::throttle(itemsize, rate, ignore_tags=true, chunk).
+ *
+ * GR3 copies at most `chunk` items, sleeps until their end-of-air time, then
+ * returns, so a chunk becomes visible downstream at the real-time arrival of
+ * its last sample.  A GR4 block must not sleep inside the scheduler, so this
+ * one uses the BlockingSync mixin: an internal timer thread wakes the
+ * scheduler every chunk period and processBulk releases the samples that are
+ * due (elapsed time x rate, capped at `chunk_size`).  Same visible behaviour
+ * -- a chunk is released at or after its end-of-air time -- and the same
+ * bound on the arrival-stamp bias, chunk_size / sample_rate.
+ */
+template<typename T>
+struct Throttle : gr::Block<Throttle<T>>, gr::BlockingSync<Throttle<T>> {
+    using Description = gr::Doc<"GR3-style throttle: releases samples at sample_rate, at most chunk_size per wake-up">;
+
+    gr::PortIn<T>  in;
+    gr::PortOut<T> out;
+
+    float      sample_rate         = 10e6f;
+    gr::Size_t chunk_size          = 4096U;
+    bool       use_internal_thread = true;
+
+    GR_MAKE_REFLECTABLE(Throttle, in, out, sample_rate, chunk_size, use_internal_thread);
+
+    void start() { this->blockingSyncStart(); }
+    void stop() { this->blockingSyncStop(); }
+
+    gr::work::Status processBulk(gr::InputSpanLike auto& input, gr::OutputSpanLike auto& output) {
+        const std::size_t avail = std::min(input.size(), output.size());
+        const std::size_t n     = this->syncSamples(avail);
+        if (n == 0) {
+            std::ignore = input.consume(0);
+            output.publish(0);
+            return gr::work::Status::INSUFFICIENT_INPUT_ITEMS;
+        }
+        std::copy_n(input.begin(), n, output.begin());
+        std::ignore = input.consume(n);
+        output.publish(n);
+        return gr::work::Status::OK;
+    }
+};
+
+/*
+ * SampleDelay -- GR3's blocks::delay(itemsize, d): the first d outputs are
+ * zero, then out[i] = in[i - d].
+ */
+template<typename T>
+struct SampleDelay : gr::Block<SampleDelay<T>> {
+    using Description = gr::Doc<"delay by `delay` samples; the first `delay` outputs are zero">;
+
+    gr::PortIn<T>  in;
+    gr::PortOut<T> out;
+
+    gr::Size_t delay = 0U;
+
+    GR_MAKE_REFLECTABLE(SampleDelay, in, out, delay);
+
+    std::vector<T> _hist;
+    std::size_t    _pos = 0;
+    uint64_t       _items = 0;
+
+    void start() {
+        _hist.assign(delay, T{});
+        _pos = 0;
+    }
+
+    [[nodiscard]] T processOne(T x) noexcept {
+        _items++;
+        if (delay == 0U) {
+            return x;
+        }
+        const T y   = _hist[_pos];
+        _hist[_pos] = x;
+        _pos        = (_pos + 1 == _hist.size()) ? 0 : _pos + 1;
+        return y;
+    }
+};
+
+// GR3 blocks::complex_to_mag_squared: re*re + im*im (volk_32fc_magnitude_squared_32f).
+struct MagSquared : gr::Block<MagSquared> {
+    using Description = gr::Doc<"|x|^2 of a complex stream, as re*re + im*im">;
+
+    gr::PortIn<std::complex<float>> in;
+    gr::PortOut<float>              out;
+
+    GR_MAKE_REFLECTABLE(MagSquared, in, out);
+
+    [[nodiscard]] constexpr float processOne(std::complex<float> x) const noexcept { return x.real() * x.real() + x.imag() * x.imag(); }
+};
+
+/*
+ * Multiply2 / Divide2 -- GR3's blocks::multiply_cc / divide_ff with two
+ * inputs.  GR4 has Multiply<T>/Divide<T> with a dynamic port vector
+ * (in#0, in#1); on this tree a graph using them never ran (apps/probe.cpp
+ * mode "m4": counting sink 0), so the two-input case is written out with
+ * static ports.  Same arithmetic: std::complex operator* and float division.
+ */
+template<typename T>
+struct Multiply2 : gr::Block<Multiply2<T>> {
+    using Description = gr::Doc<"out = in0 * in1">;
+    gr::PortIn<T>  in0;
+    gr::PortIn<T>  in1;
+    gr::PortOut<T> out;
+    GR_MAKE_REFLECTABLE(Multiply2, in0, in1, out);
+    [[nodiscard]] constexpr T processOne(T a, T b) const noexcept { return a * b; }
+};
+
+template<typename T>
+struct Divide2 : gr::Block<Divide2<T>> {
+    using Description = gr::Doc<"out = in0 / in1">;
+    gr::PortIn<T>  in0;
+    gr::PortIn<T>  in1;
+    gr::PortOut<T> out;
+    GR_MAKE_REFLECTABLE(Divide2, in0, in1, out);
+    [[nodiscard]] constexpr T processOne(T a, T b) const noexcept { return a / b; }
+};
+
+// GR3 blocks::conjugate_cc.
+struct Conjugate : gr::Block<Conjugate> {
+    using Description = gr::Doc<"complex conjugate">;
+
+    gr::PortIn<std::complex<float>>  in;
+    gr::PortOut<std::complex<float>> out;
+
+    GR_MAKE_REFLECTABLE(Conjugate, in, out);
+
+    [[nodiscard]] constexpr std::complex<float> processOne(std::complex<float> x) const noexcept { return std::conj(x); }
+};
+
+/*
+ * MovingAverage -- GR3's blocks::moving_average<T>(length, scale=1, max_iter):
+ *
+ *   history = length; per work() call: sum = accumulate(in[0 .. length-1))
+ *   (the length-1 items of history), then for i < min(noutput, max_iter):
+ *   sum += in[i + length - 1]; out[i] = sum * scale; sum -= in[i].
+ *
+ * So out[i] is the sum of the length items ending at i, re-accumulated from
+ * the window at the start of every call, at most max_iter items per call.
+ * That re-summation is the ULP mechanism port-requirements 1.2 describes;
+ * it is kept, and the chunking (which the scheduler decides) is where GR3
+ * and GR4 may differ at the last bit.  scale is 1: GR3 multiplies by
+ * T(1) which is exact, so it is omitted.
+ */
+template<typename T>
+struct MovingAverage : gr::Block<MovingAverage<T>> {
+    using Description = gr::Doc<"GR3 moving_average: running sum over `length` items, re-summed every call, max_iter per call">;
+
+    gr::PortIn<T>  in;
+    gr::PortOut<T> out;
+
+    gr::Size_t length   = 1U;
+    gr::Size_t max_iter = 4000U;
+
+    GR_MAKE_REFLECTABLE(MovingAverage, in, out, length, max_iter);
+
+    std::vector<T> _window; // history (length-1 items) followed by the call's input
+    uint64_t       _items = 0, _calls = 0;
+
+    void start() { _window.assign(length > 0 ? length - 1 : 0, T{}); }
+
+    gr::work::Status processBulk(gr::InputSpanLike auto& input, gr::OutputSpanLike auto& output) {
+        const std::size_t L = length;
+        const std::size_t n = std::min({input.size(), output.size(), static_cast<std::size_t>(max_iter)});
+        if (n == 0) {
+            std::ignore = input.consume(0);
+            output.publish(0);
+            return gr::work::Status::INSUFFICIENT_INPUT_ITEMS;
+        }
+        _window.resize(L - 1 + n);
+        std::copy_n(input.begin(), n, _window.begin() + static_cast<std::ptrdiff_t>(L - 1));
+        const T* w = _window.data();
+        T sum = std::accumulate(&w[0], &w[L - 1], T{});
+        for (std::size_t i = 0; i < n; i++) {
+            sum += w[i + L - 1];
+            output[i] = sum;
+            sum -= w[i];
+        }
+        // keep the last length-1 items as the next call's history
+        _items += n;
+        _calls++;
+        std::copy(_window.end() - static_cast<std::ptrdiff_t>(L - 1), _window.end(), _window.begin());
+        _window.resize(L - 1);
+        std::ignore = input.consume(n);
+        output.publish(n);
+        return gr::work::Status::OK;
+    }
+};
+
+} // namespace gr4wifi

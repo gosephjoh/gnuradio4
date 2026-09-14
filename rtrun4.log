@@ -1,0 +1,27 @@
+rt-run4: reusing /home/gr3/gr3-ieee802-11-project/data/phase10/rt_300_300_200_QPSK_1_2_s1 (the same bytes GR3 replays)
+
+rt-run4: 2 GR4 receiver(s) at 10000000 samples/s, chunk 4096, deadline 100 ms
+rt-run4: outputs -> /home/gr3/gr3-ieee802-11-project/data/phase10/rt_300_300_200_QPSK_1_2_s1/runs4/rate10000000_chains2/{latency.csv,latency_summary.json}
+rt-run4: the GR3 run of the same configuration is /home/gr3/gr3-ieee802-11-project/data/phase10/rt_300_300_200_QPSK_1_2_s1/runs/rate10000000_chains2 (./scripts/rt-run in the GR3 project)
+
+# 1. in another terminal:
+htop -t
+
+# 2. the GR4 receiver(s):
+./build/rx_latency4 --run-dir /home/gr3/gr3-ieee802-11-project/data/phase10/rt_300_300_200_QPSK_1_2_s1 --input /home/gr3/gr3-ieee802-11-project/data/phase10/rt_300_300_200_QPSK_1_2_s1/rx_stimulus.cf32 --out-dir /home/gr3/gr3-ieee802-11-project/data/phase10/rt_300_300_200_QPSK_1_2_s1/runs4/rate10000000_chains2 --rate 10000000 --chains 2 --chunk 4096 --deadline-ms 100
+
+# 3. the numbers:
+python3 -c "import json; s=json.load(open('/home/gr3/gr3-ieee802-11-project/data/phase10/rt_300_300_200_QPSK_1_2_s1/runs4/rate10000000_chains2/latency_summary.json')); [print('chain %d: %d/%d decoded (%s wrong payload), last->decode us p50 %.0f p95 %.0f p99 %.0f max %.0f, %d over %g ms' % (c['chain'], c['decoded'], c['frames'], c['wrong_payload'], c['p50_us'], c['p95_us'], c['p99_us'], c['max_us'], c['deadline_misses'], s['latency']['deadline_ms'])) for c in s['per_chain']]"
+
+# 4. GR3 vs GR4 on this cell, packet for packet (both must have run):
+python3 /home/gr3/gr4-ieee80211/scripts/compare-runs.py /home/gr3/gr3-ieee802-11-project/data/phase10/rt_300_300_200_QPSK_1_2_s1/runs/rate10000000_chains2/latency.csv /home/gr3/gr3-ieee802-11-project/data/phase10/rt_300_300_200_QPSK_1_2_s1/runs4/rate10000000_chains2/latency.csv
+
+rt-run4: --run given, executing step 2 now
+rx_latency4: replaying /home/gr3/gr3-ieee802-11-project/data/phase10/rt_300_300_200_QPSK_1_2_s1/rx_stimulus.cf32 (200 frames) at 10 Msample/s chunk 4096, 2 chain(s) x 18 blocks, deadline 100 ms, scheduler multiThreaded on 8 hw threads
+rx_latency4: chain 0 -- 200/200 decoded, 0 missing, 0 dup, 0 unpairable, 0 wrong payload; last->decode us: first 1131.0 p50 1188.8 p95 3886.2 p99 5121.1 max 6257.2; 0 over 100 ms; sync_short 200 sync_long 200 signal ok/bad 200/0 crc failed 0
+rx_latency4: chain 1 -- 200/200 decoded, 0 missing, 0 dup, 0 unpairable, 0 wrong payload; last->decode us: first 1584.5 p50 1184.1 p95 3798.3 p99 5471.2 max 5888.0; 0 over 100 ms; sync_short 200 sync_long 200 signal ok/bad 200/0 crc failed 0
+rx_latency4: 0.216 s; wrote /home/gr3/gr3-ieee802-11-project/data/phase10/rt_300_300_200_QPSK_1_2_s1/runs4/rate10000000_chains2/latency.csv and /home/gr3/gr3-ieee802-11-project/data/phase10/rt_300_300_200_QPSK_1_2_s1/runs4/rate10000000_chains2/latency_summary.json
+
+chain 0: 200/200 decoded (0 wrong payload), last->decode us p50 1189 p95 3886 p99 5121 max 6257, 0 over 100 ms
+chain 1: 200/200 decoded (0 wrong payload), last->decode us p50 1184 p95 3798 p99 5471 max 5888, 0 over 100 ms
+rt exit 0
