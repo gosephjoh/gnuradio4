@@ -15,6 +15,7 @@
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include <gnuradio-4.0/BlockModel.hpp>
@@ -185,29 +186,42 @@ namespace detail {
 
 [[nodiscard]] inline bool isResampling(const BlockModel& block) { return settingAsSize(block, "input_chunk_size", 1UZ) != 1UZ || settingAsSize(block, "output_chunk_size", 1UZ) != 1UZ; }
 
-/// Combines per-port availability into the single quantity that gates invocation, using exactly the
-/// rule `RateAccumulator` uses for rates: the slowest synchronous port, the fastest asynchronous
-/// one, and the faster of the two where both are present. Sharing one rule is what stops eligibility
-/// and rate derivation from disagreeing about when a block runs.
+/// The one place the port-gating rule lives: which ports count, and how their per-port quantities
+/// combine. Everything that reasons about a block's input gate goes through it, because two
+/// implementations of this rule agreeing on the combination and diverging on the membership is
+/// exactly how the capacity bound came to be computed over the wrong ports (§15).
 ///
-/// `std::nullopt` means nothing is connected, which the caller must interpret -- for an input span it
-/// identifies a source, for an output span a block that can make no progress at all.
-[[nodiscard]] inline std::optional<std::size_t> gatingAvailability(std::span<const std::size_t> available, std::span<const port::BitMask> types) {
+/// A port counts when it is **connected** and is a **stream** port. Message ports are excluded
+/// deliberately: `Port::kIsSynch` is "synchronous unless marked `Async`", so a message port reports
+/// itself synchronous and an included one would land in the minimum below and shrink whatever
+/// quantity is being combined.
+///
+/// The survivors combine exactly as `RateAccumulator` combines rates: the slowest synchronous port,
+/// the fastest asynchronous one, and the faster of the two where both are present.
+///
+/// `std::nullopt` means no port counted, which the caller interprets -- over an input span it
+/// identifies a source, over an output span a block that can make no progress at all.
+template<typename TPortEntry>
+[[nodiscard]] inline std::optional<std::size_t> combineGating(std::size_t nPorts, TPortEntry&& entry) {
     std::size_t syncMin  = gr::undefined_size;
     std::size_t asyncMax = 0UZ;
     bool        hasSync  = false;
     bool        hasAsync = false;
 
-    for (std::size_t i = 0UZ; i < std::min(available.size(), types.size()); ++i) {
-        const port::BitMask mask = types[i];
-        if (!port::isConnected(mask)) {
-            continue; // an unconnected optional port reports `undefined_size` and gates nothing
+    for (std::size_t i = 0UZ; i < nPorts; ++i) {
+        const std::optional<std::pair<port::BitMask, std::size_t>> current = entry(i);
+        if (!current.has_value()) {
+            continue;
+        }
+        const auto [mask, value] = *current;
+        if (!port::isConnected(mask) || !port::isStream(mask)) {
+            continue; // an unconnected port gates nothing; a message port is not a data gate at all
         }
         if (port::isSynchronous(mask)) {
-            syncMin = std::min(syncMin, available[i]);
+            syncMin = std::min(syncMin, value);
             hasSync = true;
         } else {
-            asyncMax = std::max(asyncMax, available[i]);
+            asyncMax = std::max(asyncMax, value);
             hasAsync = true;
         }
     }
@@ -222,6 +236,13 @@ namespace detail {
         return asyncMax;
     }
     return std::nullopt;
+}
+
+/// Per-port occupancy, as the stream port caches report it. The stream check inside `combineGating`
+/// is a no-op here -- these masks already come from a stream-only cache -- which is the point: the
+/// rule is stated once and each caller is checked against it rather than trusted to match it.
+[[nodiscard]] inline std::optional<std::size_t> gatingAvailability(std::span<const std::size_t> available, std::span<const port::BitMask> types) {
+    return combineGating(std::min(available.size(), types.size()), [available, types](std::size_t i) { return std::optional{std::pair{types[i], available[i]}}; });
 }
 
 } // namespace detail
@@ -259,49 +280,31 @@ struct Readiness {
     return {.available = *gating, .runnable = *gating >= std::max(threshold, 1UZ)};
 }
 
-/// Ceiling of the gating availability: the same synchronous/asynchronous combination
-/// `inputReadiness()` applies to occupancy, applied instead to buffer *capacities*. A bound
-/// computed any other way could be violated by construction.
+/// Ceiling of the gating availability: the same rule `inputReadiness()` applies to occupancy,
+/// applied instead to buffer *capacities*. A bound computed over any other set of ports could be
+/// violated -- or, worse, silently under-sized -- by construction.
 ///
-/// As with readiness, a block with no connected input falls back to its output side.
+/// As with readiness, a block with no counting input falls back to its output side.
 [[nodiscard]] inline std::size_t gatingCapacity(BlockModel& block) {
-    const auto combine = [](std::size_t nPorts, auto&& accessor) -> std::optional<std::size_t> {
-        std::size_t syncMin  = gr::undefined_size;
-        std::size_t asyncMax = 0UZ;
-        bool        hasSync  = false;
-        bool        hasAsync = false;
-
-        for (std::size_t i = 0UZ; i < nPorts; ++i) {
-            auto port = accessor(i);
-            if (!port.has_value() || !port.value()->isConnected()) {
-                continue;
-            }
-            const std::size_t capacity = port.value()->bufferSize();
-            if (port.value()->isSynchronous()) {
-                syncMin = std::min(syncMin, capacity);
-                hasSync = true;
-            } else {
-                asyncMax = std::max(asyncMax, capacity);
-                hasAsync = true;
-            }
+    const auto inputEntry = [&block](std::size_t i) -> std::optional<std::pair<port::BitMask, std::size_t>> {
+        auto port = block.dynamicInputPort(i);
+        if (!port.has_value()) {
+            return std::nullopt;
         }
-
-        if (hasSync && hasAsync) {
-            return std::max(syncMin, asyncMax);
+        return std::pair{port.value()->portMaskInfo(), port.value()->bufferSize()};
+    };
+    const auto outputEntry = [&block](std::size_t i) -> std::optional<std::pair<port::BitMask, std::size_t>> {
+        auto port = block.dynamicOutputPort(i);
+        if (!port.has_value()) {
+            return std::nullopt;
         }
-        if (hasSync) {
-            return syncMin;
-        }
-        if (hasAsync) {
-            return asyncMax;
-        }
-        return std::nullopt;
+        return std::pair{port.value()->portMaskInfo(), port.value()->bufferSize()};
     };
 
-    if (const std::optional<std::size_t> inputs = combine(block.dynamicInputPortsSize(), [&block](std::size_t i) { return block.dynamicInputPort(i); }); inputs.has_value()) {
+    if (const std::optional<std::size_t> inputs = detail::combineGating(block.dynamicInputPortsSize(), inputEntry); inputs.has_value()) {
         return *inputs;
     }
-    if (const std::optional<std::size_t> outputs = combine(block.dynamicOutputPortsSize(), [&block](std::size_t i) { return block.dynamicOutputPort(i); }); outputs.has_value()) {
+    if (const std::optional<std::size_t> outputs = detail::combineGating(block.dynamicOutputPortsSize(), outputEntry); outputs.has_value()) {
         return *outputs;
     }
     return 0UZ;

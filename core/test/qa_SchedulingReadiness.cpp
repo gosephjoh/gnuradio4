@@ -106,6 +106,20 @@ struct MixedJoin : gr::Block<MixedJoin<T>> {
     }
 };
 
+/// A block declaring an *explicit* message input port. `all_input_ports` includes it, the stream-only
+/// `PortCache` does not, and it reports `isSynchronous() == true` -- so before the gating rule was
+/// centralised it landed in the capacity minimum and shrank the bound (DEVLOG_M3 §15).
+template<typename T>
+struct MsgGatedCopy : gr::Block<MsgGatedCopy<T>> {
+    gr::PortIn<T>  in;
+    gr::PortOut<T> out;
+    gr::MsgPortIn  control;
+
+    GR_MAKE_REFLECTABLE(MsgGatedCopy, in, out, control);
+
+    [[nodiscard]] constexpr T processOne(T value) const noexcept { return value; }
+};
+
 constexpr std::size_t kProbeCeiling = 1024UZ;
 
 /// Outcome of running the predicate and `work()` side by side (DEVLOG_M3 §5B.4).
@@ -378,6 +392,116 @@ const boost::ut::suite<"readiness edge cases"> edgeCaseTests = [] {
         expect(eq(unassignedSamples(40UZ, 40UZ), 0UZ));
         expect(eq(unassignedSamples(40UZ, 100UZ), 0UZ)) << "must fail closed, not wrap to SIZE_MAX";
         expect(eq(unassignedSamples(0UZ, 1UZ), 0UZ));
+    };
+};
+
+const boost::ut::suite<"gating rule membership"> gatingMembershipTests = [] {
+    "a connected message port does not enter the capacity bound"_test = [] {
+        gr::Graph graph;
+        auto&     src  = graph.emplaceBlock<gr::testing::ConstantSource<float>>();
+        auto&     mid  = graph.emplaceBlock<MsgGatedCopy<float>>();
+        auto&     sink = graph.emplaceBlock<gr::testing::NullSink<float>>();
+        expect(graph.connect<"out", "in">(src, mid).has_value());
+        expect(graph.connect<"out", "in">(mid, sink).has_value());
+        expect(graph.connectPendingEdges());
+
+        gr::MsgPortOut controller;
+        expect(controller.connect(mid.control).has_value()) << fatal << "the message port must actually be connected";
+
+        gr::BlockModel& model = *graph.blocks()[1];
+
+        std::size_t streamCapacity  = 0UZ;
+        std::size_t messageCapacity = 0UZ;
+        for (std::size_t i = 0UZ; i < model.dynamicInputPortsSize(); ++i) {
+            auto port = model.dynamicInputPort(i);
+            expect(port.has_value()) << fatal;
+            expect(port.value()->isConnected()) << "both input ports are connected in this fixture";
+            (gr::port::isStream(port.value()->portMaskInfo()) ? streamCapacity : messageCapacity) = port.value()->bufferSize();
+        }
+
+        expect(gt(streamCapacity, 0UZ)) << fatal;
+        expect(gt(messageCapacity, 0UZ)) << fatal;
+        expect(lt(messageCapacity, streamCapacity)) << fatal << "the fixture only bites while the message buffer is the smaller one";
+
+        expect(eq(gatingCapacity(model), streamCapacity)) << "the bound must come from the stream port alone";
+
+        // Sized past the clamp: below a floor of 64 the cap hides the difference entirely.
+        constexpr std::size_t kFloor = 128UZ;
+        constexpr std::size_t kCap   = 64UZ;
+        expect(eq(maxOutstandingJobs(model, kFloor, kCap), std::min(streamCapacity / kFloor, kCap))) << "a message port must not shrink the ring";
+    };
+
+    "the capacity bound and the availability query see the same ports"_test = [] {
+        // The invariant that would have caught the defect directly: `gatingCapacity()` walks all
+        // dynamic input ports, `inputReadiness()` walks the stream-only cache, and the two agree only
+        // if the non-stream ones are filtered out.
+        gr::Graph graph;
+        auto&     src  = graph.emplaceBlock<gr::testing::ConstantSource<float>>();
+        auto&     mid  = graph.emplaceBlock<MsgGatedCopy<float>>();
+        auto&     sink = graph.emplaceBlock<gr::testing::NullSink<float>>();
+        expect(graph.connect<"out", "in">(src, mid).has_value());
+        expect(graph.connect<"out", "in">(mid, sink).has_value());
+        expect(graph.connectPendingEdges());
+
+        gr::BlockModel& model = *graph.blocks()[1];
+
+        std::size_t streamInputPorts = 0UZ;
+        for (std::size_t i = 0UZ; i < model.dynamicInputPortsSize(); ++i) {
+            auto port = model.dynamicInputPort(i);
+            if (port.has_value() && gr::port::isStream(port.value()->portMaskInfo())) {
+                ++streamInputPorts;
+            }
+        }
+
+        expect(eq(model.dynamicInputPortsSize(), 2UZ)) << "stream `in` plus message `control`";
+        expect(eq(model.blockInputTypes().size(), 1UZ)) << "the stream-only cache sees one";
+        expect(eq(streamInputPorts, model.blockInputTypes().size())) << "the two port sets must agree once non-stream ports are filtered";
+    };
+
+    "the capacity bound takes the fastest asynchronous port"_test = [] {
+        gr::Graph graph;
+        auto&     src0 = graph.emplaceBlock<gr::testing::ConstantSource<float>>();
+        auto&     src1 = graph.emplaceBlock<gr::testing::ConstantSource<float>>();
+        auto&     mid  = graph.emplaceBlock<Join2Async<float>>();
+        auto&     sink = graph.emplaceBlock<gr::testing::NullSink<float>>();
+        expect(graph.connect<"out", "in0">(src0, mid).has_value());
+        expect(graph.connect<"out", "in1">(src1, mid, {.minBufferSize = 4096UZ}).has_value());
+        expect(graph.connect<"out", "in">(mid, sink).has_value());
+        expect(graph.connectPendingEdges());
+
+        gr::BlockModel& model = *graph.blocks()[2];
+
+        std::size_t largest = 0UZ;
+        for (std::size_t i = 0UZ; i < model.dynamicInputPortsSize(); ++i) {
+            auto port = model.dynamicInputPort(i);
+            expect(port.has_value()) << fatal;
+            largest = std::max(largest, port.value()->bufferSize());
+        }
+        expect(eq(gatingCapacity(model), largest)) << "asynchronous ports combine with max, not min";
+    };
+
+    "a mixed block takes the larger of the two groups"_test = [] {
+        gr::Graph graph;
+        auto&     src0 = graph.emplaceBlock<gr::testing::ConstantSource<float>>();
+        auto&     src1 = graph.emplaceBlock<gr::testing::ConstantSource<float>>();
+        auto&     mid  = graph.emplaceBlock<MixedJoin<float>>();
+        auto&     sink = graph.emplaceBlock<gr::testing::NullSink<float>>();
+        expect(graph.connect<"out", "inSync">(src0, mid, {.minBufferSize = 4096UZ}).has_value());
+        expect(graph.connect<"out", "inAsync">(src1, mid).has_value());
+        expect(graph.connect<"out", "in">(mid, sink).has_value());
+        expect(graph.connectPendingEdges());
+
+        gr::BlockModel& model = *graph.blocks()[2];
+
+        std::size_t syncCapacity  = 0UZ;
+        std::size_t asyncCapacity = 0UZ;
+        for (std::size_t i = 0UZ; i < model.dynamicInputPortsSize(); ++i) {
+            auto port = model.dynamicInputPort(i);
+            expect(port.has_value()) << fatal;
+            (port.value()->isSynchronous() ? syncCapacity : asyncCapacity) = port.value()->bufferSize();
+        }
+        expect(neq(syncCapacity, asyncCapacity)) << fatal << "the two groups must differ for this to mean anything";
+        expect(eq(gatingCapacity(model), std::max(syncCapacity, asyncCapacity))) << "slowest sync vs fastest async, whichever is larger";
     };
 };
 
