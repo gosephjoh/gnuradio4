@@ -2,7 +2,10 @@
 
 #include <array>
 #include <chrono>
+#include <format>
+#include <limits>
 #include <span>
+#include <string>
 #include <vector>
 
 #include <gnuradio-4.0/Graph.hpp>
@@ -79,6 +82,34 @@ struct ReleaseProbePolicy {
 };
 
 static_assert(SchedulingPolicyLike<ReleaseProbePolicy>);
+
+/// Appends its own name to a shared log on every invocation, so a test can observe selection order
+/// directly rather than inferring it.
+inline std::vector<std::string> gInvocationLog; // externalStep is single-threaded: no sync needed
+
+template<typename T>
+struct RecordingCopy : gr::Block<RecordingCopy<T>> {
+    gr::PortIn<T>  in;
+    gr::PortOut<T> out;
+
+    GR_MAKE_REFLECTABLE(RecordingCopy, in, out);
+
+    gr::work::Status processBulk(gr::InputSpanLike auto& input, gr::OutputSpanLike auto& output) {
+        gInvocationLog.emplace_back(this->name);
+        const std::size_t n = std::min(input.size(), output.size());
+        for (std::size_t i = 0UZ; i < n; ++i) {
+            output[i] = input[i];
+        }
+        output.publish(n);
+        std::ignore = input.consume(n);
+        return gr::work::Status::OK;
+    }
+};
+
+[[nodiscard]] std::size_t positionOf(std::string_view name) {
+    const auto it = std::ranges::find(gInvocationLog, name);
+    return it == gInvocationLog.end() ? std::numeric_limits<std::size_t>::max() : static_cast<std::size_t>(std::distance(gInvocationLog.begin(), it));
+}
 
 } // namespace
 
@@ -494,6 +525,198 @@ const boost::ut::suite<"release-tracking scheduler"> integrationTests = [] {
         expect(eq((*jobs)[0][1]->name(), std::string("b")));
 
         std::ignore = sched.changeStateTo(gr::lifecycle::State::STOPPED);
+    };
+};
+
+const boost::ut::suite<"earliest deadline first"> edfTests = [] {
+    "a nearer deadline wins against a lower registration index"_test = [] {
+        // Two independent chains, interleaved so that deadline order contradicts *position* order.
+        // `b` is registered after `a` but carries the nearer deadline, so EDF must run it first --
+        // whereas selecting the first block holding a job, which is what the loop did before the key
+        // was consulted at all, would run `a`.
+        gInvocationLog.clear();
+
+        gr::Graph graph;
+        auto&     srcA  = graph.emplaceBlock<gr::testing::ConstantSource<float>>({{"name", std::string("srcA")}, {"n_samples_max", gr::Size_t{256U}}, {"relative_deadline", 0.010f}});
+        auto&     a     = graph.emplaceBlock<RecordingCopy<float>>({{"name", std::string("a")}, {"relative_deadline", 0.040f}});
+        auto&     sinkA = graph.emplaceBlock<gr::testing::CountingSink<float>>({{"name", std::string("sinkA")}, {"relative_deadline", 0.050f}});
+        auto&     srcB  = graph.emplaceBlock<gr::testing::ConstantSource<float>>({{"name", std::string("srcB")}, {"n_samples_max", gr::Size_t{256U}}, {"relative_deadline", 0.020f}});
+        auto&     b     = graph.emplaceBlock<RecordingCopy<float>>({{"name", std::string("b")}, {"relative_deadline", 0.030f}});
+        auto&     sinkB = graph.emplaceBlock<gr::testing::CountingSink<float>>({{"name", std::string("sinkB")}, {"relative_deadline", 0.060f}});
+
+        expect(graph.connect<"out", "in">(srcA, a).has_value());
+        expect(graph.connect<"out", "in">(a, sinkA).has_value());
+        expect(graph.connect<"out", "in">(srcB, b).has_value());
+        expect(graph.connect<"out", "in">(b, sinkB).has_value());
+
+        gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::externalStep, gr::profiling::null::Profiler, EdfPolicy> sched;
+        expect(sched.exchange(std::move(graph)).has_value());
+        expect(sched.changeStateTo(gr::lifecycle::State::INITIALISED).has_value());
+        expect(sched.changeStateTo(gr::lifecycle::State::RUNNING).has_value());
+        std::ignore = sched.step();
+        std::ignore = sched.changeStateTo(gr::lifecycle::State::STOPPED);
+
+        expect(positionOf("a") != std::numeric_limits<std::size_t>::max()) << fatal << "both copies must have run";
+        expect(positionOf("b") != std::numeric_limits<std::size_t>::max()) << fatal;
+        expect(lt(positionOf("b"), positionOf("a"))) << "0.030 s deadline must precede 0.040 s, whatever the registration order";
+    };
+
+    "the key follows the front job, and an empty queue sorts last"_test = [] {
+        const EdfPolicy policy{};
+
+        std::array<Job, 4> storage{};
+        SchedState         state{};
+        state.jobs.storage = std::span<Job>{storage};
+
+        gr::Graph graph;
+        auto&     block       = graph.emplaceBlock<gr::testing::Copy<float>>();
+        std::ignore           = block;
+        gr::BlockModel& model = *graph.blocks()[0];
+
+        expect(eq(policy.key(model, state), Clock::time_point::max().time_since_epoch().count())) << "an empty queue must not sort first";
+
+        const Clock::time_point near = Clock::now() + seconds(1.0);
+        const Clock::time_point far  = near + seconds(10.0);
+        expect(state.jobs.push(Job{.batch = 1UZ, .absoluteDeadline = near}));
+        expect(state.jobs.push(Job{.batch = 1UZ, .absoluteDeadline = far}));
+
+        expect(eq(policy.key(model, state), near.time_since_epoch().count())) << "the front job sets the key";
+        state.jobs.pop();
+        expect(eq(policy.key(model, state), far.time_since_epoch().count())) << "retiring it re-keys the block";
+    };
+
+    "equal keys break on registration order"_test = [] {
+        const EdfPolicy         policy{};
+        const Clock::time_point deadline = Clock::now() + seconds(1.0);
+
+        std::array<Job, 1> lhsStorage{};
+        std::array<Job, 1> rhsStorage{};
+        SchedState         lhs{.index = 7UZ};
+        SchedState         rhs{.index = 2UZ};
+        lhs.jobs.storage = std::span<Job>{lhsStorage};
+        rhs.jobs.storage = std::span<Job>{rhsStorage};
+        expect(lhs.jobs.push(Job{.batch = 1UZ, .absoluteDeadline = deadline}));
+        expect(rhs.jobs.push(Job{.batch = 1UZ, .absoluteDeadline = deadline}));
+
+        gr::Graph graph;
+        auto&     block       = graph.emplaceBlock<gr::testing::Copy<float>>();
+        std::ignore           = block;
+        gr::BlockModel& model = *graph.blocks()[0];
+
+        expect(selectsBefore(policy, model, rhs, model, lhs)) << "index 2 before index 7 on an exact tie";
+        expect(!selectsBefore(policy, model, lhs, model, rhs));
+    };
+};
+
+namespace {
+
+/// Runs one interleaved two-chain graph under the given selector and returns the invocation order.
+/// Deadlines are set explicitly and 10 ms apart, far wider than any clock jitter between the two
+/// runs, so the expected order is a property of the policy rather than of the timing.
+std::vector<std::string> runUnder(gr::scheduler::SelectionStrategy strategy, std::size_t chains, std::size_t steps) {
+    gInvocationLog.clear();
+
+    gr::Graph graph;
+    for (std::size_t c = 0UZ; c < chains; ++c) {
+        const float deadline = 0.010f * static_cast<float>(chains - c); // later chains are more urgent
+        auto&       src      = graph.emplaceBlock<gr::testing::ConstantSource<float>>({{"name", std::format("src{}", c)}, {"n_samples_max", gr::Size_t{512U}}, {"relative_deadline", deadline}});
+        auto&       mid      = graph.emplaceBlock<RecordingCopy<float>>({{"name", std::format("mid{}", c)}, {"relative_deadline", deadline}});
+        auto&       sink     = graph.emplaceBlock<gr::testing::CountingSink<float>>({{"name", std::format("sink{}", c)}, {"relative_deadline", deadline}});
+        expect(graph.connect<"out", "in">(src, mid).has_value());
+        expect(graph.connect<"out", "in">(mid, sink).has_value());
+    }
+
+    gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::externalStep, gr::profiling::null::Profiler, EdfPolicy> sched;
+    sched.selection_strategy = strategy;
+    expect(sched.exchange(std::move(graph)).has_value());
+    expect(sched.changeStateTo(gr::lifecycle::State::INITIALISED).has_value());
+    expect(sched.changeStateTo(gr::lifecycle::State::RUNNING).has_value());
+    for (std::size_t i = 0UZ; i < steps; ++i) {
+        std::ignore = sched.step();
+    }
+    std::ignore = sched.changeStateTo(gr::lifecycle::State::STOPPED);
+
+    return gInvocationLog;
+}
+
+} // namespace
+
+const boost::ut::suite<"selector equivalence"> selectorTests = [] {
+    "both selectors are offered and differ only in how the minimum is found"_test = [] {
+        gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::externalStep, gr::profiling::null::Profiler, EdfPolicy> sched;
+        expect(sched.selection_strategy.value == gr::scheduler::SelectionStrategy::linearScan) << "the scan stays the default";
+    };
+
+    "the ready heap selects the same sequence as the linear scan"_test = [] {
+        // This is what licenses the benchmark to be a comparison rather than two unrelated numbers,
+        // and the guard against the heap drifting as either side is changed.
+        for (std::size_t chains : {2UZ, 5UZ, 9UZ}) {
+            const std::vector<std::string> scanned = runUnder(gr::scheduler::SelectionStrategy::linearScan, chains, 4UZ);
+            const std::vector<std::string> heaped  = runUnder(gr::scheduler::SelectionStrategy::readyHeap, chains, 4UZ);
+
+            expect(!scanned.empty()) << fatal << std::format("{} chains produced no invocations", chains);
+            expect(eq(scanned.size(), heaped.size())) << std::format("{} chains: invocation counts differ", chains);
+            expect(scanned == heaped) << std::format("{} chains: selection order differs\n  scan: {}\n  heap: {}", chains, std::format("{}", scanned), std::format("{}", heaped));
+        }
+    };
+
+    "the heap honours the deadline order too"_test = [] {
+        // The same contradiction between deadline order and registration order as the scan test,
+        // run through the heap: chain 1 is registered later but is the more urgent.
+        const std::vector<std::string> log = runUnder(gr::scheduler::SelectionStrategy::readyHeap, 2UZ, 1UZ);
+        gInvocationLog                     = log;
+        expect(positionOf("mid1") != std::numeric_limits<std::size_t>::max()) << fatal;
+        expect(positionOf("mid0") != std::numeric_limits<std::size_t>::max()) << fatal;
+        expect(lt(positionOf("mid1"), positionOf("mid0"))) << "the nearer deadline runs first under the heap as well";
+    };
+};
+
+namespace {
+
+/// All chains share one deadline, so the sources -- released together by the backstop, which takes a
+/// single timestamp per pass -- carry *identical* absolute deadlines. That is the only way to make
+/// the tie-break observable: elsewhere release times differ and so do the deadlines derived from them.
+std::vector<std::string> runTied(gr::scheduler::SelectionStrategy strategy, std::size_t chains) {
+    gInvocationLog.clear();
+
+    gr::Graph graph;
+    for (std::size_t c = 0UZ; c < chains; ++c) {
+        auto& src  = graph.emplaceBlock<gr::testing::ConstantSource<float>>({{"name", std::format("tsrc{}", c)}, {"n_samples_max", gr::Size_t{256U}}, {"relative_deadline", 0.05f}});
+        auto& mid  = graph.emplaceBlock<RecordingCopy<float>>({{"name", std::format("tmid{}", c)}, {"relative_deadline", 0.05f}});
+        auto& sink = graph.emplaceBlock<gr::testing::CountingSink<float>>({{"name", std::format("tsink{}", c)}, {"relative_deadline", 0.05f}});
+        expect(graph.connect<"out", "in">(src, mid).has_value());
+        expect(graph.connect<"out", "in">(mid, sink).has_value());
+    }
+
+    gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::externalStep, gr::profiling::null::Profiler, EdfPolicy> sched;
+    sched.selection_strategy = strategy;
+    expect(sched.exchange(std::move(graph)).has_value());
+    expect(sched.changeStateTo(gr::lifecycle::State::INITIALISED).has_value());
+    expect(sched.changeStateTo(gr::lifecycle::State::RUNNING).has_value());
+    std::ignore = sched.step();
+    std::ignore = sched.changeStateTo(gr::lifecycle::State::STOPPED);
+
+    return gInvocationLog;
+}
+
+} // namespace
+
+const boost::ut::suite<"selector tie-breaking"> tieTests = [] {
+    "equal deadlines resolve identically under both selectors"_test = [] {
+        for (std::size_t chains : {3UZ, 6UZ}) {
+            const std::vector<std::string> scanned = runTied(gr::scheduler::SelectionStrategy::linearScan, chains);
+            const std::vector<std::string> heaped  = runTied(gr::scheduler::SelectionStrategy::readyHeap, chains);
+
+            expect(!scanned.empty()) << fatal << std::format("{} tied chains produced no invocations", chains);
+            expect(scanned == heaped) << std::format("{} tied chains: order differs\n  scan: {}\n  heap: {}", chains, std::format("{}", scanned), std::format("{}", heaped));
+        }
+    };
+
+    "a tie resolves to the lower registration index"_test = [] {
+        const std::vector<std::string> log = runTied(gr::scheduler::SelectionStrategy::linearScan, 3UZ);
+        gInvocationLog                     = log;
+        expect(lt(positionOf("tmid0"), positionOf("tmid1"))) << "registration order decides an exact tie";
+        expect(lt(positionOf("tmid1"), positionOf("tmid2")));
     };
 };
 

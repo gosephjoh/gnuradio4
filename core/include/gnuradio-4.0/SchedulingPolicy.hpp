@@ -62,6 +62,16 @@ enum class PriorityClass : std::uint8_t {
     dynamic    /// priority may change during a job (LLF)
 };
 
+/// How a worker picks the minimum-key block among those eligible. Not a property of the policy: the
+/// same policy must be runnable both ways so the two can be measured against each other.
+///
+/// Only meaningful where `hasStaticKey` is false. A static-key policy has its list pre-sorted by
+/// `applyStaticOrder`, so "first eligible" already *is* "minimum key" and a heap would buy nothing.
+enum class SelectionStrategy : std::uint8_t {
+    linearScan, /// O(n) per selection, no auxiliary state
+    readyHeap   /// O(log n) per selection over a heap rebuilt once per pass
+};
+
 /// Whether the ordering key is fixed once the schedule is formed, and the list can be pre-sorted.
 [[nodiscard]] constexpr bool hasStaticKey(PriorityClass priorityClass) noexcept { return priorityClass == PriorityClass::none || priorityClass == PriorityClass::fixedTask; }
 
@@ -92,7 +102,8 @@ struct JobQueue {
     [[nodiscard]] constexpr bool        full() const noexcept { return storage.empty() || size >= storage.size(); }
     [[nodiscard]] constexpr std::size_t capacity() const noexcept { return storage.size(); }
 
-    [[nodiscard]] constexpr Job& front() noexcept { return storage[head]; }
+    [[nodiscard]] constexpr Job&       front() noexcept { return storage[head]; }
+    [[nodiscard]] constexpr const Job& front() const noexcept { return storage[head]; }
 
     [[nodiscard]] constexpr bool push(const Job& job) noexcept {
         if (full()) {
@@ -235,6 +246,38 @@ struct FixedPriorityPolicy {
 static_assert(SchedulingPolicyLike<FixedPriorityPolicy>);
 
 /**
+ * @brief Earliest deadline first: runs the released job whose absolute deadline is nearest.
+ *
+ * The key is the *front* job's deadline, not the block's: EDF orders jobs, and a block's queue is
+ * FIFO, so its next job is always the front one. `key()` is already minimum-first and an earlier
+ * deadline is more urgent, so unlike the priority policies this needs no sign flip.
+ *
+ * A block with no released job returns the maximum representable instant. It is never selected --
+ * the selectors skip empty queues -- but leaving the key undefined would invite the mirror of the
+ * trap an unset *priority* sets, where a default-constructed `0` sorts first and starves everything.
+ */
+struct EdfPolicy {
+    static constexpr std::string_view kName          = "EarliestDeadlineFirst";
+    static constexpr PriorityClass    kPriorityClass = PriorityClass::fixedJob;
+
+    [[nodiscard]] constexpr std::chrono::steady_clock::rep key(const BlockModel& /*block*/, const SchedState& state) const noexcept { return (state.jobs.empty() ? std::chrono::steady_clock::time_point::max() : state.jobs.front().absoluteDeadline).time_since_epoch().count(); }
+};
+
+static_assert(SchedulingPolicyLike<EdfPolicy>);
+
+/// The one ordering every selector must use: minimum key first, ties broken by registration order.
+///
+/// Shared deliberately. A linear scan breaking ties by scan position and a heap breaking them by
+/// insertion order would disagree on equal keys, and the two would stop being comparable for reasons
+/// unrelated to either being wrong.
+template<typename TPolicy>
+[[nodiscard]] bool selectsBefore(const TPolicy& policy, const BlockModel& lhsBlock, const SchedState& lhs, const BlockModel& rhsBlock, const SchedState& rhs) {
+    const auto lhsKey = policy.key(lhsBlock, lhs);
+    const auto rhsKey = policy.key(rhsBlock, rhs);
+    return lhsKey == rhsKey ? lhs.index < rhs.index : lhsKey < rhsKey;
+}
+
+/**
  * @brief Runs blocks in rate-monotonic order: the shorter a block's period, the sooner it runs.
  *
  * Keys on the priority the derivation assigned -- a rank over periods, with a user-set
@@ -271,12 +314,7 @@ void applyStaticOrder(std::vector<std::shared_ptr<BlockModel>>& blocks, std::vec
         std::vector<std::size_t> order(blocks.size());
         std::iota(order.begin(), order.end(), 0UZ);
 
-        const auto keyAt = [&policy, &blocks, &states](std::size_t position) { return policy.key(*blocks[position], states[position]); };
-        std::ranges::sort(order, [&keyAt](std::size_t lhs, std::size_t rhs) {
-            const auto lhsKey = keyAt(lhs);
-            const auto rhsKey = keyAt(rhs);
-            return lhsKey == rhsKey ? lhs < rhs : lhsKey < rhsKey;
-        });
+        std::ranges::sort(order, [&policy, &blocks, &states](std::size_t lhs, std::size_t rhs) { return selectsBefore(policy, *blocks[lhs], states[lhs], *blocks[rhs], states[rhs]); });
 
         // `states` carries a payload now, so it must follow the same permutation -- a policy that
         // reorders blocks while their state stays put would hand each block another's batch.

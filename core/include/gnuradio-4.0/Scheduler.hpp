@@ -239,6 +239,17 @@ protected:
     std::vector<std::vector<Job>>         _jobArena{};
     std::vector<std::vector<std::size_t>> _successorArena{};
 
+    /// One heap slot per block. The heap is rebuilt each pass and a block appears in it at most
+    /// once, so the block count is an exact bound and the scratch never has to grow.
+    using PolicyKey = decltype(std::declval<const TPolicy&>().key(std::declval<const BlockModel&>(), std::declval<const SchedState&>()));
+
+    struct ReadyEntry {
+        PolicyKey   key{};
+        std::size_t index = 0UZ;
+    };
+
+    std::vector<std::vector<ReadyEntry>> _readyHeapArena{};
+
     /// Multiplier applied to the block count when `max_selections_per_pass` is left at auto. A
     /// tunable heuristic, not a derived quantity: larger favours fidelity to the priority order,
     /// smaller bounds how long message handling, adoption and lifecycle transitions wait.
@@ -291,10 +302,11 @@ public:
     Annotated<std::size_t, "max_work_items", Doc<"number of work items per work scheduling interval (controls latency)">>                                                                                                                                                      max_work_items                  = std::numeric_limits<std::size_t>::max(); // TODO: check whether we can keep this std::size_t or more consistently to gr::Size_t
     Annotated<property_map, "sched_settings", Doc<"scheduler implementation specific settings">>                                                                                                                                                                               sched_settings{};
 
-    Annotated<gr::Size_t, "max_selections_per_pass", Doc<"priority-class policies: cap on successful work() calls before returning to house-keeping (0: auto = 4 x block count)">> max_selections_per_pass = 0U;
-    Annotated<gr::Size_t, "max_outstanding_jobs", Doc<"release-tracking policies: cap on a block's outstanding jobs, clamping the buffer-derived bound (0: uncapped)">>            max_outstanding_jobs    = kDefaultMaxOutstandingJobs;
+    Annotated<gr::Size_t, "max_selections_per_pass", Doc<"priority-class policies: cap on successful work() calls before returning to house-keeping (0: auto = 4 x block count)">>                        max_selections_per_pass = 0U;
+    Annotated<SelectionStrategy, "selection_strategy", Doc<"dynamic-key policies: how the next block is picked -- linearScan (O(n), no auxiliary state) or readyHeap (O(log n), heap rebuilt per pass)">> selection_strategy      = SelectionStrategy::linearScan;
+    Annotated<gr::Size_t, "max_outstanding_jobs", Doc<"release-tracking policies: cap on a block's outstanding jobs, clamping the buffer-derived bound (0: uncapped)">>                                   max_outstanding_jobs    = kDefaultMaxOutstandingJobs;
 
-    GR_MAKE_REFLECTABLE(SchedulerBase, timeout_ms, watchdog_timeout, timeout_inactivity_count, process_stream_to_message_ratio, house_keeping_policy, house_keeping_depth, max_work_items, max_selections_per_pass, max_outstanding_jobs, poolName, sched_settings);
+    GR_MAKE_REFLECTABLE(SchedulerBase, timeout_ms, watchdog_timeout, timeout_inactivity_count, process_stream_to_message_ratio, house_keeping_policy, house_keeping_depth, max_work_items, max_selections_per_pass, max_outstanding_jobs, selection_strategy, poolName, sched_settings);
 
     constexpr static block::Category blockCategory = block::Category::ScheduledBlockGroup;
 
@@ -404,8 +416,9 @@ public:
         if constexpr (needsReleaseTracking(TPolicy::kPriorityClass)) {
             _jobArena.resize(_executionOrder->size());
             _successorArena.resize(_executionOrder->size());
+            _readyHeapArena.resize(_executionOrder->size());
             for (std::size_t job = 0UZ; job < _executionOrder->size(); ++job) {
-                buildReleaseStorage((*_executionOrder)[job], _schedStates[job], _jobArena[job], _successorArena[job]);
+                buildReleaseStorage((*_executionOrder)[job], _schedStates[job], _jobArena[job], _successorArena[job], _readyHeapArena[job]);
             }
         }
     }
@@ -418,9 +431,10 @@ public:
     /// are two state paths -- `_schedStates` for `step()`, and the worker-local copies `poolWorker`
     /// derives -- and both must go through here, or a policy that tracks releases finds every job
     /// ring empty and never runs a block at all.
-    void buildReleaseStorage(const std::vector<std::shared_ptr<BlockModel>>& blocks, std::vector<SchedState>& states, std::vector<Job>& jobArena, std::vector<std::size_t>& successorArena) const {
+    void buildReleaseStorage(const std::vector<std::shared_ptr<BlockModel>>& blocks, std::vector<SchedState>& states, std::vector<Job>& jobArena, std::vector<std::size_t>& successorArena, std::vector<ReadyEntry>& readyHeap) const {
         jobArena.clear();
         successorArena.clear();
+        readyHeap.assign(blocks.size(), ReadyEntry{});
         if (blocks.empty()) {
             return;
         }
@@ -846,7 +860,7 @@ public:
     requires(executionPolicy() == ExecutionPolicy::externalStep)
     {
         processScheduledMessages();
-        return traverseBlockListOnce((*_executionOrder)[0], _schedStates.empty() ? std::span<SchedState>{} : std::span<SchedState>{_schedStates[0]});
+        return traverseBlockListOnce((*_executionOrder)[0], _schedStates.empty() ? std::span<SchedState>{} : std::span<SchedState>{_schedStates[0]}, _readyHeapArena.empty() ? std::span<ReadyEntry>{} : std::span<ReadyEntry>{_readyHeapArena[0]});
     }
 
     /*
@@ -921,7 +935,7 @@ protected:
     /// - **`fixed`** selects the highest-priority *eligible* block each time, which is what
     ///   fixed-priority scheduling means. The list is already priority-sorted, so "highest
     ///   priority eligible" is "the earliest index that can run".
-    work::Result traverseBlockListOnce(const std::vector<std::shared_ptr<BlockModel>>& blocks, std::span<SchedState> states) const {
+    work::Result traverseBlockListOnce(const std::vector<std::shared_ptr<BlockModel>>& blocks, std::span<SchedState> states, std::span<ReadyEntry> readyHeap = {}) const {
         std::size_t performedWorkAllBlocks = 0UZ;
         bool        unfinishedBlocksExist  = false; // i.e. at least one block returned OK, INSUFFICIENT_INPUT_ITEMS, or INSUFFICIENT_OUTPU_ITEMS
 
@@ -942,14 +956,20 @@ protected:
         /// Event-driven detection: a block's output arriving is what makes its consumers eligible,
         /// so their release is stamped within one block execution of the write rather than one
         /// sweep. One hop only -- no transitive cascade, so a feedback loop cannot spin it.
-        [[maybe_unused]] const auto releaseSuccessorsOf = [&](std::size_t producer) {
+        [[maybe_unused]] const auto releaseSuccessorsOf = [&](std::size_t producer, auto&& onNewlyReady) {
             if (producer >= states.size()) {
                 return;
             }
             const std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
             for (std::size_t successor : states[producer].successors) {
                 if (successor < blocks.size() && successor < states.size()) {
+                    // The empty-to-non-empty transition is what a heap selector needs to hear about:
+                    // a block already holding a job is already in the heap.
+                    const bool wasEmpty = states[successor].jobs.empty();
                     gr::scheduler::releaseIfEligible(*blocks[successor], states[successor], now);
+                    if (wasEmpty && !states[successor].jobs.empty()) {
+                        onNewlyReady(successor);
+                    }
                 }
             }
         };
@@ -965,11 +985,11 @@ protected:
                     unfinishedBlocksExist = true;
                 }
             }
-        } else {
-            // Selection loop. `work()` doubles as the eligibility oracle: a block that cannot run
-            // returns performed_work == 0 with an INSUFFICIENT_* status, which is a cheap near-no-op
-            // (§2.1). That is why this needs no readiness query -- Tier 1 (§2.2) adds one to remove
-            // the *probing*, not to make selection possible.
+        } else if constexpr (hasStaticKey(TPolicy::kPriorityClass)) {
+            // Fixed-priority selection over a list `applyStaticOrder` has already sorted, so the
+            // earliest index that can run *is* the highest-priority eligible block. `work()` doubles
+            // as the eligibility oracle: a block that cannot run returns performed_work == 0 with an
+            // INSUFFICIENT_* status, which is a cheap near-no-op.
             //
             // The bound is what keeps the worker responsive: house-keeping, message handling,
             // adoption and lifecycle checks all live between passes, so an unbounded loop would not
@@ -985,35 +1005,8 @@ protected:
                     continue;
                 }
 
-                std::size_t requested = ceilingFor(index);
-                if constexpr (needsReleaseTracking(TPolicy::kPriorityClass)) {
-                    // A released job *is* the eligibility answer here, which is what retires the
-                    // probing this loop relied on: no job, no run, and no `work()` call to find out.
-                    if (index >= states.size() || states[index].jobs.empty()) {
-                        // Nothing released, so nothing to run. This deliberately does *not* mark the
-                        // pass unfinished: event-driven detection releases a block as soon as its
-                        // producer publishes, so by the end of a pass anything holding data already
-                        // has a job. A block with neither is idle, and treating idle as unfinished
-                        // would keep the worker spinning for ever once the sources have stopped.
-                        ++index;
-                        continue;
-                    }
-                    requested = states[index].jobs.front().batch;
-                }
-
-                const auto [requested_work, performed_work, status] = blocks[index]->work(requested);
+                const auto [requested_work, performed_work, status] = blocks[index]->work(ceilingFor(index));
                 performedWorkAllBlocks += performed_work;
-
-                if constexpr (needsReleaseTracking(TPolicy::kPriorityClass)) {
-                    gr::scheduler::retireFrontJob(states[index]);
-
-                    // Unconditional, and ahead of the DONE branch. `performed_work` cannot be used
-                    // as the trigger: `computePerformedWork()` returns 0 for any status other than
-                    // OK, so a source that publishes its whole output and finishes in one call
-                    // reports zero having published everything. Gating on it stranded that data with
-                    // the producer already marked finished, so no later pass could free it.
-                    releaseSuccessorsOf(index);
-                }
 
                 if (status == work::Status::ERROR) {
                     return {requested_work, performedWorkAllBlocks, work::Status::ERROR};
@@ -1021,10 +1014,6 @@ protected:
                 if (status == work::Status::DONE) {
                     if (index < states.size()) {
                         states[index].finished = true;
-                        if constexpr (needsReleaseTracking(TPolicy::kPriorityClass)) {
-                            states[index].jobs.clear(); // jobs it can never execute
-                            states[index].assignedSamples = 0UZ;
-                        }
                     }
                     ++index;
                     continue;
@@ -1036,6 +1025,134 @@ protected:
                     index = 0UZ; // strict restart: a still-runnable higher-priority block runs again
                 } else {
                     ++index; // not eligible right now; try the next-highest priority
+                }
+            }
+        } else {
+            // Job-driven selection for policies whose key is a property of the *job* -- the key
+            // changes as jobs are released and retired, so the list cannot be pre-sorted and the
+            // ordering has to be re-derived.
+            //
+            // A released job is the eligibility answer, which is what retires the probing the
+            // fixed-priority loop above relies on: no job, no run, and no `work()` call to find out.
+            //
+            // Two selectors, chosen at run time so the same policy and graph can be measured both
+            // ways. They must agree on every decision -- the shared `selectsBefore` ordering is what
+            // makes that true even for equal keys -- so the only difference is how the minimum is
+            // found: a scan over every eligible block, or a heap.
+            //
+            // N.B. neither has a strict restart. That was a way of approximating "highest priority
+            // eligible" over a pre-sorted list; taking the minimum outright reconsiders every block
+            // on each iteration by construction, so a restart would only repeat work.
+            const TPolicy     policy{};
+            const std::size_t nBlocks    = std::min(blocks.size(), states.size());
+            const std::size_t bound      = max_selections_per_pass == 0U ? kDefaultSelectionMultiplier * blocks.size() : static_cast<std::size_t>(max_selections_per_pass);
+            const bool        useHeap    = selection_strategy == SelectionStrategy::readyHeap && readyHeap.size() >= nBlocks;
+            std::size_t       selections = 0UZ;
+            std::size_t       heapSize   = 0UZ;
+            std::size_t       running    = nBlocks;
+
+            const auto eligible = [&](std::size_t i) { return !states[i].finished && !states[i].jobs.empty(); };
+
+            // `std::push_heap` builds a *max* heap, so the comparator is reversed to put the
+            // smallest key on top. Ties fall to the lower registration index, matching the scan.
+            const auto worse = [](const ReadyEntry& lhs, const ReadyEntry& rhs) { return lhs.key == rhs.key ? lhs.index > rhs.index : lhs.key > rhs.key; };
+
+            const auto pushReady = [&](std::size_t i) {
+                if (heapSize >= readyHeap.size()) {
+                    return; // cannot happen while the scratch is sized at the block count
+                }
+                readyHeap[heapSize] = ReadyEntry{.key = policy.key(*blocks[i], states[i]), .index = i};
+                ++heapSize;
+                std::push_heap(readyHeap.begin(), readyHeap.begin() + static_cast<std::ptrdiff_t>(heapSize), worse);
+            };
+
+            // A block released while it is *running* must not be pushed here: it is already out of
+            // the heap and is re-pushed after its job completes. Without this a feedback edge, where
+            // a block is its own successor, would insert a duplicate entry.
+            const auto onNewlyReady = [&](std::size_t i) {
+                if (useHeap && i != running) {
+                    pushReady(i);
+                }
+            };
+
+            const auto runOne = [&](std::size_t chosen) -> std::optional<work::Result> {
+                running                                             = chosen;
+                const auto [requested_work, performed_work, status] = blocks[chosen]->work(states[chosen].jobs.front().batch);
+                performedWorkAllBlocks += performed_work;
+                ++selections; // every iteration consumed a released job, successful or not
+
+                gr::scheduler::retireFrontJob(states[chosen]);
+
+                // Unconditional, and ahead of the DONE branch. `performed_work` cannot be used as the
+                // trigger: `computePerformedWork()` returns 0 for any status other than OK, so a
+                // source that publishes its whole output and finishes in one call reports zero having
+                // published everything. Gating on it stranded that data with the producer already
+                // marked finished, so no later pass could free it.
+                releaseSuccessorsOf(chosen, onNewlyReady);
+                running = nBlocks;
+
+                if (status == work::Status::ERROR) {
+                    return work::Result{requested_work, performedWorkAllBlocks, work::Status::ERROR};
+                }
+                if (status == work::Status::DONE) {
+                    states[chosen].finished = true;
+                    states[chosen].jobs.clear(); // jobs it can never execute
+                    states[chosen].assignedSamples = 0UZ;
+                    return std::nullopt;
+                }
+
+                unfinishedBlocksExist = true;
+                return std::nullopt;
+            };
+
+            if (useHeap) {
+                // Rebuilt once per pass rather than carried across them. That costs O(n) a pass and
+                // buys the invariant that a block appears at most once, which is what removes any
+                // need for stale-entry handling or a position map.
+                for (std::size_t i = 0UZ; i < nBlocks; ++i) {
+                    if (eligible(i)) {
+                        readyHeap[heapSize] = ReadyEntry{.key = policy.key(*blocks[i], states[i]), .index = i};
+                        ++heapSize;
+                    }
+                }
+                std::make_heap(readyHeap.begin(), readyHeap.begin() + static_cast<std::ptrdiff_t>(heapSize), worse);
+
+                while (selections < bound && heapSize > 0UZ) {
+                    std::pop_heap(readyHeap.begin(), readyHeap.begin() + static_cast<std::ptrdiff_t>(heapSize), worse);
+                    --heapSize;
+                    const std::size_t chosen = readyHeap[heapSize].index;
+
+                    if (const std::optional<work::Result> failure = runOne(chosen); failure.has_value()) {
+                        return *failure;
+                    }
+                    if (eligible(chosen)) {
+                        pushReady(chosen); // re-keyed to whatever job is now at its head
+                    }
+                }
+            } else {
+                while (selections < bound) {
+                    std::size_t chosen = nBlocks;
+                    for (std::size_t i = 0UZ; i < nBlocks; ++i) {
+                        if (!eligible(i)) {
+                            continue;
+                        }
+                        if (chosen == nBlocks || gr::scheduler::selectsBefore(policy, *blocks[i], states[i], *blocks[chosen], states[chosen])) {
+                            chosen = i;
+                        }
+                    }
+
+                    if (chosen == nBlocks) {
+                        // Nothing released. This deliberately does *not* mark the pass unfinished:
+                        // event-driven detection releases a block as soon as its producer publishes,
+                        // so by the end of a pass anything holding data already has a job. A block
+                        // with neither is idle, and treating idle as unfinished would keep the worker
+                        // spinning for ever once the sources have stopped.
+                        break;
+                    }
+
+                    if (const std::optional<work::Result> failure = runOne(chosen); failure.has_value()) {
+                        return *failure;
+                    }
                 }
             }
         }
@@ -1171,11 +1288,12 @@ protected:
         // whenever this worker's list changes.
         std::vector<Job>         localJobArena;
         std::vector<std::size_t> localSuccessorArena;
+        std::vector<ReadyEntry>  localReadyHeap;
 
         syncSchedStates(localBlockList, localStates);
         gr::scheduler::detail::applyStaticOrder<TPolicy>(localBlockList, localStates); // no-op for RoundRobinPolicy: its key is the position itself
         if constexpr (needsReleaseTracking(TPolicy::kPriorityClass)) {
-            buildReleaseStorage(localBlockList, localStates, localJobArena, localSuccessorArena);
+            buildReleaseStorage(localBlockList, localStates, localJobArena, localSuccessorArena, localReadyHeap);
         }
 
         if (localBlockList.empty()) {
@@ -1240,7 +1358,7 @@ protected:
                     // (DEVLOG_M3 §5A.8), but it rides the house-keeping cadence and so fires even
                     // when nothing changed -- a known defect, recorded rather than papered over.
                     if constexpr (needsReleaseTracking(TPolicy::kPriorityClass)) {
-                        buildReleaseStorage(localBlockList, localStates, localJobArena, localSuccessorArena);
+                        buildReleaseStorage(localBlockList, localStates, localJobArena, localSuccessorArena, localReadyHeap);
                     }
 
                     std::ranges::for_each(localBlockList, &BlockModel::processScheduledMessages);
@@ -1270,7 +1388,7 @@ protected:
                     cleanupRemovedBlocks(runnerID, localBlockList);
                     idleUntilAdoption = localBlockList.empty();
                     if (!idleUntilAdoption) {
-                        gr::work::Result result = traverseBlockListOnce(localBlockList, localStates);
+                        gr::work::Result result = traverseBlockListOnce(localBlockList, localStates, std::span<ReadyEntry>{localReadyHeap});
                         if (result.status == work::Status::DONE) {
                             break; // nothing happened -> shutdown this worker
                         } else if (result.status == work::Status::ERROR) {
