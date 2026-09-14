@@ -1105,6 +1105,24 @@ protected:
                 return std::nullopt;
             };
 
+            // A block that has not reported DONE keeps the pass unfinished, as round robin achieves by
+            // polling `work()` and getting INSUFFICIENT_* back from the starved ones. Concluding DONE
+            // because no block on *this* worker holds a job is sound only for a single worker: across
+            // a boundary the producer is another thread that may not have run yet, and the consumer's
+            // worker would exit before any data arrived.
+            //
+            // This terminates only because end-of-stream waives the batch floor (`releaseIfEligible`):
+            // without that a starved block could never run, never finish, and the pass would never be
+            // DONE. The two rules are one change.
+            const auto markUnfinished = [&] {
+                for (std::size_t i = 0UZ; i < nBlocks; ++i) {
+                    if (!states[i].finished) {
+                        unfinishedBlocksExist = true;
+                        return;
+                    }
+                }
+            };
+
             if (useHeap) {
                 // Rebuilt once per pass rather than carried across them. That costs O(n) a pass and
                 // buys the invariant that a block appears at most once, which is what removes any
@@ -1129,6 +1147,7 @@ protected:
                         pushReady(chosen); // re-keyed to whatever job is now at its head
                     }
                 }
+                markUnfinished();
             } else {
                 while (selections < bound) {
                     std::size_t chosen = nBlocks;
@@ -1142,18 +1161,14 @@ protected:
                     }
 
                     if (chosen == nBlocks) {
-                        // Nothing released. This deliberately does *not* mark the pass unfinished:
-                        // event-driven detection releases a block as soon as its producer publishes,
-                        // so by the end of a pass anything holding data already has a job. A block
-                        // with neither is idle, and treating idle as unfinished would keep the worker
-                        // spinning for ever once the sources have stopped.
-                        break;
+                        break; // nothing released this pass
                     }
 
                     if (const std::optional<work::Result> failure = runOne(chosen); failure.has_value()) {
                         return *failure;
                     }
                 }
+                markUnfinished();
             }
         }
 #ifdef __EMSCRIPTEN__

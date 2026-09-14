@@ -336,24 +336,45 @@ struct Readiness {
 /// job's release time -- no nominal instant is ever invented, because a release is *defined* as the
 /// detection of eligibility and a nominal one asserts an eligibility that may never have occurred.
 inline void releaseIfEligible(BlockModel& block, SchedState& state, std::chrono::steady_clock::time_point now) {
-    if (state.finished || block.state() != lifecycle::State::RUNNING) {
-        return; // a stopped block would only accumulate jobs it can never execute
+    if (state.finished) {
+        return;
+    }
+    if (block.state() != lifecycle::State::RUNNING) {
+        // A block that stopped itself -- a source reaching `n_samples_max`, say -- will never be
+        // released again, so it can never return `DONE` and nothing else would ever mark it
+        // finished. Recording it here is what lets a worker conclude the graph is over; without it
+        // the pass stays unfinished for ever, waiting on a block that has already left.
+        if (lifecycle::isShuttingDown(block.state()) || block.state() == lifecycle::State::ERROR) {
+            state.finished = true;
+        }
+        return; // otherwise merely paused: it may yet resume, and would only accumulate jobs meanwhile
     }
 
-    if (state.periodSeconds > 0.0) { // a zero period imposes no temporal gate
+    // End of stream makes the batch floor unsatisfiable: no more data is coming, so waiting for it
+    // is waiting for ever, and the block would never run, never report DONE and never let its worker
+    // conclude the graph had finished. Only checked when the gate is about to shut, so it costs
+    // nothing while data is flowing.
+    //
+    // Only with an empty ring: a shut gate can equally mean the samples are committed to outstanding
+    // jobs rather than absent, and waiving then would commit them twice.
+    const Readiness   readiness  = inputReadiness(block, state.batchFloor);
+    const std::size_t unassigned = unassignedSamples(readiness.available, state.assignedSamples);
+    const bool        draining   = unassigned < std::max(state.batchFloor, 1UZ) && state.jobs.empty() && block.inputStreamEnded();
+
+    if (!draining && state.periodSeconds > 0.0) { // a zero period imposes no temporal gate
         const std::chrono::duration<double> elapsed = now - state.lastRelease;
         if (elapsed.count() < state.periodSeconds) {
-            return;
+            return; // ... and a terminating block does not wait out a period to run its last job
         }
     }
 
-    const Readiness   readiness  = inputReadiness(block, state.batchFloor);
-    const std::size_t unassigned = unassignedSamples(readiness.available, state.assignedSamples);
-    if (unassigned < std::max(state.batchFloor, 1UZ)) {
+    if (unassigned < std::max(state.batchFloor, 1UZ) && !draining) {
         return;
     }
 
-    const std::size_t batch = std::min(unassigned, state.batchCeiling);
+    // At least one, so a drain job can run on an empty-but-ended port and observe the end-of-stream
+    // tag; `work(1)` there reports DONE.
+    const std::size_t batch = std::min(std::max(unassigned, 1UZ), state.batchCeiling);
     if (batch == 0UZ || batch == kUnboundedBatch || batch == gr::undefined_size) {
         return; // `work(SIZE_MAX)` is not a batch -- nothing connected bounds this one
     }

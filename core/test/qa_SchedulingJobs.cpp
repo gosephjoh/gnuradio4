@@ -826,10 +826,7 @@ const boost::ut::suite<"multi-threaded release tracking"> threadedTests = [] {
         expect(eq(workers, 2UZ)) << "otherwise the placement below means nothing";
     };
 
-    // SKIPPED: documents a real defect, not a flaky test -- release-tracking policies lose every
-    // sample across a worker boundary (DEVLOG_M3 §16.5). Kept active-looking so the fix has a
-    // ready-made check; remove the `skip /` when the readiness query can see end-of-stream.
-    skip / "cross-worker chains deliver every sample"_test = [] {
+    "cross-worker chains deliver every sample"_test = [] {
         // Every edge crosses a worker boundary, so successor lists are empty by construction and the
         // per-sweep backstop is the only thing that can release a consumer (DEVLOG_M3 §5A.12).
         const auto [a, b] = runThreaded<EdfPolicy>(Placement::crossWorker, kThreadedSamples);
@@ -843,7 +840,7 @@ const boost::ut::suite<"multi-threaded release tracking"> threadedTests = [] {
         expect(eq(b, kThreadedSamples));
     };
 
-    skip / "both selectors agree under threads"_test = [] { // blocked on the same defect (§16.5)
+    "both selectors agree under threads"_test = [] {
         const auto [scanA, scanB] = runThreaded<EdfPolicy>(Placement::crossWorker, kThreadedSamples, gr::scheduler::SelectionStrategy::linearScan);
         const auto [heapA, heapB] = runThreaded<EdfPolicy>(Placement::crossWorker, kThreadedSamples, gr::scheduler::SelectionStrategy::readyHeap);
         expect(eq(scanA, heapA));
@@ -876,6 +873,39 @@ const boost::ut::suite<"multi-threaded release tracking"> threadedTests = [] {
         const auto [sameA, sameB] = runThreaded<RoundRobinPolicy>(Placement::sameWorker, kThreadedSamples);
         expect(eq(sameA, kThreadedSamples));
         expect(eq(sameB, kThreadedSamples));
+    };
+};
+
+const boost::ut::suite<"end-of-stream readiness"> eosTests = [] {
+    "work(1) on an ended, empty port reports DONE"_test = [] {
+        // The assumption the whole termination argument rests on (DEVLOG_M3 §18.4). If an ended but
+        // empty port answers INSUFFICIENT_INPUT_ITEMS instead, a waived-floor job would never finish
+        // the block and the worker would spin.
+        gr::Graph graph;
+        auto&     src  = graph.emplaceBlock<gr::testing::ConstantSource<float>>({{"n_samples_max", gr::Size_t{8U}}});
+        auto&     copy = graph.emplaceBlock<gr::testing::Copy<float>>();
+        auto&     sink = graph.emplaceBlock<gr::testing::NullSink<float>>();
+        expect(graph.connect<"out", "in">(src, copy).has_value());
+        expect(graph.connect<"out", "in">(copy, sink).has_value());
+        expect(graph.connectPendingEdges());
+
+        gr::BlockModel& srcModel = *graph.blocks()[0];
+        gr::BlockModel& midModel = *graph.blocks()[1];
+        activate(srcModel);
+        activate(midModel);
+
+        for (std::size_t i = 0UZ; i < 4UZ && srcModel.state() == gr::lifecycle::State::RUNNING; ++i) {
+            std::ignore = srcModel.work(64UZ);
+        }
+        for (std::size_t i = 0UZ; i < 8UZ && midModel.availableInputSamples(true)[0UZ] > 0UZ; ++i) {
+            std::ignore = midModel.work(64UZ);
+        }
+
+        expect(eq(midModel.availableInputSamples(true)[0UZ], 0UZ)) << fatal << "the port must be empty for this to mean anything";
+        expect(midModel.state() == gr::lifecycle::State::RUNNING) << fatal << "and the block still running";
+
+        const gr::work::Result result = midModel.work(1UZ);
+        expect(result.status == gr::work::Status::DONE) << std::format("an ended, empty port must terminate the block; got status {}", static_cast<int>(result.status));
     };
 };
 

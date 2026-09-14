@@ -542,6 +542,14 @@ public:
     [[nodiscard]] virtual std::span<const std::size_t> minOutputRequirements() noexcept = 0;
     [[nodiscard]] virtual std::span<const std::size_t> maxOutputRequirements() noexcept = 0;
 
+    /**
+     * @brief whether the input stream has ended -- an end-of-stream tag is pending.
+     *
+     * Distinct from "no data available": it means no further data will arrive, so a scheduler that
+     * gates execution on a minimum batch must stop waiting and let the block drain and terminate.
+     */
+    [[nodiscard]] virtual bool inputStreamEnded() noexcept = 0;
+
     [[nodiscard]] virtual bool hasAsyncInputPorts() noexcept  = 0;
     [[nodiscard]] virtual bool hasAsyncOutputPorts() noexcept = 0;
 
@@ -785,6 +793,7 @@ public:
     [[nodiscard]] std::span<const port::BitMask> blockInputTypes() noexcept override { return blockRef().inputStreamCache.types(); }
     [[nodiscard]] std::span<const port::BitMask> blockOutputTypes() noexcept override { return blockRef().outputStreamCache.types(); }
     [[nodiscard]] std::span<const std::size_t>   availableInputSamples(bool reset = false) noexcept override { return blockRef().inputStreamCache.availableSamples(reset); }
+    [[nodiscard]] bool                           inputStreamEnded() noexcept override { return blockRef().inputStreamEnded(); }
     [[nodiscard]] std::span<const std::size_t>   availableOutputSamples(bool reset = false) noexcept override { return blockRef().outputStreamCache.availableSamples(reset); }
     [[nodiscard]] std::span<const std::size_t>   minInputRequirements() noexcept override { return blockRef().inputStreamCache.minSamples(); }
     [[nodiscard]] std::span<const std::size_t>   maxInputRequirements() noexcept override { return blockRef().inputStreamCache.maxSamples(); }

@@ -1529,6 +1529,18 @@ public:
         return result;
     }
 
+    /// Whether this block's input stream has ended: an end-of-stream tag is pending on a synchronous
+    /// input, or an asynchronous one has reached its own.
+    ///
+    /// Distinct from "no data available". It means no *further* data will arrive, so a scheduler
+    /// waiting for a minimum batch is waiting for ever, and must let the block run to drain whatever
+    /// is left and terminate. A block with no connected input never reports ended -- it has no input
+    /// stream to end.
+    [[nodiscard]] bool inputStreamEnded() {
+        const auto position = getNextTagAndEosPosition();
+        return position.asyncEoS || position.nextEosTag != std::numeric_limits<std::size_t>::max();
+    }
+
     /***
      * skip leftover stride
      * @param availableSamples number of samples that can be consumed from each sync port
