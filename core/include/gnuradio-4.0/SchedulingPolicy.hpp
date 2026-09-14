@@ -2,6 +2,7 @@
 #define GNURADIO_SCHEDULINGPOLICY_HPP
 
 #include <algorithm>
+#include <chrono>
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
@@ -70,6 +71,52 @@ enum class PriorityClass : std::uint8_t {
 /// Whether the worker selects the highest-priority eligible block each time, rather than sweeping.
 [[nodiscard]] constexpr bool selectsByPriority(PriorityClass priorityClass) noexcept { return priorityClass != PriorityClass::none; }
 
+/// One released job: a unit of work admitted at a particular instant, with its batch frozen at
+/// release so that samples arriving before it executes cannot change what it was admitted to do.
+struct Job {
+    std::size_t                           batch = 0UZ;
+    std::chrono::steady_clock::time_point releaseTime{};      /// detection instant, never a nominal one
+    std::chrono::steady_clock::time_point absoluteDeadline{}; /// frozen with the batch, so a mid-run
+                                                              /// `relative_deadline` change cannot move it
+};
+
+/// Fixed-capacity ring over storage owned elsewhere: the scheduler allocates one arena during setup
+/// and hands each block a slice, so releasing a job never allocates. Capacity is per block and
+/// derived, not a constant -- see DEVLOG_M3 §5.7.
+struct JobQueue {
+    std::span<Job> storage{};
+    std::size_t    head = 0UZ;
+    std::size_t    size = 0UZ;
+
+    [[nodiscard]] constexpr bool        empty() const noexcept { return size == 0UZ; }
+    [[nodiscard]] constexpr bool        full() const noexcept { return storage.empty() || size >= storage.size(); }
+    [[nodiscard]] constexpr std::size_t capacity() const noexcept { return storage.size(); }
+
+    [[nodiscard]] constexpr Job& front() noexcept { return storage[head]; }
+
+    [[nodiscard]] constexpr bool push(const Job& job) noexcept {
+        if (full()) {
+            return false;
+        }
+        storage[(head + size) % storage.size()] = job;
+        ++size;
+        return true;
+    }
+
+    constexpr void pop() noexcept {
+        if (empty()) {
+            return;
+        }
+        head = (head + 1UZ) % storage.size();
+        --size;
+    }
+
+    constexpr void clear() noexcept {
+        head = 0UZ;
+        size = 0UZ;
+    }
+};
+
 struct SchedState {
     std::size_t index = 0UZ;
 
@@ -92,6 +139,42 @@ struct SchedState {
     /// re-probing it on every restart. Cleared whenever the states are re-derived, which is the
     /// right scope: a graph mutation invalidates the conclusion.
     bool finished = false;
+
+    /// Release bookkeeping, used only where the policy's class calls for it
+    /// (`needsReleaseTracking`). A round-robin scheduler leaves all of it untouched and pays only
+    /// the storage, which is fixed and small.
+    JobQueue jobs{};
+
+    /// Zero-initialised on purpose: it makes the temporal gate vacuous on the first sweep, so a
+    /// block's first release is decided by data alone (DEVLOG_M3 §5A.5).
+    std::chrono::steady_clock::time_point lastRelease{};
+
+    /// Samples already committed to released-but-unexecuted jobs, so two jobs cannot claim the
+    /// same data. Read through `unassignedSamples()`, which saturates rather than wrapping.
+    std::size_t assignedSamples = 0UZ;
+
+    /// Minimum input the block needs before it can run: the data gate's threshold.
+    std::size_t batchFloor = 1UZ;
+
+    /// Resolved period and relative deadline in seconds, `0` meaning unset. A zero period imposes
+    /// no temporal gate, leaving release governed by data alone (DEVLOG_M3 §5.3).
+    double periodSeconds           = 0.0;
+    double relativeDeadlineSeconds = 0.0;
+
+    /// Releases dropped because the ring was full -- a real backlog signal, not an error: the
+    /// samples stay unassigned and are offered again on a later detection.
+    ///
+    /// N.B. the buffer-derived bound alone could never be reached by a block with inputs, so a
+    /// non-zero count used to imply a bookkeeping defect. The `max_outstanding_jobs` clamp removes
+    /// that guarantee deliberately, and with it the distinction: under a clamp every block can
+    /// saturate, and this counts how often the cap, rather than the data, was the binding
+    /// constraint (DEVLOG_M3 §5.7).
+    std::size_t overruns = 0UZ;
+
+    /// Indices, within this worker's own list, of the blocks this one feeds. Event-driven release
+    /// detection walks these after a `work()` that produced output; cross-worker edges are absent
+    /// by construction and are covered by the per-sweep backstop instead (DEVLOG_M3 §5A.12).
+    std::span<const std::size_t> successors{};
 };
 
 /**

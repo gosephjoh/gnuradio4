@@ -259,11 +259,129 @@ struct Readiness {
     return {.available = *gating, .runnable = *gating >= std::max(threshold, 1UZ)};
 }
 
+/// Ceiling of the gating availability: the same synchronous/asynchronous combination
+/// `inputReadiness()` applies to occupancy, applied instead to buffer *capacities*. A bound
+/// computed any other way could be violated by construction.
+///
+/// As with readiness, a block with no connected input falls back to its output side.
+[[nodiscard]] inline std::size_t gatingCapacity(BlockModel& block) {
+    const auto combine = [](std::size_t nPorts, auto&& accessor) -> std::optional<std::size_t> {
+        std::size_t syncMin  = gr::undefined_size;
+        std::size_t asyncMax = 0UZ;
+        bool        hasSync  = false;
+        bool        hasAsync = false;
+
+        for (std::size_t i = 0UZ; i < nPorts; ++i) {
+            auto port = accessor(i);
+            if (!port.has_value() || !port.value()->isConnected()) {
+                continue;
+            }
+            const std::size_t capacity = port.value()->bufferSize();
+            if (port.value()->isSynchronous()) {
+                syncMin = std::min(syncMin, capacity);
+                hasSync = true;
+            } else {
+                asyncMax = std::max(asyncMax, capacity);
+                hasAsync = true;
+            }
+        }
+
+        if (hasSync && hasAsync) {
+            return std::max(syncMin, asyncMax);
+        }
+        if (hasSync) {
+            return syncMin;
+        }
+        if (hasAsync) {
+            return asyncMax;
+        }
+        return std::nullopt;
+    };
+
+    if (const std::optional<std::size_t> inputs = combine(block.dynamicInputPortsSize(), [&block](std::size_t i) { return block.dynamicInputPort(i); }); inputs.has_value()) {
+        return *inputs;
+    }
+    if (const std::optional<std::size_t> outputs = combine(block.dynamicOutputPortsSize(), [&block](std::size_t i) { return block.dynamicOutputPort(i); }); outputs.has_value()) {
+        return *outputs;
+    }
+    return 0UZ;
+}
+
+/// How many jobs of one block can be outstanding at once. Every released job holds at least
+/// `batchFloor` samples and the committed total cannot exceed the gating buffer, so the quotient
+/// bounds the ring -- which is what lets the whole job arena be sized during setup.
+///
+/// `cap` clamps that bound. The derived value is a true maximum but a wildly pessimistic one: with
+/// 65536-sample buffers and a floor of one it reserves 65536 jobs (1.5 MB) for a block that will
+/// realistically hold a handful. Clamping trades an unreachable guarantee for the memory, and
+/// changes what a full ring means -- see `SchedState::overruns`. `kUnboundedBatch` disables it.
+[[nodiscard]] inline std::size_t maxOutstandingJobs(BlockModel& block, std::size_t batchFloor, std::size_t cap = kUnboundedBatch) {
+    const std::size_t floor = std::max(batchFloor, 1UZ);
+    return std::clamp(gatingCapacity(block) / floor, 1UZ, std::max(cap, 1UZ));
+}
+
 /// `available - assigned`, saturating at zero. Availability can legitimately fall below what
 /// outstanding jobs already hold -- under the asynchronous `max` rule the gating port may change
 /// between detection points -- and unsigned wrap-around there would open the data gate wide instead
 /// of closing it. Saturating fails closed: the gate stays shut until the outstanding jobs drain.
 [[nodiscard]] constexpr std::size_t unassignedSamples(std::size_t available, std::size_t assigned) noexcept { return available > assigned ? available - assigned : 0UZ; }
+
+/// Releases one job for `state` when both gates are open, and does nothing otherwise.
+///
+/// Sporadic, not gridded: `lastRelease` advances only on an actual release, so `period` reads as a
+/// minimum separation between consecutive releases. `now` is the detection instant and becomes the
+/// job's release time -- no nominal instant is ever invented, because a release is *defined* as the
+/// detection of eligibility and a nominal one asserts an eligibility that may never have occurred.
+inline void releaseIfEligible(BlockModel& block, SchedState& state, std::chrono::steady_clock::time_point now) {
+    if (state.finished || block.state() != lifecycle::State::RUNNING) {
+        return; // a stopped block would only accumulate jobs it can never execute
+    }
+
+    if (state.periodSeconds > 0.0) { // a zero period imposes no temporal gate
+        const std::chrono::duration<double> elapsed = now - state.lastRelease;
+        if (elapsed.count() < state.periodSeconds) {
+            return;
+        }
+    }
+
+    const Readiness   readiness  = inputReadiness(block, state.batchFloor);
+    const std::size_t unassigned = unassignedSamples(readiness.available, state.assignedSamples);
+    if (unassigned < std::max(state.batchFloor, 1UZ)) {
+        return;
+    }
+
+    const std::size_t batch = std::min(unassigned, state.batchCeiling);
+    if (batch == 0UZ || batch == kUnboundedBatch || batch == gr::undefined_size) {
+        return; // `work(SIZE_MAX)` is not a batch -- nothing connected bounds this one
+    }
+
+    const double deadlineSeconds = state.relativeDeadlineSeconds > 0.0 ? state.relativeDeadlineSeconds : state.periodSeconds;
+
+    // An unset deadline sorts *last*, never first: a zero absolute deadline would look infinitely
+    // urgent and starve everything else.
+    const std::chrono::steady_clock::time_point deadline = deadlineSeconds > 0.0 //
+                                                               ? now + std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(deadlineSeconds))
+                                                               : std::chrono::steady_clock::time_point::max();
+
+    if (!state.jobs.push(Job{.batch = batch, .releaseTime = now, .absoluteDeadline = deadline})) {
+        ++state.overruns;
+        return;
+    }
+    state.assignedSamples += batch;
+    state.lastRelease = now;
+}
+
+/// Retires the job at the head of the queue, returning its whole assignment to the unassigned pool.
+/// The job's actual consumption is deliberately not consulted: `work()` may legitimately process
+/// less than it was asked for, and carrying a remainder would make ring entries mutable.
+inline void retireFrontJob(SchedState& state) {
+    if (state.jobs.empty()) {
+        return;
+    }
+    const std::size_t batch = state.jobs.front().batch;
+    state.assignedSamples   = state.assignedSamples > batch ? state.assignedSamples - batch : 0UZ;
+    state.jobs.pop();
+}
 
 /// A period is only as sound as the batch it was computed at, so its provenance follows the
 /// batch's: configuration where a value was configured, `derivedFromRate` where the rate model
