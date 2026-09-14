@@ -293,8 +293,14 @@ public:
         return std::span<const std::size_t>{_maxSamples.data(), _maxSamples.size()};
     }
 
+    /// `reset` must invalidate before updating, not merely call `updateAvailable()`: that function
+    /// returns early while the cache is clean, so without this a caller asking to force a re-read
+    /// was handed back stale occupancy -- exactly what passing `reset` is meant to avoid.
     std::span<const std::size_t> availableSamples(bool reset = false) {
-        if (_dirtyAvailable || reset) {
+        if (reset) {
+            invalidateStatistic();
+        }
+        if (_dirtyAvailable) {
             updateAvailable();
         }
         assert(!_dirtyAvailable);
