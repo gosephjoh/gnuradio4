@@ -87,7 +87,7 @@ TAG="rate${RATE_HZ}_chains${CHAINS}"; [ "$CHUNK" = 4096 ] || TAG="${TAG}_chunk${
 OUT="$CELL/runs4/$TAG"
 mkdir -p "$OUT" || die "cannot create $OUT"
 CMD="./build/rx_latency4 --run-dir $CELL --input $CELL/rx_stimulus.cf32 --out-dir $OUT --rate $RATE_HZ --chains $CHAINS --chunk $CHUNK --deadline-ms $DEADLINE --threads $THREADS --buffer $BUFFER"
-SUM="python3 -c \"import json; s=json.load(open('$OUT/latency_summary.json')); [print('chain %d: %d/%d decoded (%s wrong payload), last->decode us p50 %.0f p95 %.0f p99 %.0f max %.0f, %d over %g ms' % (c['chain'], c['decoded'], c['frames'], c['wrong_payload'], c['p50_us'], c['p95_us'], c['p99_us'], c['max_us'], c['deadline_misses'], s['latency']['deadline_ms'])) for c in s['per_chain']]\""
+SUM="$HERE/scripts/rt-table $OUT"
 cat <<EOF
 
 rt-run4: $FACTS
@@ -101,7 +101,7 @@ htop -t
 # 2. the GR4 receiver(s):
 $CMD
 
-# 3. the numbers:
+# 3. the numbers, one row per receiver (add more run directories to compare; --md / --csv / --wide):
 $SUM
 
 # 4. against a GR3 run of the same levers (its latency.csv, from ./scripts/rt-run in the GR3 project):

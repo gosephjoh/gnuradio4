@@ -188,6 +188,8 @@ lifecycle state and the stage counters.
   `build/compare --rx-only` (symbols within tolerance, PDUs byte for byte,
   `GR3-DEFECT` for a GR3-lost frame the port decodes correctly). Results
   in `results/gate4.{log,csv}`.
+- `scripts/rt-table`: the per-chain results of any runs (GR3 or GR4) as an
+  aligned, Markdown or CSV table; identical copy in the GR3 project.
 - `scripts/compare-runs.py`: a GR3 `latency.csv` against a GR4 one on the
   same cell — decoded sets, GR3-only / GR4-only frames, payload correctness
   of the GR4-only ones, latency percentiles side by side.

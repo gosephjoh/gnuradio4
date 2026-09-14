@@ -109,8 +109,10 @@ Outputs are in `<cell>/runs4/rate<R>_chains<C>/`:
 ```
 OUT=data/rt_300_300_102934_QPSK_1_2_s1/runs4/rate10000000_chains2
 
-# the summary: per chain decoded/frames, p50/p95/p99/max of last-sample-to-decode, deadline misses
-python3 -c "import json; s=json.load(open('$OUT/latency_summary.json')); [print('chain %d: %d/%d decoded (%s wrong payload), last->decode us p50 %.0f p95 %.0f p99 %.0f max %.0f, %d over %g ms' % (c['chain'], c['decoded'], c['frames'], c['wrong_payload'], c['p50_us'], c['p95_us'], c['p99_us'], c['max_us'], c['deadline_misses'], s['latency']['deadline_ms'])) for c in s['per_chain']]"
+# the summary as a table, one row per receiver; several run directories (GR3 and GR4
+# alike) compare side by side; --md for Markdown, --csv, --wide for the knobs and stage counts
+./scripts/rt-table $OUT
+./scripts/rt-table --md <GR3 run dir> $OUT
 
 # every packet: chain,seq,length,t_first_ns,t_last_ns,t_decode_ns,lat_first_us,lat_last_us,decoded,correct
 head -5 $OUT/latency.csv
@@ -197,7 +199,7 @@ include/gr4ieee80211/   wifi_codec.hpp (params, tables, Viterbi, descrambler, CR
 src/chain.cpp           one receiver chain wired into a gr::Graph (the heavy TU)
 include/gr4ieee80211/wifi_tx.hpp, wifi_tables.h   the standalone transmitter (gen4)
 apps/rx_latency4.cpp    the app; apps/gen4.cpp the generator; apps/probe.cpp the diagnostic
-scripts/                rt-run4, gate4, compare-runs.py, check-gen4.py
+scripts/                rt-run4, rt-table, gate4, compare-runs.py, check-gen4.py
 third_party/nlohmann    vendored JSON header (MIT)
 docs/port-notes.md      what changed and why
 results/                gate4.log, gate4.csv
