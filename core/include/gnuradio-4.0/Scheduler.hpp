@@ -1140,6 +1140,14 @@ protected:
                     --heapSize;
                     const std::size_t chosen = readyHeap[heapSize].index;
 
+                    // A popped entry may be stale. `onNewlyReady` avoids creating duplicates, but
+                    // that is an argument about one call site, whereas `runOne` would read
+                    // `jobs.front()` of an emptied ring. Validating here makes the loop correct
+                    // however an entry came to be there.
+                    if (!eligible(chosen)) {
+                        continue;
+                    }
+
                     if (const std::optional<work::Result> failure = runOne(chosen); failure.has_value()) {
                         return *failure;
                     }

@@ -909,4 +909,243 @@ const boost::ut::suite<"end-of-stream readiness"> eosTests = [] {
     };
 };
 
+namespace {
+
+/// `src -> copy -> sink` driven until the source has stopped and published its end-of-stream tag,
+/// leaving the copy holding `samples` samples with EOS pending behind them.
+struct EndedChain {
+    gr::Graph       graph;
+    gr::BlockModel* src = nullptr;
+    gr::BlockModel* mid = nullptr;
+
+    explicit EndedChain(gr::Size_t samples) {
+        auto& source = graph.emplaceBlock<gr::testing::ConstantSource<float>>({{"n_samples_max", samples}});
+        auto& copy   = graph.emplaceBlock<gr::testing::Copy<float>>();
+        auto& sink   = graph.emplaceBlock<gr::testing::NullSink<float>>();
+        expect(graph.connect<"out", "in">(source, copy).has_value());
+        expect(graph.connect<"out", "in">(copy, sink).has_value());
+        expect(graph.connectPendingEdges());
+
+        src = graph.blocks()[0].get();
+        mid = graph.blocks()[1].get();
+        activate(*src);
+        activate(*mid);
+
+        for (std::size_t i = 0UZ; i < 8UZ && src->state() == gr::lifecycle::State::RUNNING; ++i) {
+            std::ignore = src->work(2UZ * static_cast<std::size_t>(samples));
+        }
+        expect(src->state() != gr::lifecycle::State::RUNNING) << fatal << "the source must have stopped";
+        expect(mid->inputStreamEnded()) << fatal << "and its end-of-stream tag must have reached the consumer";
+        expect(eq(mid->availableInputSamples(true)[0UZ], static_cast<std::size_t>(samples))) << fatal;
+    }
+};
+
+} // namespace
+
+const boost::ut::suite<"end-of-stream release guards"> eosGuardTests = [] {
+    constexpr gr::Size_t kLeftover = 8U;
+
+    "end of stream waives the batch floor"_test = [] {
+        EndedChain chain{kLeftover};
+
+        StateFixture fixture{4UZ};
+        fixture.state.batchFloor = 64UZ; // far above what is left, so the gate is shut for ever
+
+        releaseIfEligible(*chain.mid, fixture.state, Clock::now());
+        expect(!fixture.state.jobs.empty()) << fatal << "an ended stream must release what is left";
+        expect(eq(fixture.state.jobs.front().batch, static_cast<std::size_t>(kLeftover))) << "the drain job takes the remainder";
+    };
+
+    "the floor is waived only while the ring is empty"_test = [] {
+        // A shut gate can equally mean the samples are committed to outstanding jobs rather than
+        // absent. Waiving then would hand the same samples to a second job.
+        EndedChain chain{kLeftover};
+
+        StateFixture fixture{4UZ};
+        fixture.state.batchFloor = 64UZ;
+
+        releaseIfEligible(*chain.mid, fixture.state, Clock::now());
+        expect(eq(fixture.state.jobs.size, 1UZ)) << fatal;
+        expect(eq(fixture.state.assignedSamples, static_cast<std::size_t>(kLeftover)));
+
+        releaseIfEligible(*chain.mid, fixture.state, Clock::now());
+        expect(eq(fixture.state.jobs.size, 1UZ)) << "the waiver must not fire again while a job is outstanding";
+        expect(eq(fixture.state.assignedSamples, static_cast<std::size_t>(kLeftover))) << "and must not commit the same samples twice";
+    };
+
+    "the temporal gate is waived on the terminal path"_test = [] {
+        // Otherwise shutdown latency would scale with the longest period in the graph.
+        EndedChain chain{kLeftover};
+
+        StateFixture fixture{4UZ};
+        fixture.state.batchFloor    = 64UZ;
+        fixture.state.periodSeconds = 1000.0;
+        fixture.state.lastRelease   = Clock::now(); // a full period away from being due
+
+        releaseIfEligible(*chain.mid, fixture.state, Clock::now());
+        expect(!fixture.state.jobs.empty()) << "a terminating block does not wait out a period to run its last job";
+    };
+
+    "a stopped block is marked finished, a paused one is not"_test = [] {
+        // A source that stops itself is never released again, so nothing else would ever report DONE
+        // for it and a worker would wait on it for ever. A paused block may yet resume.
+        Chain paused;
+        paused.prime(64UZ);
+        activate(*paused.mid);
+        expect(paused.mid->changeStateTo(gr::lifecycle::State::REQUESTED_PAUSE).has_value());
+        expect(paused.mid->changeStateTo(gr::lifecycle::State::PAUSED).has_value());
+
+        StateFixture pausedState{4UZ};
+        releaseIfEligible(*paused.mid, pausedState.state, Clock::now());
+        expect(!pausedState.state.finished) << "a paused block must not be written off";
+        expect(pausedState.state.jobs.empty()) << "nor accumulate jobs while paused";
+
+        Chain stopped;
+        stopped.prime(64UZ);
+        activate(*stopped.mid);
+        expect(stopped.mid->changeStateTo(gr::lifecycle::State::REQUESTED_STOP).has_value());
+
+        StateFixture stoppedState{4UZ};
+        releaseIfEligible(*stopped.mid, stoppedState.state, Clock::now());
+        expect(stoppedState.state.finished) << "a block that is shutting down is finished for scheduling purposes";
+    };
+};
+
+namespace {
+
+/// Reports ERROR without consuming or publishing, so a test can reach the selectors' error path.
+template<typename T>
+struct FailingCopy : gr::Block<FailingCopy<T>> {
+    gr::PortIn<T>  in;
+    gr::PortOut<T> out;
+
+    GR_MAKE_REFLECTABLE(FailingCopy, in, out);
+
+    gr::work::Status processBulk(gr::InputSpanLike auto& input, gr::OutputSpanLike auto& output) const noexcept {
+        std::ignore = input.consume(0UZ);
+        output.publish(0UZ);
+        return gr::work::Status::ERROR;
+    }
+};
+
+/// One `step()` over `chains` independent source→RecordingCopy→sink chains, returning how many
+/// recorded blocks ran. `bound` is `max_selections_per_pass`.
+std::size_t recordedRunsInOneStep(gr::Size_t bound, std::size_t chains, gr::scheduler::SelectionStrategy strategy) {
+    gInvocationLog.clear();
+
+    gr::Graph graph;
+    for (std::size_t c = 0UZ; c < chains; ++c) {
+        auto& src  = graph.emplaceBlock<gr::testing::ConstantSource<float>>({{"name", std::format("bsrc{}", c)}, {"n_samples_max", gr::Size_t{512U}}});
+        auto& mid  = graph.emplaceBlock<RecordingCopy<float>>({{"name", std::format("bmid{}", c)}});
+        auto& sink = graph.emplaceBlock<gr::testing::NullSink<float>>({{"name", std::format("bsink{}", c)}});
+        expect(graph.connect<"out", "in">(src, mid).has_value());
+        expect(graph.connect<"out", "in">(mid, sink).has_value());
+    }
+
+    gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::externalStep, gr::profiling::null::Profiler, EdfPolicy> sched;
+    sched.selection_strategy      = strategy;
+    sched.max_selections_per_pass = bound;
+    expect(sched.exchange(std::move(graph)).has_value());
+    expect(sched.changeStateTo(gr::lifecycle::State::INITIALISED).has_value());
+    expect(sched.changeStateTo(gr::lifecycle::State::RUNNING).has_value());
+    std::ignore = sched.step();
+    std::ignore = sched.changeStateTo(gr::lifecycle::State::STOPPED);
+
+    return gInvocationLog.size();
+}
+
+} // namespace
+
+const boost::ut::suite<"dynamic selector error and bound"> selectorEdgeTests = [] {
+    "a block reporting ERROR aborts the pass"_test = [] {
+        for (const auto strategy : {gr::scheduler::SelectionStrategy::linearScan, gr::scheduler::SelectionStrategy::readyHeap}) {
+            gr::Graph graph;
+            auto&     src     = graph.emplaceBlock<gr::testing::ConstantSource<float>>({{"n_samples_max", gr::Size_t{512U}}});
+            auto&     failing = graph.emplaceBlock<FailingCopy<float>>();
+            auto&     sink    = graph.emplaceBlock<gr::testing::NullSink<float>>();
+            expect(graph.connect<"out", "in">(src, failing).has_value());
+            expect(graph.connect<"out", "in">(failing, sink).has_value());
+
+            gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::externalStep, gr::profiling::null::Profiler, EdfPolicy> sched;
+            sched.selection_strategy = strategy;
+            expect(sched.exchange(std::move(graph)).has_value());
+            expect(sched.changeStateTo(gr::lifecycle::State::INITIALISED).has_value());
+            expect(sched.changeStateTo(gr::lifecycle::State::RUNNING).has_value());
+
+            const gr::work::Result result = sched.step();
+            expect(result.status == gr::work::Status::ERROR) << "the selector must surface a block's ERROR, not swallow it";
+
+            std::ignore = sched.changeStateTo(gr::lifecycle::State::STOPPED);
+        }
+    };
+
+    "max_selections_per_pass bounds the dynamic loop"_test = [] {
+        // M2e covered the bound for the static-key loop; the dynamic loop re-derives it and never
+        // checked. Four chains are released together by the backstop, so a tight bound has to cut
+        // the pass short and a generous one must not.
+        constexpr std::size_t kChains = 4UZ;
+
+        for (const auto strategy : {gr::scheduler::SelectionStrategy::linearScan, gr::scheduler::SelectionStrategy::readyHeap}) {
+            const std::size_t tight    = recordedRunsInOneStep(2U, kChains, strategy);
+            const std::size_t generous = recordedRunsInOneStep(64U, kChains, strategy);
+
+            expect(le(tight, 2UZ)) << "a bound of two cannot admit more than two selections";
+            expect(eq(generous, kChains)) << "and a generous bound lets every chain's middle block run";
+            expect(lt(tight, generous)) << "so the bound is actually binding";
+        }
+    };
+};
+
+namespace {
+
+/// Feeds its own asynchronous input from its output, so it is its own successor. Asynchronous, so
+/// the loop port never gates the block and no feedback priming is needed.
+template<typename T>
+struct SelfLoop : gr::Block<SelfLoop<T>> {
+    gr::PortIn<T>            in;
+    gr::PortIn<T, gr::Async> loop;
+    gr::PortOut<T>           out;
+
+    GR_MAKE_REFLECTABLE(SelfLoop, in, loop, out);
+
+    std::size_t processed = 0UZ;
+
+    gr::work::Status processBulk(gr::InputSpanLike auto& input, gr::InputSpanLike auto& fed, gr::OutputSpanLike auto& output) noexcept {
+        const std::size_t n = std::min(input.size(), output.size());
+        for (std::size_t i = 0UZ; i < n; ++i) {
+            output[i] = input[i];
+        }
+        processed += n;
+        output.publish(n);
+        std::ignore = input.consume(n);
+        std::ignore = fed.consume(fed.size()); // drain the feedback so the loop buffer cannot fill
+        return gr::work::Status::OK;
+    }
+};
+
+} // namespace
+
+const boost::ut::suite<"feedback self-successor"> selfLoopTests = [] {
+    "a block that is its own successor runs correctly under both selectors"_test = [] {
+        // `onNewlyReady` skips the block currently running: it is out of the heap and is re-pushed
+        // once its job completes, so without that guard a self-edge inserts a duplicate entry and the
+        // block can be popped a second time with an empty queue.
+        constexpr gr::Size_t kSamples = 2048U;
+
+        for (const auto strategy : {gr::scheduler::SelectionStrategy::linearScan, gr::scheduler::SelectionStrategy::readyHeap}) {
+            gr::Graph graph;
+            auto&     src  = graph.emplaceBlock<gr::testing::ConstantSource<float>>({{"n_samples_max", kSamples}});
+            auto&     loop = graph.emplaceBlock<SelfLoop<float>>();
+            expect(graph.connect<"out", "in">(src, loop).has_value());
+            expect(graph.connect<"out", "loop">(loop, loop).has_value()) << fatal << "the self-edge must connect";
+
+            gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded, gr::profiling::null::Profiler, EdfPolicy> sched;
+            sched.selection_strategy = strategy;
+            expect(sched.exchange(std::move(graph)).has_value());
+            expect(sched.runAndWait().has_value()) << "a self-edge must not wedge or crash the selector";
+            expect(eq(loop.processed, static_cast<std::size_t>(kSamples))) << "and every sample must still be processed exactly once";
+        }
+    };
+};
+
 int main() { /* tests are statically executed */ }

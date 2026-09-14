@@ -370,7 +370,6 @@ const boost::ut::suite<"readiness edge cases"> edgeCaseTests = [] {
         gr::BlockModel& source    = *graph.blocks()[0];
         const Readiness readiness = inputReadiness(source, gr::scheduler::detail::releaseThreshold(source));
 
-        expect(!readiness.unbounded()) << "a connected source must not report unbounded availability";
         expect(readiness.runnable) << "an empty downstream buffer is space to write into";
         expect(lt(readiness.available, gr::undefined_size));
         expect(gt(readiness.available, 0UZ));

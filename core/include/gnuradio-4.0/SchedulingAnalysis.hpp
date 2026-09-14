@@ -255,11 +255,6 @@ template<typename TPortEntry>
 struct Readiness {
     std::size_t available = 0UZ;
     bool        runnable  = false;
-
-    /// Nothing connected constrains `available`, so a batch cannot be derived from it and must come
-    /// from the block's ceiling instead -- and no job may be issued where that ceiling is itself
-    /// unbounded, since `work(SIZE_MAX)` is not a batch.
-    [[nodiscard]] constexpr bool unbounded() const noexcept { return available == gr::undefined_size; }
 };
 
 /// N.B. forces a re-read of the port caches: an upstream publish leaves the consumer's
@@ -376,7 +371,10 @@ inline void releaseIfEligible(BlockModel& block, SchedState& state, std::chrono:
     // tag; `work(1)` there reports DONE.
     const std::size_t batch = std::min(std::max(unassigned, 1UZ), state.batchCeiling);
     if (batch == 0UZ || batch == kUnboundedBatch || batch == gr::undefined_size) {
-        return; // `work(SIZE_MAX)` is not a batch -- nothing connected bounds this one
+        // Defence in depth. `combineGating()` only ever folds in *connected* ports, so availability
+        // cannot come back as `undefined_size` and this cannot currently fire -- but `work(SIZE_MAX)`
+        // is not a batch, and the guard is one comparison.
+        return;
     }
 
     const double deadlineSeconds = state.relativeDeadlineSeconds > 0.0 ? state.relativeDeadlineSeconds : state.periodSeconds;
