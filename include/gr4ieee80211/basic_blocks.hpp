@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <complex>
+#include <time.h>
 #include <numeric>
 #include <vector>
 
@@ -39,15 +40,42 @@ struct Throttle : gr::Block<Throttle<T>>, gr::BlockingSync<Throttle<T>> {
     float      sample_rate         = 10e6f;
     gr::Size_t chunk_size          = 4096U;
     bool       use_internal_thread = true;
+    // catch_up: when behind schedule, release everything that is due in one
+    // call (GR3's thread loops without sleeping until it has caught up; a GR4
+    // block gets one call per scheduler pass, so a per-call cap of chunk_size
+    // drains a backlog only chunk_size per pass).  false = BlockingSync's cap.
+    bool       catch_up            = false;
 
-    GR_MAKE_REFLECTABLE(Throttle, in, out, sample_rate, chunk_size, use_internal_thread);
+    GR_MAKE_REFLECTABLE(Throttle, in, out, sample_rate, chunk_size, use_internal_thread, catch_up);
+
+    uint64_t _calls = 0, _released = 0, _last_call_ns = 0, _max_gap_ns = 0, _max_backlog = 0, _sum_gap_ns = 0;
+    static uint64_t nowNs() { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return static_cast<uint64_t>(t.tv_sec) * 1000000000ull + static_cast<uint64_t>(t.tv_nsec); }
 
     void start() { this->blockingSyncStart(); }
     void stop() { this->blockingSyncStop(); }
 
     gr::work::Status processBulk(gr::InputSpanLike auto& input, gr::OutputSpanLike auto& output) {
         const std::size_t avail = std::min(input.size(), output.size());
-        const std::size_t n     = this->syncSamples(avail);
+        const uint64_t    now   = nowNs();
+        if (_last_call_ns) { const uint64_t g = now - _last_call_ns; _sum_gap_ns += g; if (g > _max_gap_ns) { _max_gap_ns = g; } }
+        _last_call_ns = now;
+        _calls++;
+        // how far behind: samples due since the start minus samples released
+        const double due_total = std::chrono::duration<double>(std::chrono::system_clock::now() - this->blockingSyncStartTime()).count() * static_cast<double>(sample_rate);
+        const uint64_t backlog = due_total > static_cast<double>(_released) ? static_cast<uint64_t>(due_total - static_cast<double>(_released)) : 0;
+        if (backlog > _max_backlog) { _max_backlog = backlog; }
+        std::size_t n;
+        if (catch_up) {
+            const std::size_t due = std::min(avail, static_cast<std::size_t>(backlog));
+            n = due;
+            // keep BlockingSync's clock in step: consume the same count from it
+            std::size_t left = n;
+            while (left > 0) { const std::size_t k = this->syncSamples(left); if (k == 0) { break; } left -= k; }
+            n -= left;
+        } else {
+            n = this->syncSamples(avail);
+        }
+        _released += n;
         if (n == 0) {
             std::ignore = input.consume(0);
             output.publish(0);

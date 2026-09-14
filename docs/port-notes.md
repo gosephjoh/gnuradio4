@@ -108,6 +108,68 @@ blocks.
   (`max|Δ| ≤ 1e-5`, NMSE ≤ −80 dB) and the decoded planes are bit-exact,
   which is exactly what `compare --rx-only` asserts.
 
+## The standalone generator, `gen4`
+
+`apps/gen4.cpp` + `include/gr4ieee80211/wifi_tx.hpp` reproduce the GR3
+project's `gen-input` + `tx_capture` with no GNU Radio of either generation:
+GR3's payload rules (`mt19937_64` bodies, u32 sequence numbers, a second
+generator for `--payload-range`), `mac.cc`'s header and CRC, the mapper
+pipeline of `lib/utils.cc`, the SIGNAL field, the constellations, the
+carrier allocator with the generated tables (`wifi_tables.h`, copied from
+the GR3 project), an unnormalised radix-2 inverse FFT with GR3's
+`1/sqrt(52)` window and input-half swap, the cyclic prefixer with its
+rolloff-2 flanks, `packet_pad2`, and GR3's own noise generator
+(`gr::random`: xoroshiro128+ seeded through splitmix64 and a jump,
+`std::uniform_real_distribution<float>`, Marsaglia-polar `gasdev`, the
+complex source's `ampl / sqrt(2)` and right-to-left argument evaluation).
+Checked against GR3-generated cells with `scripts/check-gen4.py`:
+`payloads.bin` and `manifest.json`'s `frames[]` identical; `tx_samples.cf32`
+and `rx_stimulus.cf32` `max|Δ|` 6e-7 (NMSE −141 dB, a third of the samples
+bit-identical) on the 300 B/200-frame cell and the 8–1500 B/1000-frame cell.
+Two facts that cost a retry each: `xoroshiro128p_seed` increments `state[0]`
+inside `splitmix64_next` before it becomes the seed word, and the complex
+noise source scales by `1/sqrt(2)`.
+
+## Why GR4's response-time tail was worse, and the two knobs that fix it
+
+The user's 20 Msps run: GR3 p50 977 / p95 1582 / p99 2119 / max 6704 µs;
+GR4 p50 657 / p95 6791 / p99 9927 / max 34985 µs. The slow GR4 frames came
+in long runs (mean 23 consecutive frames above p95, max 757; GR3: mean 2.4)
+with latency decreasing ~70 µs per frame along a run: a backlog draining.
+Measured causes (`results/latency_knobs.md`, per-thread `ps -T` and the
+throttle's gap/backlog counters in `latency_summary.json`):
+
+1. **Every worker of this tree's multi-threaded scheduler busy-polls.** One
+   receiver at 20 Msps shows 8 workers at 91–98 % CPU; at 10 Msps too. With a
+   worker per hardware thread, the throttle's timer thread (IO pool), the
+   main thread and the OS preempt spinners, and a block's turn on its worker
+   waits behind its list-mates: the longest gap between two throttle calls
+   was 18.6 ms, the deepest backlog 650k samples.
+2. **A work call takes the whole buffer** — 65 536 items, 3.3 ms of air at
+   20 Msps — so one slow block's turn delays every block sharing its worker
+   by milliseconds. GR3 offers at most 4 096 items per call.
+
+`--threads 6` (two hardware threads left free) cuts the worst throttle gap
+to 3.3 ms; `--buffer 8192` (GR3's size) restores fine interleaving; both
+together give p50 624 / p95 920 / p99 1070 / max 5755 µs at 20 Msps and
+p50 209 / p95 356 / p99 764 µs at 10 Msps — ahead of GR3 on every percentile
+while holding real time. `--buffer 8192` alone collapses the tail but the
+throttle then falls behind (its call rate is bound to the scheduler pass
+rate); `--batch 4096` (`max_batch_size`) alone changes nothing; `--single`
+cannot keep up at 20 Msps. `rt-run4` therefore defaults to
+`hardware threads − 2` and 8 192; the binary keeps GR4's defaults.
+
+Consequence for the CPU comparison: GR4's "cores busy" equals its worker
+count whatever the load (six workers at 100 % for one receiver *and* for
+two), where GR3 measured 2.3 and 4.7 cores. Compare GR4 pool sizes, not
+utilisation, against GR3's core counts.
+
+A defect of this port found on the way: the experiment binary read the
+stamps after the scheduler — which owns the graph and the blocks — had gone
+out of scope; two frames per run showed an impossible arrival stamp of 0
+and the throttle counters read garbage. Fixed (the scheduler now outlives
+the reporting); every number above is from the fixed binary.
+
 ## Diagnostics kept in the code
 
 Per-stage item and tag counters are in every own block and reported under

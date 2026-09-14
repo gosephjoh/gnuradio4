@@ -22,7 +22,10 @@ set(USE_CCACHE OFF CACHE BOOL "" FORCE)
 set(GR_ENABLE_HTTP OFF CACHE STRING "" FORCE)
 add_subdirectory(${GNURADIO4_DIR} gnuradio4 EXCLUDE_FROM_ALL)
 
-find_package(nlohmann_json REQUIRED)
+# nlohmann/json is vendored (third_party/, MIT) so the tree builds on a machine
+# without the -dev package; a system copy is not needed.
+add_library(gr4json INTERFACE)
+target_include_directories(gr4json INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
 
 # The receiver blocks: header-only, GR3's flags (-O3 -msse2, no -march=native)
 add_library(gr4ieee80211 INTERFACE)
@@ -37,7 +40,7 @@ add_library(gr4chain STATIC src/chain.cpp)
 target_link_libraries(gr4chain PUBLIC gr4ieee80211)
 
 add_executable(rx_latency4 apps/rx_latency4.cpp)
-target_link_libraries(rx_latency4 PRIVATE gr4chain nlohmann_json::nlohmann_json)
+target_link_libraries(rx_latency4 PRIVATE gr4chain gr4json)
 # libgnuradio-core.a (PluginLoader) needs the registry symbols from the shared
 # blocklib-core, which the linker would otherwise discard as unneeded
 target_link_options(rx_latency4 PRIVATE -Wl,--no-as-needed)
@@ -48,3 +51,9 @@ target_link_libraries(hello PRIVATE gnuradio4::gnuradio-core gnuradio4::gnuradio
 add_executable(probe apps/probe.cpp)
 target_link_libraries(probe PRIVATE gr4chain)
 target_link_options(probe PRIVATE -Wl,--no-as-needed)
+
+# The standalone sample generator: no GNU Radio of either generation.
+add_executable(gen4 apps/gen4.cpp)
+target_include_directories(gen4 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(gen4 PRIVATE gr4json)
+target_compile_options(gen4 PRIVATE -O2 -msse2)

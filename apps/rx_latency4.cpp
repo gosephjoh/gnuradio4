@@ -16,6 +16,7 @@
  */
 #include <gnuradio-4.0/Graph.hpp>
 #include <gnuradio-4.0/Scheduler.hpp>
+#include <gnuradio-4.0/thread/thread_pool.hpp>
 
 #include "gr4ieee80211/chain.hpp"
 
@@ -29,6 +30,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <print>
 #include <thread>
 #include <vector>
@@ -47,6 +49,11 @@ struct Options {
     double      timeout_s   = 300.0;
     bool        record      = false;
     bool        check       = true;
+    std::size_t buffer      = 0;
+    bool        catch_up    = false;
+    bool        single      = false;
+    unsigned    threads     = 0;   // CPU pool size; 0 = GR4 default (hardware_concurrency)
+    unsigned    batch       = 0;
 };
 
 void usage() {
@@ -61,7 +68,12 @@ void usage() {
         "  --deadline-ms F     default 100\n"
         "  --timeout-s S       default 300\n"
         "  --record            write rx_pdus.bin/rx_log.csv/rx_symbols.* (chain 0) for compare\n"
-        "  --no-check          do not compare decoded payloads against payloads.bin");
+        "  --no-check          do not compare decoded payloads against payloads.bin\n"
+        "  --buffer N          edge buffer size in items (default GR4's 65536)\n"
+        "  --catch-up          throttle releases the whole backlog when behind\n"
+        "  --single            single-threaded scheduler\n"
+        "  --threads N         CPU thread-pool size (default: hardware threads)\n"
+        "  --batch N           max_batch_size on every block (default 0 = unbounded)");
 }
 
 double percentile(const std::vector<double>& sorted, double q) {
@@ -77,7 +89,7 @@ double percentile(const std::vector<double>& sorted, double q) {
 
 int main(int argc, char** argv) {
     Options opt;
-    static const struct option kOpts[] = {{"run-dir", required_argument, nullptr, 1}, {"input", required_argument, nullptr, 2}, {"out-dir", required_argument, nullptr, 3}, {"rate", required_argument, nullptr, 4}, {"chunk", required_argument, nullptr, 5}, {"chains", required_argument, nullptr, 6}, {"deadline-ms", required_argument, nullptr, 7}, {"timeout-s", required_argument, nullptr, 8}, {"record", no_argument, nullptr, 9}, {"no-check", no_argument, nullptr, 10}, {"help", no_argument, nullptr, 'h'}, {nullptr, 0, nullptr, 0}};
+    static const struct option kOpts[] = {{"run-dir", required_argument, nullptr, 1}, {"input", required_argument, nullptr, 2}, {"out-dir", required_argument, nullptr, 3}, {"rate", required_argument, nullptr, 4}, {"chunk", required_argument, nullptr, 5}, {"chains", required_argument, nullptr, 6}, {"deadline-ms", required_argument, nullptr, 7}, {"timeout-s", required_argument, nullptr, 8}, {"record", no_argument, nullptr, 9}, {"no-check", no_argument, nullptr, 10}, {"buffer", required_argument, nullptr, 11}, {"catch-up", no_argument, nullptr, 12}, {"single", no_argument, nullptr, 13}, {"threads", required_argument, nullptr, 14}, {"batch", required_argument, nullptr, 15}, {"help", no_argument, nullptr, 'h'}, {nullptr, 0, nullptr, 0}};
     int c;
     while ((c = getopt_long(argc, argv, "h", kOpts, nullptr)) != -1) {
         switch (c) {
@@ -91,6 +103,11 @@ int main(int argc, char** argv) {
         case 8: opt.timeout_s = std::atof(optarg); break;
         case 9: opt.record = true; break;
         case 10: opt.check = false; break;
+        case 11: opt.buffer = std::strtoul(optarg, nullptr, 10); break;
+        case 12: opt.catch_up = true; break;
+        case 13: opt.single = true; break;
+        case 14: opt.threads = static_cast<unsigned>(std::strtoul(optarg, nullptr, 10)); break;
+        case 15: opt.batch = static_cast<unsigned>(std::strtoul(optarg, nullptr, 10)); break;
         default: usage(); return 2;
         }
     }
@@ -177,6 +194,9 @@ int main(int argc, char** argv) {
         cfg.record      = opt.record && k == 0;
         cfg.out_dir     = opt.out_dir;
         cfg.prefix      = "c" + std::to_string(k) + "_";
+        cfg.buffer      = opt.buffer;
+        cfg.catch_up    = opt.catch_up;
+        cfg.batch       = opt.batch;
         ChainBlocks cb  = buildChain(graph, cfg);
         cb.stamper->setFrames(first, last);
         cb.sink->setFrames(frames);
@@ -190,30 +210,52 @@ int main(int argc, char** argv) {
         chains.push_back(std::move(cb));
     }
     const unsigned hw_threads = std::thread::hardware_concurrency();
+    if (opt.threads > 0) {
+        using namespace gr::thread_pool;
+        auto cpu = std::make_shared<ThreadPoolWrapper>(std::make_unique<BasicThreadPool>(std::string(kDefaultCpuPoolId), TaskType::CPU_BOUND, opt.threads, opt.threads), "CPU");
+        gr::thread_pool::Manager::instance().replacePool(std::string(kDefaultCpuPoolId), std::move(cpu));
+    }
+    const unsigned pool_threads = opt.threads > 0 ? opt.threads : hw_threads;
 
     std::println(stderr, "rx_latency4: replaying {} ({} frames) at {}, {} chain(s) x {} blocks, deadline {} ms, scheduler multiThreaded on {} hw threads", opt.input, frames, opt.rate > 0 ? std::format("{} Msample/s chunk {}", opt.rate / 1e6, opt.chunk) : std::string("unthrottled"), opt.chains, chains[0].block_count, opt.deadline_ms, hw_threads);
 
-    gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multiThreaded> sched;
-    if (auto r = sched.exchange(std::move(graph)); !r) {
-        std::println(stderr, "rx_latency4: scheduler exchange failed: {}", r.error().message);
-        return 1;
-    }
     std::atomic<bool> timed_out{false}, finished{false};
-    std::thread watchdog([&] {
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::duration<double>(opt.timeout_s);
-        while (!finished.load() && std::chrono::steady_clock::now() < deadline) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    double elapsed_s = 0;
+    bool   ok        = false;
+    auto run = [&](auto& sched) {
+        if (auto r = sched.exchange(std::move(graph)); !r) {
+            std::println(stderr, "rx_latency4: scheduler exchange failed: {}", r.error().message);
+            return false;
         }
-        if (!finished.load()) {
-            timed_out = true;
-            sched.requestStop();
-        }
-    });
-    const auto t0 = std::chrono::steady_clock::now();
-    const bool ok = sched.runAndWait().has_value() && !timed_out.load();
-    const double elapsed_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-    finished = true;
-    watchdog.join();
+        std::thread watchdog([&] {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::duration<double>(opt.timeout_s);
+            while (!finished.load() && std::chrono::steady_clock::now() < deadline) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+            if (!finished.load()) {
+                timed_out = true;
+                sched.requestStop();
+            }
+        });
+        const auto t0 = std::chrono::steady_clock::now();
+        ok            = sched.runAndWait().has_value() && !timed_out.load();
+        elapsed_s     = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        finished      = true;
+        watchdog.join();
+        return true;
+    };
+    // The scheduler owns the graph and therefore the blocks whose tables are
+    // read below: it must outlive the reporting (an earlier version let it go
+    // out of scope here and read freed memory).
+    std::unique_ptr<gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded>> sched_single;
+    std::unique_ptr<gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multiThreaded>>  sched_multi;
+    if (opt.single) {
+        sched_single = std::make_unique<gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded>>();
+        if (!run(*sched_single)) { return 1; }
+    } else {
+        sched_multi = std::make_unique<gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multiThreaded>>();
+        if (!run(*sched_multi)) { return 1; }
+    }
 
     // ---- latency.csv + latency_summary.json ------------------------------
     const std::string csv_path = opt.out_dir + "/latency.csv";
@@ -264,7 +306,7 @@ int main(int argc, char** argv) {
         const double p50 = percentile(lat, 0.50), p95 = percentile(lat, 0.95), p99 = percentile(lat, 0.99);
         const double mx = lat.empty() ? std::nan("") : lat.back(), mn = lat.empty() ? std::nan("") : lat.front();
         const ChainCounters cc = cb.counters();
-        json s = {{"chain", k}, {"frames", frames}, {"decoded", cb.sink->_count}, {"missing", missing_n}, {"missing_seqs", missing}, {"duplicates", cb.sink->_duplicates}, {"unpairable", cb.sink->_unpairable}, {"wrong_payload", opt.check ? json(cb.sink->_wrong_payload) : json(nullptr)}, {"wrong_seqs", wrong}, {"unstamped", unstamped}, {"samples_seen", cb.stamper->_items}, {"first_us", first_us}, {"min_us", mn}, {"p50_us", p50}, {"p95_us", p95}, {"p99_us", p99}, {"max_us", mx}, {"deadline_misses", misses}, {"counts", {{"sync_short_detections", cc.sync_short_detections}, {"sync_long_frames", cc.sync_long_frames}, {"signal_ok", cc.signal_ok}, {"signal_bad", cc.signal_bad}, {"frames_started", cc.frames_started}, {"frames_decoded", cc.frames_decoded}, {"crc_failed", cc.crc_failed}, {"too_large", cc.too_large}, {"sl_neg_tags", cc.sl_neg_tags}, {"sl_far_tags", cc.sl_far_tags}, {"sl_tags_seen", cc.sl_tags_seen}, {"sl_max_copy_run", cc.sl_max_copy_run}, {"sl_short_calls", cc.sl_short_calls}, {"fft_tags_in", cc.fft_tags_in}, {"fft_tags_out", cc.fft_tags_out}, {"eq_tags_in", cc.eq_tags_in}}}};
+        json s = {{"chain", k}, {"frames", frames}, {"decoded", cb.sink->_count}, {"missing", missing_n}, {"missing_seqs", missing}, {"duplicates", cb.sink->_duplicates}, {"unpairable", cb.sink->_unpairable}, {"wrong_payload", opt.check ? json(cb.sink->_wrong_payload) : json(nullptr)}, {"wrong_seqs", wrong}, {"unstamped", unstamped}, {"samples_seen", cb.stamper->_items}, {"first_us", first_us}, {"min_us", mn}, {"p50_us", p50}, {"p95_us", p95}, {"p99_us", p99}, {"max_us", mx}, {"deadline_misses", misses}, {"counts", {{"sync_short_detections", cc.sync_short_detections}, {"sync_long_frames", cc.sync_long_frames}, {"signal_ok", cc.signal_ok}, {"signal_bad", cc.signal_bad}, {"frames_started", cc.frames_started}, {"frames_decoded", cc.frames_decoded}, {"crc_failed", cc.crc_failed}, {"too_large", cc.too_large}, {"sl_neg_tags", cc.sl_neg_tags}, {"sl_far_tags", cc.sl_far_tags}, {"sl_tags_seen", cc.sl_tags_seen}, {"sl_max_copy_run", cc.sl_max_copy_run}, {"sl_short_calls", cc.sl_short_calls}, {"fft_tags_in", cc.fft_tags_in}, {"fft_tags_out", cc.fft_tags_out}, {"eq_tags_in", cc.eq_tags_in}, {"src_calls", cc.src_calls}, {"src_max_read_us", cc.src_max_read_ns / 1e3}, {"src_mean_read_us", cc.src_calls ? cc.src_sum_read_ns / 1e3 / cc.src_calls : 0.0}, {"src_max_read_items", cc.src_max_read_items}, {"thr_calls", cc.thr_calls}, {"thr_max_gap_us", cc.thr_max_gap_ns / 1e3}, {"thr_mean_gap_us", cc.thr_calls ? cc.thr_sum_gap_ns / 1e3 / cc.thr_calls : 0.0}, {"thr_max_backlog_samples", cc.thr_max_backlog}, {"stamper_reentry", cc.stamper_reentry}}}};
         per_chain.push_back(s);
         decoded_total += cb.sink->_count;
         missing_total += missing_n;
@@ -274,7 +316,7 @@ int main(int argc, char** argv) {
     }
     std::fclose(csv);
 
-    json summary = {{"app", "rx_latency4"}, {"runtime", "gnuradio4"}, {"scheduler", "Simple<multiThreaded>"}, {"hw_threads", hw_threads}, {"chains", opt.chains}, {"order_mode", order_mode}, {"blocks_per_chain", chains[0].block_count}, {"frames", frames}, {"decoded_total", decoded_total}, {"missing_total", missing_total}, {"wrong_payload_total", opt.check ? json(wrong_total) : json(nullptr)}, {"deadline_misses_total", misses_total}, {"elapsed_s", elapsed_s}, {"latency", {{"rate", opt.rate}, {"chunk", opt.chunk}, {"deadline_ms", opt.deadline_ms}, {"stamp_bias_max_us", opt.rate > 0 ? opt.chunk / opt.rate * 1e6 : 0.0}, {"input", opt.input}}}, {"result", ok ? "ok" : (timed_out.load() ? "timeout" : "error")}, {"per_chain", per_chain}};
+    json summary = {{"app", "rx_latency4"}, {"runtime", "gnuradio4"}, {"scheduler", opt.single ? "Simple<singleThreaded>" : "Simple<multiThreaded>"}, {"buffer", opt.buffer}, {"catch_up", opt.catch_up}, {"threads", pool_threads}, {"batch", opt.batch}, {"hw_threads", hw_threads}, {"chains", opt.chains}, {"order_mode", order_mode}, {"blocks_per_chain", chains[0].block_count}, {"frames", frames}, {"decoded_total", decoded_total}, {"missing_total", missing_total}, {"wrong_payload_total", opt.check ? json(wrong_total) : json(nullptr)}, {"deadline_misses_total", misses_total}, {"elapsed_s", elapsed_s}, {"latency", {{"rate", opt.rate}, {"chunk", opt.chunk}, {"deadline_ms", opt.deadline_ms}, {"stamp_bias_max_us", opt.rate > 0 ? opt.chunk / opt.rate * 1e6 : 0.0}, {"input", opt.input}}}, {"result", ok ? "ok" : (timed_out.load() ? "timeout" : "error")}, {"per_chain", per_chain}};
     {
         std::ofstream f(opt.out_dir + "/latency_summary.json");
         f << summary.dump(2) << "\n";

@@ -16,6 +16,7 @@
 
 #include <cstdio>
 #include <string>
+#include <time.h>
 
 namespace gr4wifi {
 
@@ -31,6 +32,7 @@ struct FileSourceRaw : gr::Block<FileSourceRaw<T>> {
 
     std::FILE* _f     = nullptr;
     uint64_t   _items = 0;
+    uint64_t   _calls = 0, _max_read_ns = 0, _sum_read_ns = 0, _max_read_items = 0;
 
     void start() {
         _f = std::fopen(file_name.c_str(), "rb");
@@ -51,7 +53,15 @@ struct FileSourceRaw : gr::Block<FileSourceRaw<T>> {
             sOut.publish(0);
             return gr::work::Status::DONE;
         }
+        struct timespec a, b;
+        clock_gettime(CLOCK_MONOTONIC, &a);
         const std::size_t n = std::fread(sOut.data(), sizeof(T), sOut.size(), _f);
+        clock_gettime(CLOCK_MONOTONIC, &b);
+        const uint64_t dt = static_cast<uint64_t>(b.tv_sec - a.tv_sec) * 1000000000ull + static_cast<uint64_t>(b.tv_nsec - a.tv_nsec);
+        _calls++;
+        _sum_read_ns += dt;
+        if (dt > _max_read_ns) { _max_read_ns = dt; }
+        if (n > _max_read_items) { _max_read_items = n; }
         _items += n;
         sOut.publish(n);
         if (n < sOut.size()) {

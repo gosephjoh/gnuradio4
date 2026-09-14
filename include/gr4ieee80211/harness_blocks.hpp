@@ -44,6 +44,8 @@ struct ArrivalStamper : gr::Block<ArrivalStamper> {
     std::vector<uint64_t> _t_first, _t_last;
     std::size_t           _next  = 0;
     uint64_t              _items = 0;
+    std::atomic<int>      _busy{0};
+    uint64_t              _reentry = 0; // processBulk entered while another call was running
 
     void setFrames(const std::vector<uint64_t>& first, const std::vector<uint64_t>& last) {
         _events.clear();
@@ -56,6 +58,7 @@ struct ArrivalStamper : gr::Block<ArrivalStamper> {
     }
 
     gr::work::Status processBulk(gr::InputSpanLike auto& sIn) {
+        if (_busy.fetch_add(1) != 0) { _reentry++; }
         const uint64_t end = _items + sIn.size();
         if (_next < _events.size() && _events[_next].offset < end) {
             const uint64_t now = monotonic_ns();
@@ -66,6 +69,7 @@ struct ArrivalStamper : gr::Block<ArrivalStamper> {
             }
         }
         _items = end;
+        _busy.fetch_sub(1);
         return gr::work::Status::OK;
     }
 };

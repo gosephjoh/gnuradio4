@@ -19,22 +19,33 @@ then compared packet for packet between the two runtimes.
 
 ```
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=g++-15
-cmake --build build -j1 --target rx_latency4      # ~6 min the first time; one TU needs 2.4 GB
+cmake --build build -j1 --target rx_latency4 gen4    # ~6 min the first time; one TU needs 2.4 GB
 ```
 
 ## Quick start — generate samples, run, read the response times
 
-All commands run from this folder (`cd ~/gr4-ieee80211`). The GR3 project
-must be built too (`~/gr3-ieee802-11-project/build/`): it generates the
-samples, and its `compare` tool is the correctness judge.
+All commands run from this folder (`cd ~/gr4-ieee80211`). Nothing here needs
+the GR3 project: the sample generator (`gen4`) is standalone, and the only
+thing that does need GR3 is the optional fixture gate (`scripts/gate4`).
+
+### 0. Moving it to another machine
+
+Copy two directories: this repo and the GR4 tree it builds against
+(`~/gnuradio4`, fork `gosephjoh/gnuradio4`, branch `modular-scheduling`,
+commit `29320de`; set `-DGNURADIO4_DIR=/path` if it is not at `~/gnuradio4`).
+Needs GCC 15 (or Clang 20), CMake ≥ 3.27, Python 3 with numpy for the check
+scripts, about 2.5 GB of RAM for the one heavy translation unit, and network
+access at configure time for GR4's own dependency (`vir-simd`). The JSON
+library is vendored under `third_party/`.
 
 ### 1. Generate the samples
 
 One command takes the same levers as GR3's `rt-run` and makes (or reuses)
-the sample file, so GR3 and GR4 replay identical bytes:
+the sample file with this repo's own generator:
 
 ```
-./scripts/rt-run4 MIN MAX RATE CHAINS [--packets N] [--mcs NAME] [--seed S] [--chunk N] [--deadline-ms F] [--run]
+./scripts/rt-run4 MIN MAX RATE CHAINS [--packets N] [--mcs NAME] [--seed S] [--chunk N] [--deadline-ms F]
+                                      [--threads N] [--buffer N] [--gr3-cell DIR] [--run]
 
 ./scripts/rt-run4 8 1500 10e6 1 --packets 1000       # payloads 8..1500 B, 1000 packets, real time, one receiver
 ./scripts/rt-run4 300 300 10e6 2 --packets 102934    # one payload size, 60 s of air, two receivers
@@ -43,15 +54,26 @@ the sample file, so GR3 and GR4 replay identical bytes:
 - `MIN MAX` payload bytes, drawn uniformly per packet; `MIN == MAX` is one size (8..1500).
 - `RATE` throttle in samples/s: `10e6` = 802.11p real time, `20e6` twice that, `0` unthrottled.
 - `CHAINS` concurrent receivers on the same file in one process.
-- The cell lands in `~/gr3-ieee802-11-project/data/phase10/rt_<MIN>_<MAX>_<N>_<MCS>_s<seed>/`
-  (4.8 GB and ~65 s per 60-second cell, once; reused afterwards). Without `--run`
+- `--threads` / `--buffer` are the two scheduler knobs `results/latency_knobs.md`
+  measured: GR4's stock defaults (a busy-polling worker per hardware thread,
+  65 536-item buffers) gave a p95 five times GR3's; `rt-run4` defaults to
+  hardware threads − 2 and 8 192-item buffers, which beat GR3 on every
+  percentile. `--threads 0 --buffer 0` restores GR4's defaults.
+- The cell lands in `data/rt_<MIN>_<MAX>_<N>_<MCS>_s<seed>/` here (4.8 GB and
+  under a minute per 60-second cell, once; reused afterwards). Without `--run`
   the script only generates and **prints the commands** below, so you can start
   `htop -t` in another terminal first.
+- `gen4` reproduces the GR3 project's generator: same `payloads.bin` and
+  manifest byte for byte, samples equal to float rounding (`max|Δ|` 6e-7
+  against GR3's files, `scripts/check-gen4.py`), same noise generator. Two
+  machines running the same `rt-run4` line replay the same bytes. On a box
+  that also has the GR3 project, `--gr3-cell DIR` replays a GR3-generated cell
+  instead, for a comparison on literally identical files.
 
 To generate by hand instead (what `rt-run4` calls):
 
 ```
-( cd ~/gr3-ieee802-11-project && ./scripts/rt-gen 300 300 102934 --out data/phase10/rt_300_300_102934_QPSK_1_2_s1 )
+./build/gen4 --out data/rt_300_300_102934_QPSK_1_2_s1 --frames 102934 --payload-range 300,300 --mcs QPSK_1_2 --seed 1
 ```
 
 ### 2. Execute
@@ -59,17 +81,20 @@ To generate by hand instead (what `rt-run4` calls):
 Either add `--run` to the `rt-run4` line, or run the receiver line it printed:
 
 ```
-./build/rx_latency4 --run-dir ~/gr3-ieee802-11-project/data/phase10/rt_300_300_102934_QPSK_1_2_s1 \
-    --input ~/gr3-ieee802-11-project/data/phase10/rt_300_300_102934_QPSK_1_2_s1/rx_stimulus.cf32 \
-    --out-dir ~/gr3-ieee802-11-project/data/phase10/rt_300_300_102934_QPSK_1_2_s1/runs4/rate10000000_chains2 \
+./build/rx_latency4 --run-dir data/rt_300_300_102934_QPSK_1_2_s1 \
+    --input data/rt_300_300_102934_QPSK_1_2_s1/rx_stimulus.cf32 \
+    --out-dir data/rt_300_300_102934_QPSK_1_2_s1/runs4/rate10000000_chains2 \
     --rate 10000000 --chains 2 --chunk 4096 --deadline-ms 100
 ```
 
 While it runs, `htop -t` shows the GR4 scheduler's worker threads
-`default_cpu#1..8` (one per hardware thread on this box), the IO-pool threads
-`default_io#k` that run the throttles' timers, and the main thread. GR4 is
-not thread-per-block, so there is no thread per receiver block as with GR3;
-the per-block picture comes from the stage counters in `latency_summary.json`.
+`default_cpu#k` (six by default here, one per hardware thread with
+`--threads 0`), the IO-pool threads `default_io#k` that run the throttles'
+timers, and the main thread. **Every worker runs at ~100 % whatever the
+load**: this GR4 tree's multi-threaded scheduler busy-polls, so GR4's CPU
+figure is the pool size, not the work. GR4 is not thread-per-block, so there
+is no thread per receiver block as with GR3; the per-block picture comes from
+the stage counters in `latency_summary.json`.
 The run ends by itself at the end of the file; a per-chain line is printed:
 
 ```
@@ -79,11 +104,10 @@ rx_latency4: chain 0 -- 102934/102934 decoded, 0 missing, 0 dup, 0 unpairable, 0
 
 ### 3. Look at the response times
 
-Outputs are in `<cell>/runs4/rate<R>_chains<C>/`, beside GR3's `runs/` for the
-same configuration:
+Outputs are in `<cell>/runs4/rate<R>_chains<C>/`:
 
 ```
-OUT=~/gr3-ieee802-11-project/data/phase10/rt_300_300_102934_QPSK_1_2_s1/runs4/rate10000000_chains2
+OUT=data/rt_300_300_102934_QPSK_1_2_s1/runs4/rate10000000_chains2
 
 # the summary: per chain decoded/frames, p50/p95/p99/max of last-sample-to-decode, deadline misses
 python3 -c "import json; s=json.load(open('$OUT/latency_summary.json')); [print('chain %d: %d/%d decoded (%s wrong payload), last->decode us p50 %.0f p95 %.0f p99 %.0f max %.0f, %d over %g ms' % (c['chain'], c['decoded'], c['frames'], c['wrong_payload'], c['p50_us'], c['p95_us'], c['p99_us'], c['max_us'], c['deadline_misses'], s['latency']['deadline_ms'])) for c in s['per_chain']]"
@@ -91,8 +115,8 @@ python3 -c "import json; s=json.load(open('$OUT/latency_summary.json')); [print(
 # every packet: chain,seq,length,t_first_ns,t_last_ns,t_decode_ns,lat_first_us,lat_last_us,decoded,correct
 head -5 $OUT/latency.csv
 
-# GR3 vs GR4 on the same cell, packet for packet (run GR3's ./scripts/rt-run for the same levers first)
-python3 scripts/compare-runs.py ${OUT/runs4/runs}/latency.csv $OUT/latency.csv
+# GR3 vs GR4 for the same levers, packet for packet (the GR3 latency.csv comes from ./scripts/rt-run there)
+python3 scripts/compare-runs.py <GR3 latency.csv> $OUT/latency.csv
 ```
 
 `lat_last_us` is the headline number: the frame's last sample released by
@@ -131,7 +155,13 @@ The binary's own options:
 ```
 ./build/rx_latency4 --run-dir DIR [--input F] [--out-dir D] [--rate SPS] [--chunk N]
                     [--chains N] [--deadline-ms F] [--timeout-s S] [--record] [--no-check]
+                    [--threads N] [--buffer N] [--batch N] [--catch-up] [--single]
 ```
+
+The binary's own defaults are GR4's (`--threads 0` = all hardware threads,
+`--buffer 0` = 65 536 items); `rt-run4` passes the tuned values. `--batch`,
+`--catch-up` and `--single` are the other knobs the investigation tried
+(`docs/port-notes.md`).
 
 `--record` adds `rx_pdus.bin`, `rx_log.csv`, `rx_symbols.cf32`, `rx_symbols.csv`
 in the GR3 formats for `compare`; `--no-check` skips the payload check. The GR3
@@ -144,7 +174,8 @@ run directory is never written to.
 python3 scripts/compare-runs.py GR3/latency.csv GR4/latency.csv
 ```
 
-`gate4` replays each of the 58 golden fixture cells of the GR3 project and
+`gate4` needs the GR3 project on the same box (its fixture and its `compare`
+tool); it is the correctness proof, not a runtime dependency. It replays each of the 58 golden fixture cells of the GR3 project and
 has the GR3 project's own `build/compare --rx-only` judge the port: the
 equalised-symbols plane within the fixture's tolerance, the decoded PDUs
 byte for byte, and a frame GR3 loses that the port decodes correctly
@@ -164,8 +195,10 @@ include/gr4ieee80211/   wifi_codec.hpp (params, tables, Viterbi, descrambler, CR
                         harness_blocks.hpp (ArrivalStamper, LatencySink, PduRecorder,
                         SymbolsRecorder), chain.hpp
 src/chain.cpp           one receiver chain wired into a gr::Graph (the heavy TU)
-apps/rx_latency4.cpp    the app; apps/probe.cpp the block-by-block diagnostic; apps/hello.cpp
-scripts/                rt-run4, gate4, compare-runs.py
+include/gr4ieee80211/wifi_tx.hpp, wifi_tables.h   the standalone transmitter (gen4)
+apps/rx_latency4.cpp    the app; apps/gen4.cpp the generator; apps/probe.cpp the diagnostic
+scripts/                rt-run4, gate4, compare-runs.py, check-gen4.py
+third_party/nlohmann    vendored JSON header (MIT)
 docs/port-notes.md      what changed and why
 results/                gate4.log, gate4.csv
 ```

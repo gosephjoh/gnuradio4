@@ -38,6 +38,9 @@ struct ChainConfig {
     bool        record      = false;
     std::string out_dir;           // for the recorders
     std::string prefix;            // block name prefix, e.g. "c0_"
+    std::size_t buffer      = 0;   // edge minBufferSize in items; 0 = GR4 default (65536)
+    bool        catch_up    = false; // Throttle::catch_up
+    unsigned    batch       = 0;     // max_batch_size on every block; 0 = GR4 default (unbounded)
 };
 
 struct ChainCounters {
@@ -48,6 +51,9 @@ struct ChainCounters {
     // items consumed per stage (diagnostics)
     uint64_t items_avgpow = 0, items_dly16 = 0, items_avgcor = 0, items_ss = 0, items_dly320 = 0, items_sl = 0, items_fft = 0, items_eq = 0, items_dec = 0;
     uint64_t calls_ss = 0, calls_sl = 0;
+    uint64_t stamper_reentry = 0;
+    uint64_t src_calls = 0, src_max_read_ns = 0, src_sum_read_ns = 0, src_max_read_items = 0;
+    uint64_t thr_calls = 0, thr_max_gap_ns = 0, thr_sum_gap_ns = 0, thr_max_backlog = 0;
     uint64_t fft_tags_in = 0, fft_tags_out = 0, eq_tags_in = 0;
     uint64_t sl_neg_tags = 0, sl_far_tags = 0, sl_tags_seen = 0, sl_max_copy_run = 0, sl_short_calls = 0;
     float    max_cor = 0;

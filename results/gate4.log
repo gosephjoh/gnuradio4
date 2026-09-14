@@ -1,4 +1,4 @@
-# gate4 -- 2026-09-14T20:06:01Z  gr4-ieee80211 8fd316e  gnuradio4 29320de  rate 0
+# gate4 -- 2026-09-14T22:36:50Z  gr4-ieee80211 0db4f38  gnuradio4 29320de  rate 0
 PASS    BPSK_1_2_10            exit 0 PASS       decoded 200/200 wrong 0 -
 PASS    BPSK_1_2_100           exit 0 PASS       decoded 200/200 wrong 0 -
 PASS    BPSK_1_2_1000          exit 0 PASS       decoded 200/200 wrong 0 -
