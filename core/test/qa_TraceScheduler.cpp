@@ -56,6 +56,14 @@ struct Chain {
 /// count for no information. One comparison, one message.
 [[nodiscard]] bool sameIds(const std::vector<gr::trace::EntityId>& lhs, const std::vector<gr::trace::EntityId>& rhs) { return std::ranges::equal(lhs, rhs); }
 
+void collectingConsumer(const gr::trace::Event& event, void* user) noexcept { static_cast<std::vector<gr::trace::Event>*>(user)->push_back(event); }
+
+[[nodiscard]] std::vector<gr::trace::Event> collect() {
+    std::vector<gr::trace::Event> events;
+    std::ignore = gr::trace::forEachEvent(collectingConsumer, &events);
+    return events;
+}
+
 [[nodiscard]] std::vector<gr::trace::EntityId> idsOf(const std::vector<const void*>& keys) {
     std::vector<gr::trace::EntityId> ids;
     ids.reserve(keys.size());
@@ -266,6 +274,159 @@ const boost::ut::suite<"TraceScheduler"> traceSchedulerTests = [] {
         expect(eq(collisions, 0UZ)) << "a new graph reused an identity from a destroyed one";
 
         std::ignore = scheduler.changeStateTo(gr::lifecycle::State::STOPPED);
+    };
+
+    "a work() pair is emitted per productive invocation, and only for productive ones"_test = [] {
+        reset();
+        setCategories(categoryMask(Category::work));
+
+        // The sink is emplaced *first* on purpose. `Simple` assigns blocks in graph order and round
+        // robin sweeps that order, so the opening passes call the sink and the copy before the source
+        // has produced anything: they return INSUFFICIENT_INPUT_ITEMS, which is the branch the filter
+        // exists to suppress. Built the natural way -- source first -- this graph never starves a
+        // block at all, and the assertion below passes without the filter being reached. That is not
+        // a hypothetical: the first version of this test did exactly that, and only a mutation (deleting
+        // the filter and watching the suite stay green) showed it up.
+        gr::Graph graph;
+        auto&     sink   = graph.emplaceBlock<gr::testing::NullSink<float>>({{"name", std::string("snk")}});
+        auto&     copy   = graph.emplaceBlock<gr::testing::Copy<float>>({{"name", std::string("mid")}});
+        auto&     source = graph.emplaceBlock<gr::testing::ConstantSource<float>>({{"name", std::string("src")}, {"n_samples_max", gr::Size_t{2048U}}});
+        std::ignore      = graph.connect<"out", "in">(source, copy);
+        std::ignore      = graph.connect<"out", "in">(copy, sink);
+
+        TestScheduler scheduler;
+        expect(scheduler.exchange(std::move(graph)).has_value() >> fatal);
+        expect(scheduler.changeStateTo(gr::lifecycle::State::INITIALISED).has_value() >> fatal);
+        expect(scheduler.changeStateTo(gr::lifecycle::State::RUNNING).has_value() >> fatal);
+        for (std::size_t pass = 0UZ; pass < 8UZ; ++pass) {
+            std::ignore = scheduler.step();
+        }
+
+        const std::vector<Event> recorded = collect();
+        expect(gt(recorded.size(), 0UZ) >> fatal) << "a running graph must produce work records";
+
+        std::size_t begins = 0UZ;
+        std::size_t ends   = 0UZ;
+        for (const Event& event : recorded) {
+            if (event.kind == Kind::workBegin) {
+                ++begins;
+                expect(eq(event.durationNs, 0U)) << "workBegin is an instant";
+            }
+            if (event.kind == Kind::workEnd) {
+                ++ends;
+                // The filter: an INSUFFICIENT_* invocation did nothing and must not be recorded as work.
+                expect(event.status != static_cast<std::int8_t>(gr::work::Status::INSUFFICIENT_INPUT_ITEMS)) << "a starved invocation must not produce a workEnd";
+                expect(event.status != static_cast<std::int8_t>(gr::work::Status::INSUFFICIENT_OUTPUT_ITEMS)) << "a blocked invocation must not produce a workEnd";
+            }
+            expect(neq(event.entity, kNoEntity)) << "every work record must name the block it came from";
+        }
+        expect(gt(begins, 0UZ));
+        expect(gt(ends, 0UZ));
+        expect(ge(begins, ends)) << "every workEnd has a workBegin; the surplus is probes and, at most, one hang";
+        expect(gt(begins, ends)) << "this graph must actually starve a block, or the filter above is never reached "
+                                    "and this scenario asserts nothing";
+
+        setCategories(0U);
+        std::ignore = scheduler.changeStateTo(gr::lifecycle::State::STOPPED);
+    };
+
+    "workEnd carries the entry instant, so execution and overhead are both recoverable"_test = [] {
+        reset();
+        setCategories(categoryMask(Category::work));
+
+        Chain chain;
+        chain.build(4096UZ);
+        TestScheduler scheduler;
+        expect(scheduler.exchange(std::move(chain.graph)).has_value() >> fatal);
+        expect(scheduler.changeStateTo(gr::lifecycle::State::INITIALISED).has_value() >> fatal);
+        expect(scheduler.changeStateTo(gr::lifecycle::State::RUNNING).has_value() >> fatal);
+        for (std::size_t pass = 0UZ; pass < 16UZ; ++pass) {
+            std::ignore = scheduler.step();
+        }
+
+        std::vector<Event> ends;
+        for (const Event& event : collect()) {
+            if (event.kind == Kind::workEnd) {
+                ends.push_back(event);
+            }
+        }
+        expect(gt(ends.size(), 1UZ) >> fatal) << "need at least two invocations to measure a gap";
+
+        // `startNs` is the *entry* instant and `durationNs` the execution time, so the end of one
+        // invocation is startNs + durationNs and the next one's startNs is where it resumed. The
+        // difference is the scheduler overhead between them -- measured, not inferred from gaps.
+        std::size_t   measurable = 0UZ;
+        std::uint64_t totalWork  = 0UL;
+        for (std::size_t i = 1UZ; i < ends.size(); ++i) {
+            const std::uint64_t previousLeft = ends[i - 1UZ].startNs + ends[i - 1UZ].durationNs;
+            expect(ge(ends[i].startNs, ends[i - 1UZ].startNs)) << "entry instants must be non-decreasing on one worker";
+            if (ends[i].startNs >= previousLeft) {
+                ++measurable;
+            }
+            totalWork += ends[i].durationNs;
+        }
+        expect(eq(measurable, ends.size() - 1UZ)) << "an invocation must not appear to start before the previous one finished";
+        expect(gt(totalWork, 0UL)) << "durations must be non-zero -- a work() that did something takes time";
+
+        setCategories(0U);
+        std::ignore = scheduler.changeStateTo(gr::lifecycle::State::STOPPED);
+    };
+
+    "the loop kind is recorded, so a round-robin trace cannot be read as an EDF one"_test = [] {
+        reset();
+        setCategories(categoryMask(Category::work));
+
+        Chain chain;
+        chain.build(2048UZ);
+        TestScheduler scheduler; // Simple<> defaults to RoundRobinPolicy
+        expect(scheduler.exchange(std::move(chain.graph)).has_value() >> fatal);
+        expect(scheduler.changeStateTo(gr::lifecycle::State::INITIALISED).has_value() >> fatal);
+        expect(scheduler.changeStateTo(gr::lifecycle::State::RUNNING).has_value() >> fatal);
+        for (std::size_t pass = 0UZ; pass < 4UZ; ++pass) {
+            std::ignore = scheduler.step();
+        }
+
+        for (const Event& event : collect()) {
+            if (event.kind == Kind::workBegin || event.kind == Kind::workEnd) {
+                expect(eq(static_cast<std::uint8_t>(event.flags & flag::kLoopKindMask), std::to_underlying(LoopKind::roundRobin))) << "the default policy's records must say round robin";
+                expect(eq(static_cast<std::uint8_t>(event.flags & flag::kJobBacked), std::uint8_t{0U})) << "round robin runs no released jobs";
+            }
+        }
+
+        setCategories(0U);
+        std::ignore = scheduler.changeStateTo(gr::lifecycle::State::STOPPED);
+    };
+
+    "tracing does not change what the scheduler does"_test = [] {
+        // Asserted on what must not change -- the samples delivered and the statuses returned --
+        // never on invocation order, which is not deterministic across workers and would make this
+        // flaky rather than meaningful.
+        const auto runOnce = [](bool traced) {
+            reset();
+            setCategories(traced ? kAllCategories : 0U);
+
+            Chain chain;
+            chain.build(8192UZ);
+            TestScheduler scheduler;
+            std::ignore = scheduler.exchange(std::move(chain.graph));
+            std::ignore = scheduler.changeStateTo(gr::lifecycle::State::INITIALISED);
+            std::ignore = scheduler.changeStateTo(gr::lifecycle::State::RUNNING);
+
+            std::vector<std::pair<std::size_t, int>> results;
+            for (std::size_t pass = 0UZ; pass < 64UZ; ++pass) {
+                const gr::work::Result result = scheduler.step();
+                results.emplace_back(result.performed_work, static_cast<int>(result.status));
+            }
+            setCategories(0U);
+            std::ignore = scheduler.changeStateTo(gr::lifecycle::State::STOPPED);
+            return results;
+        };
+
+        const auto untraced = runOnce(false);
+        const auto traced   = runOnce(true);
+
+        expect(eq(untraced.size(), traced.size()) >> fatal);
+        expect(std::ranges::equal(untraced, traced)) << "tracing changed the work::Result sequence -- the layer is not behaviour-neutral";
     };
 };
 

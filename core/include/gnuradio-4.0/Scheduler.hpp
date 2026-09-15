@@ -946,11 +946,41 @@ protected:
     /// - **`fixed`** selects the highest-priority *eligible* block each time, which is what
     ///   fixed-priority scheduling means. The list is already priority-sorted, so "highest
     ///   priority eligible" is "the earliest index that can run".
-    work::Result traverseBlockListOnce(const std::vector<std::shared_ptr<BlockModel>>& blocks, std::span<SchedState> states, std::span<ReadyEntry> readyHeap = {}) const {
+    work::Result traverseBlockListOnce(const std::vector<std::shared_ptr<BlockModel>>& blocks, std::span<SchedState> states, std::span<ReadyEntry> readyHeap = {}, std::uint8_t traceWorkerId = 0U) const {
         std::size_t performedWorkAllBlocks = 0UZ;
         bool        unfinishedBlocksExist  = false; // i.e. at least one block returned OK, INSUFFICIENT_INPUT_ITEMS, or INSUFFICIENT_OUTPU_ITEMS
 
         const auto ceilingFor = [&](std::size_t i) { return i < states.size() ? states[i].batchCeiling : static_cast<std::size_t>(max_work_items); };
+
+        // Hoisted once per pass rather than tested per invocation: the mask is a relaxed load, and a
+        // category switched on mid-pass simply takes effect on the next one (mask changes are not
+        // synchronised with emitters by design). `states` may be shorter than `blocks`, or empty --
+        // `step()` passes an empty span -- so identity falls back to `kNoEntity`, which is a valid
+        // worker-scoped record rather than an out-of-range read.
+        [[maybe_unused]] const bool traceWork  = gr::trace::kEnabled && gr::trace::categoryEnabled(gr::trace::Category::work);
+        [[maybe_unused]] const auto entityFor  = [&](std::size_t i) { return i < states.size() ? states[i].entityId : gr::trace::kNoEntity; };
+        [[maybe_unused]] const auto traceEnter = [&](std::size_t i, std::size_t requested, gr::trace::LoopKind loopKind, std::uint8_t extraFlags) -> std::uint64_t {
+            if (!traceWork) {
+                return 0UL;
+            }
+            const std::uint64_t entered = gr::trace::now();
+            gr::trace::emit(gr::trace::Event{.startNs = entered, .payload0 = gr::trace::saturate(requested), .entity = entityFor(i), .kind = gr::trace::Kind::workBegin, .workerId = traceWorkerId, .flags = static_cast<std::uint8_t>(std::to_underlying(loopKind) | extraFlags)});
+            return entered;
+        };
+        // Emitted only for an invocation that did something. The predicate is on `status`, never on
+        // `performed_work`: an all-asynchronous-input block reports `performed_work == requestedWork`
+        // having consumed nothing, and a source that publishes everything and returns DONE reports
+        // zero. Either would be recorded backwards.
+        //
+        // An unmatched `workBegin` therefore means one of two things, and a reader can tell them
+        // apart: an unproductive probe, accounted for by the `workProbe` that follows in the same
+        // sweep; or -- if it is the last record on its ring -- a `work()` that never returned.
+        [[maybe_unused]] const auto traceLeave = [&](std::size_t i, std::uint64_t entered, std::size_t requested, std::size_t performed, work::Status status, gr::trace::LoopKind loopKind, std::uint8_t extraFlags) {
+            if (!traceWork || status == work::Status::INSUFFICIENT_INPUT_ITEMS || status == work::Status::INSUFFICIENT_OUTPUT_ITEMS) {
+                return;
+            }
+            gr::trace::emit(gr::trace::Event{.startNs = entered, .durationNs = gr::trace::durationOf(entered, gr::trace::now()), .payload0 = gr::trace::saturate(requested), .payload1 = gr::trace::saturate(performed), .entity = entityFor(i), .kind = gr::trace::Kind::workEnd, .workerId = traceWorkerId, .status = static_cast<std::int8_t>(status), .flags = static_cast<std::uint8_t>(std::to_underlying(loopKind) | extraFlags)});
+        };
 
         // Backstop release pass. Covers what event-driven detection cannot reach: sources, which
         // have no producer to trigger them, and blocks fed across a worker boundary, whose
@@ -987,7 +1017,10 @@ protected:
 
         if constexpr (!selectsByPriority(TPolicy::kPriorityClass)) {
             for (std::size_t i = 0UZ; i < blocks.size(); ++i) {
-                const auto [requested_work, performed_work, status] = blocks[i]->work(ceilingFor(i));
+                const std::size_t   ceiling                         = ceilingFor(i);
+                const std::uint64_t entered                         = traceEnter(i, ceiling, gr::trace::LoopKind::roundRobin, 0U);
+                const auto [requested_work, performed_work, status] = blocks[i]->work(ceiling);
+                traceLeave(i, entered, requested_work, performed_work, status, gr::trace::LoopKind::roundRobin, 0U);
                 performedWorkAllBlocks += performed_work;
 
                 if (status == work::Status::ERROR) {
@@ -1016,7 +1049,10 @@ protected:
                     continue;
                 }
 
-                const auto [requested_work, performed_work, status] = blocks[index]->work(ceilingFor(index));
+                const std::size_t   ceiling                         = ceilingFor(index);
+                const std::uint64_t entered                         = traceEnter(index, ceiling, gr::trace::LoopKind::fixedPriority, 0U);
+                const auto [requested_work, performed_work, status] = blocks[index]->work(ceiling);
+                traceLeave(index, entered, requested_work, performed_work, status, gr::trace::LoopKind::fixedPriority, 0U);
                 performedWorkAllBlocks += performed_work;
 
                 if (status == work::Status::ERROR) {
@@ -1088,7 +1124,10 @@ protected:
 
             const auto runOne = [&](std::size_t chosen) -> std::optional<work::Result> {
                 running                                             = chosen;
-                const auto [requested_work, performed_work, status] = blocks[chosen]->work(states[chosen].jobs.front().batch);
+                const std::size_t   batch                           = states[chosen].jobs.front().batch;
+                const std::uint64_t entered                         = traceEnter(chosen, batch, gr::trace::LoopKind::jobDriven, gr::trace::flag::kJobBacked);
+                const auto [requested_work, performed_work, status] = blocks[chosen]->work(batch);
+                traceLeave(chosen, entered, requested_work, performed_work, status, gr::trace::LoopKind::jobDriven, gr::trace::flag::kJobBacked);
                 performedWorkAllBlocks += performed_work;
                 ++selections; // every iteration consumed a released job, successful or not
 
@@ -1422,7 +1461,7 @@ protected:
                     cleanupRemovedBlocks(runnerID, localBlockList);
                     idleUntilAdoption = localBlockList.empty();
                     if (!idleUntilAdoption) {
-                        gr::work::Result result = traverseBlockListOnce(localBlockList, localStates, std::span<ReadyEntry>{localReadyHeap});
+                        gr::work::Result result = traverseBlockListOnce(localBlockList, localStates, std::span<ReadyEntry>{localReadyHeap}, static_cast<std::uint8_t>(runnerID));
                         if (result.status == work::Status::DONE) {
                             break; // nothing happened -> shutdown this worker
                         } else if (result.status == work::Status::ERROR) {
