@@ -1,0 +1,128 @@
+#!/usr/bin/env python3
+"""Print the response-time results of one or more runs as a table.
+
+    rt-table [--md | --csv] [--wide] RUN [RUN ...]
+
+RUN is a run output directory (one holding latency_summary.json) or the
+summary file itself; GR3 (rx_latency) and GR4 (rx_latency4) runs mix freely,
+one row per receiver chain.  Default is an aligned text table; --md gives
+Markdown, --csv machine-readable rows; --wide adds the scheduler knobs and
+the per-stage counts.
+
+Columns: run (cell/runs/config for rt-run outputs), rt (GR3/GR4), rate (Msample/s, or
+`unthr`), ch (chain), frames, decoded, missing, wrong (payload mismatches,
+GR4 only), p50/p95/p99/max of last-sample-to-decode in microseconds, >dl
+(frames over the deadline), elapsed (s).  Percentiles are the ones the app
+computed (nearest rank over the decoded frames).
+
+Standard library only; identical copies live in the GR3 and the GR4 project.
+"""
+import csv
+import json
+import os
+import sys
+
+BASE = ["run", "rt", "rate", "ch", "frames", "decoded", "missing", "wrong", "p50_us", "p95_us", "p99_us", "max_us", ">dl", "elapsed_s"]
+WIDE = ["threads", "buffer", "chunk", "sync_short", "sync_long", "crc_fail", "first_us"]
+
+
+def load(path):
+    if os.path.isdir(path):
+        path = os.path.join(path, "latency_summary.json")
+    with open(path) as f:
+        s = json.load(f)
+    parts = os.path.normpath(os.path.dirname(os.path.abspath(path))).split(os.sep)
+    # <cell>/runs*/<config> for rt-run outputs, else the last two components
+    n = 3 if len(parts) >= 3 and parts[-2] in ("runs", "runs4") else 2
+    s["_run"] = os.sep.join(parts[-n:])
+    return s
+
+
+def rows_of(s):
+    rt = "GR4" if s.get("runtime") == "gnuradio4" or s.get("app") == "rx_latency4" else "GR3"
+    lat = s.get("latency", {})
+    rate = lat.get("rate", None)
+    rate_s = "unthr" if rate in (0, 0.0, None) else ("%g" % (rate / 1e6))
+    out = []
+    for c in s.get("per_chain", []):
+        k = c.get("counts", {})
+        wrong = c.get("wrong_payload")
+        r = {
+            "run": s["_run"], "rt": rt, "rate": rate_s, "ch": c.get("chain", 0),
+            "frames": c.get("frames"), "decoded": c.get("decoded"), "missing": c.get("missing"),
+            "wrong": "-" if wrong is None else wrong,
+            "p50_us": c.get("p50_us"), "p95_us": c.get("p95_us"), "p99_us": c.get("p99_us"), "max_us": c.get("max_us"),
+            ">dl": c.get("deadline_misses"), "elapsed_s": s.get("elapsed_s"),
+            "threads": s.get("threads", "-"), "buffer": s.get("buffer", "-"), "chunk": lat.get("chunk", "-"),
+            "sync_short": k.get("sync_short_detections", "-"), "sync_long": k.get("sync_long_frames", "-"),
+            "crc_fail": k.get("crc_failed", "-"), "first_us": c.get("first_us"),
+        }
+        out.append(r)
+    return out
+
+
+def fmt(v, key):
+    if v is None:
+        return "-"
+    if isinstance(v, float):
+        if key.endswith("_us"):
+            return "%.0f" % v
+        if key == "elapsed_s":
+            return "%.2f" % v
+        return "%g" % v
+    return str(v)
+
+
+def main():
+    args = sys.argv[1:]
+    mode = "text"
+    wide = False
+    paths = []
+    for a in args:
+        if a == "--md":
+            mode = "md"
+        elif a == "--csv":
+            mode = "csv"
+        elif a == "--wide":
+            wide = True
+        elif a in ("-h", "--help"):
+            print(__doc__)
+            return 0
+        else:
+            paths.append(a)
+    if not paths:
+        print(__doc__)
+        return 2
+    cols = BASE + (WIDE if wide else [])
+    rows = []
+    for p in paths:
+        try:
+            rows.extend(rows_of(load(p)))
+        except (OSError, ValueError, KeyError) as e:
+            print("rt-table: cannot read %s: %s" % (p, e), file=sys.stderr)
+            return 1
+    cells = [[fmt(r.get(c), c) for c in cols] for r in rows]
+    if mode == "csv":
+        w = csv.writer(sys.stdout)
+        w.writerow(cols)
+        w.writerows(cells)
+        return 0
+    widths = [max(len(c), *(len(row[i]) for row in cells)) for i, c in enumerate(cols)]
+    right = {c for c in cols if c not in ("run", "rt", "rate")}
+    def line(vals):
+        return " | ".join((v.rjust(widths[i]) if cols[i] in right else v.ljust(widths[i])) for i, v in enumerate(vals))
+    if mode == "md":
+        print("| " + " | ".join(c.ljust(widths[i]) for i, c in enumerate(cols)) + " |")
+        print("|" + "|".join(("-" * (widths[i] + 1) + ":") if cols[i] in right else ("-" * (widths[i] + 2)) for i in range(len(cols))) + "|")
+        for row in cells:
+            print("| " + line(row) + " |")
+    else:
+        print(line(cols))
+        print("-+-".join("-" * w for w in widths))
+        for row in cells:
+            print(line(row))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

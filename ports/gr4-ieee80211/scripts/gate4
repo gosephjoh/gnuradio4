@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# gate4 -- the correctness gate of the GR4 port: every golden fixture cell of
+# the GR3 project is replayed through rx_latency4 --record and judged by the
+# GR3 project's own `compare --rx-only` (symbols plane within tolerance, PDU
+# plane byte for byte, GR3-DEFECT for a frame GR3 loses that the port decodes
+# correctly).  Nothing new decides correctness.
+#
+#   ./scripts/gate4 [--cells "A B C"] [--rate 0] [--keep]
+#
+# Writes results/gate4.log and results/gate4.csv (cell,exit,verdict,decoded,
+# frames,first_divergence).  Exit 0 iff every cell is PASS or GR3-DEFECT.
+set -u
+HERE="$(cd "$(dirname "$0")/.." && pwd)"
+GR3="${GR3:-$HOME/gr3-ieee802-11-project}"
+cd "$HERE" || exit 1
+
+CELLS=""; RATE=0; KEEP=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --cells) CELLS=$2; shift 2;;
+        --rate)  RATE=$2; shift 2;;
+        --keep)  KEEP=1; shift;;
+        *) echo "gate4: unknown option $1" >&2; exit 2;;
+    esac
+done
+[ -x build/rx_latency4 ] || { echo "gate4: build/rx_latency4 missing" >&2; exit 2; }
+[ -x "$GR3/build/compare" ] || { echo "gate4: $GR3/build/compare missing" >&2; exit 2; }
+FIX="$GR3/results/phase9/fixture/index.json"
+[ -f "$FIX" ] || { echo "gate4: $FIX missing" >&2; exit 2; }
+if [ -z "$CELLS" ]; then
+    CELLS=$(python3 -c "import json;print(' '.join(c['name'] for c in json.load(open('$FIX'))['cells']))")
+fi
+
+mkdir -p results data
+LOG=results/gate4.log; CSV=results/gate4.csv
+: > "$LOG"; echo "cell,exit,verdict,decoded,frames,wrong_payload,first_divergence" > "$CSV"
+echo "# gate4 -- $(date -u +%Y-%m-%dT%H:%M:%SZ)  gr4-ieee80211 $(git -C "$HERE" rev-parse --short HEAD 2>/dev/null || echo untracked)  gnuradio4 $(git -C "$HOME/gnuradio4" rev-parse --short HEAD)  rate $RATE" | tee -a "$LOG"
+pass=0; defect=0; fail=0; n=0
+for cell in $CELLS; do
+    n=$((n+1))
+    G="$GR3/data/golden/$cell"
+    C="data/gate4/$cell"
+    mkdir -p "$C"
+    ./build/rx_latency4 --run-dir "$G" --input "$G/rx_stimulus.cf32" --out-dir "$C" --rate "$RATE" --record --timeout-s 120 > "$C/run.log" 2>&1
+    rx=$?
+    if [ "$rx" -ne 0 ]; then
+        echo "FAIL  $cell: rx_latency4 exit $rx (see $C/run.log)" | tee -a "$LOG"; fail=$((fail+1))
+        echo "$cell,rx4-error,,,,," >> "$CSV"; continue
+    fi
+    ( cd "$GR3" && ./build/compare --fixture results/phase9/fixture/index.json --cell "$cell" --candidate "$HERE/$C" --rx-only --json "$HERE/$C/compare.json" ) > "$C/compare.log" 2>&1
+    rc=$?
+    read -r verdict fdiv decoded frames wrong < <(python3 - "$C/compare.json" "$C/latency_summary.json" <<'EOF'
+import json,sys
+try:
+    c=json.load(open(sys.argv[1])); v=c.get("verdict","?"); fd=c.get("first_divergence") or ""
+    if isinstance(fd,dict): fd="%s@%s" % (fd.get("plane",""), fd.get("frame",""))
+except Exception as e:
+    v="no-json"; fd=str(e)
+try:
+    s=json.load(open(sys.argv[2])); p=s["per_chain"][0]; d=p["decoded"]; f=p["frames"]; w=p.get("wrong_payload")
+except Exception:
+    d=f=w="?"
+print(v, str(fd).replace(" ","_") or "-", d, f, w)
+EOF
+)
+    case "$rc" in
+        0) pass=$((pass+1)); tag=PASS;;
+        3) defect=$((defect+1)); tag=DEFECT;;
+        *) fail=$((fail+1)); tag=FAIL;;
+    esac
+    printf '%-7s %-22s exit %d %-10s decoded %s/%s wrong %s %s\n' "$tag" "$cell" "$rc" "$verdict" "$decoded" "$frames" "$wrong" "$fdiv" | tee -a "$LOG"
+    echo "$cell,$rc,$verdict,$decoded,$frames,$wrong,$fdiv" >> "$CSV"
+    if [ "$KEEP" -eq 0 ]; then rm -f "$C/rx_symbols.cf32" "$C/rx_pdus.bin" "$C/latency.csv"; fi
+done
+echo "gate4: $n cells -- $pass PASS, $defect GR3-DEFECT, $fail FAIL" | tee -a "$LOG"
+[ "$fail" -eq 0 ]
