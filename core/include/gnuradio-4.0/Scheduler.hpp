@@ -1523,9 +1523,8 @@ protected:
 
                     syncSchedStates(localBlockList, localStates, static_cast<std::uint8_t>(runnerID));
 
-                    // Re-order after the mutations (the M0 obligation): adoption appends to the end
-                    // of the list, so without this a newly adopted block would run last whatever
-                    // its priority. A no-op for `RoundRobinPolicy`, whose key is the position.
+                    // Re-order after the mutations: adoption appends to the end of the list, so
+                    // without this a newly adopted block would run last whatever its priority. A no-op for `RoundRobinPolicy`, whose key is the position.
                     gr::scheduler::detail::applyStaticOrder<TPolicy>(localBlockList, localStates);
 
                     // N.B. `syncSchedStates()` assigns whole `SchedState`s, so this also discards

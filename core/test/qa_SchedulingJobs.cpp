@@ -1080,9 +1080,9 @@ const boost::ut::suite<"dynamic selector error and bound"> selectorEdgeTests = [
     };
 
     "max_selections_per_pass bounds the dynamic loop"_test = [] {
-        // M2e covered the bound for the static-key loop; the dynamic loop re-derives it and never
-        // checked. Four chains are released together by the backstop, so a tight bound has to cut
-        // the pass short and a generous one must not.
+        // `qa_SchedulerPolicy` covers the bound for the static-key loop; the dynamic loop
+        // re-derives it and was never checked. Four chains are released together by the backstop, so a tight bound
+        // has to cut the pass short and a generous one must not.
         constexpr std::size_t kChains = 4UZ;
 
         for (const auto strategy : {gr::scheduler::SelectionStrategy::linearScan, gr::scheduler::SelectionStrategy::readyHeap}) {

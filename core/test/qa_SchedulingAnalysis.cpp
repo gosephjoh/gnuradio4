@@ -711,7 +711,7 @@ const boost::ut::suite<"SchedulingAnalysis"> schedulingAnalysisTests = [] {
     };
 
     "an unbounded block keeps an unbounded execution ceiling"_test = [] {
-        // F2: the strategy's 4096 stand-in is a *modelling* value. Letting it reach the worker
+        // The strategy's 4096 stand-in is a *modelling* value. Letting it reach the worker
         // would cap every block in every stock graph, so only `nominalBatch` may carry it.
         UnanchoredChain g;
         const auto      analysis = deriveSchedulingAttributes(g.graph, defaultStrategy, noneUserSet);
@@ -784,7 +784,7 @@ const boost::ut::suite<"SchedulingAnalysis"> schedulingAnalysisTests = [] {
     };
 
     "port bounds are read from the type-erased snapshot"_test = [] {
-        // F4: DynamicPort holds *copies* of min_samples/max_samples taken once, lazily, when
+        // DynamicPort holds *copies* of min_samples/max_samples taken once, lazily, when
         // initDynamicPorts() first runs -- normally at connect(). A bound applied to the typed
         // port after that is honoured by computeSampleLimits() but invisible here. This test
         // pins the behaviour rather than asserting it is desirable.
@@ -809,7 +809,7 @@ const boost::ut::suite<"SchedulingAnalysis"> schedulingAnalysisTests = [] {
     };
 
     "a port bound changed after the first derivation does not reach a later one"_test = [] {
-        // F4: DynamicPort holds *copies* of min_samples/max_samples, taken once under
+        // DynamicPort holds *copies* of min_samples/max_samples, taken once under
         // std::call_once when initDynamicPorts() first runs and never refreshed. Connection does
         // not trigger it -- the resolver itself is normally the first accessor, so a first
         // derivation does see current values. What it cannot see is a later change.
@@ -885,8 +885,8 @@ const boost::ut::suite<"SchedulingAnalysis"> schedulingAnalysisTests = [] {
     };
 
     "independent chains keep independent timebases"_test = [] {
-        // Debt D3. Before this, one global anchor governed the whole graph: these two chains both
-        // came out at 4.096 s, leaving the 48 kHz chain 48x too slow.
+        // Before per-source anchoring, one global anchor governed the whole graph: these two
+        // chains both came out at 4.096 s, leaving the 48 kHz chain 48x too slow.
         gr::Graph graph;
         auto&     slowSrc  = graph.emplaceBlock<RateSource<float>>({{"sample_rate", 1000.f}});
         auto&     slowSink = graph.emplaceBlock<gr::testing::NullSink<float>>();
@@ -947,7 +947,7 @@ const boost::ut::suite<"SchedulingAnalysis"> schedulingAnalysisTests = [] {
     };
 
     "flatten hoists a transparent subgraph's blocks into the analysis"_test = [] {
-        // Debt D2. Every other graph in this suite is flat, so `flatten()`'s actual purpose --
+        // Every other graph in this suite is flat, so `flatten()`'s actual purpose --
         // hoisting the children of a TransparentBlockGroup -- went unexercised. The sub-*scheduler*
         // test above does not cover it: a ScheduledBlockGroup is deliberately *not* traversed by
         // `flatten<TransparentBlockGroup>`, so its children are never hoisted.
@@ -1181,7 +1181,7 @@ const boost::ut::suite<"SchedulingAnalysis"> schedulingAnalysisTests = [] {
     };
 
     "a stock graph is still asked for an unbounded batch"_test = [] {
-        // The F2 gate. `NominalBatchStrategy` reports a 4096 stand-in for `nominalBatch` where
+        // `NominalBatchStrategy` reports a 4096 stand-in for `nominalBatch` where
         // nothing bounds a block -- had that reached the worker it would cap every graph in the
         // project at 4096 samples while claiming to be behaviour-neutral.
         gr::Graph graph;

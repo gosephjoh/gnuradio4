@@ -207,7 +207,7 @@ const boost::ut::suite<"SchedulingPolicy"> schedulingPolicyTests = [] {
     };
 
     "an externalStep scheduler orders its shared job list by policy"_test = [] {
-        // M2d. `step()` executes `(*_executionOrder)[0]` directly -- there is no worker-local copy
+        // `step()` executes `(*_executionOrder)[0]` directly -- there is no worker-local copy
         // to order -- so without ordering the shared list at init, the same graph would run
         // priority-ordered on the pool path and in registration order here. `jobs()` is the
         // observable: it returns a copy of that shared list.
@@ -253,8 +253,8 @@ const boost::ut::suite<"SchedulingPolicy"> schedulingPolicyTests = [] {
     };
 
     "re-ordering an appended block restores priority order"_test = [] {
-        // M2c's mechanism. Adoption appends to the end of the worker's list, so the ordering has to
-        // be re-applied or a newly adopted block runs last whatever its priority.
+        // Adoption appends to the end of the worker's list, so the ordering has to be re-applied
+        // or a newly adopted block runs last whatever its priority.
         //
         // N.B. this exercises `applyStaticOrder` on a list mutated the way `adoptBlocks()` mutates
         // it, not the scheduler's call site. Observing the call site would need a block that records
