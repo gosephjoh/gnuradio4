@@ -46,6 +46,14 @@ cmake --build build -j1 --target rx_latency4 gen4
 Standalone, copy two directories instead: this repo and the GR4 tree it
 builds against (`~/gnuradio4`; set `-DGNURADIO4_DIR=/path` if it is
 elsewhere).
+
+The branch carries this repository as a `git subtree`. To move commits
+between the two (from a checkout of the fork):
+
+```
+git subtree pull --prefix=ports/gr4-ieee80211 <path-or-url-of-this-repo> master   # standalone -> branch
+git subtree push --prefix=ports/gr4-ieee80211 <path-or-url-of-this-repo> master   # branch -> standalone
+```
 Needs GCC 15 (or Clang 20), CMake ≥ 3.27, Python 3 with numpy for the check
 scripts, about 2.5 GB of RAM for the one heavy translation unit, and network
 access at configure time for GR4's own dependency (`vir-simd`). The JSON
