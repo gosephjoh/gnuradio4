@@ -1,6 +1,7 @@
 #ifndef GNURADIO_TRACE_HPP
 #define GNURADIO_TRACE_HPP
 
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <chrono>
@@ -460,14 +461,42 @@ inline constexpr std::size_t kDefaultRingCapacity = 65536UZ;
 void                        setCategories(std::uint32_t mask) noexcept;
 [[nodiscard]] std::uint32_t categories() noexcept;
 
+/**
+ * Largest ring a single thread may be given, in bytes.
+ *
+ * A ceiling, not a default -- the default stays at `kDefaultRingCapacity`, two megabytes. It exists
+ * because the capacity setting is a 32-bit record count, so a caller can ask for 128 GiB by typing
+ * one large number; the allocation then fails, every record from that thread is dropped for the
+ * life of the process, and nothing says so. A capture that silently records nothing is the one
+ * outcome this layer must never produce.
+ *
+ * Per *emitting thread*: a graph on eight workers can commit eight times this. That is why the
+ * ceiling is generous rather than tight — it is a guard against a typo, not a memory budget.
+ */
+inline constexpr std::size_t kDefaultRingCapacityLimitBytes = 4UZ * 1024UZ * 1024UZ * 1024UZ;
+
+/// Raises or lowers the ceiling above. Rounded down to a whole number of records, and never below
+/// one record, so a ring always has somewhere to write.
+void                      setRingCapacityLimitBytes(std::size_t bytes) noexcept;
+[[nodiscard]] std::size_t ringCapacityLimitBytes() noexcept;
+
 /// Takes effect for rings created after the call, so a thread that has already emitted keeps its
-/// own. Rounded up to a power of two. Ignored when `capacity` is 0.
-void                      setRingCapacity(std::size_t capacity) noexcept;
+/// own. Ignored when `capacity` is 0. Returns the capacity actually adopted: the request rounded
+/// **up** to a power of two, then clamped to the ceiling and rounded **down** to a power of two
+/// again so the index mask stays valid. Compare it against what you asked for to detect a clamp --
+/// the return value is the only way to find out, and ignoring it is how a capture ends up smaller
+/// than intended.
+[[nodiscard]] std::size_t setRingCapacity(std::size_t capacity) noexcept;
 [[nodiscard]] std::size_t ringCapacity() noexcept;
 
 /// Discards every record **and every identity**, without freeing any ring — a ring whose address a
 /// live `thread_local` still holds must not be destroyed, and no thread can be made to drop that
 /// pointer from here.
+///
+/// **Defined only while nothing is emitting**, the same precondition `dump()` carries. This rewinds
+/// each ring's sequence counter, which emitters advance without synchronisation; calling it under a
+/// running graph races them, and leaves slots holding records the counter now claims are unwritten.
+/// Park the workers first.
 ///
 /// Dropping identities invalidates any cached `EntityId`, `SchedState::entityId` included. That is
 /// deliberate: `reset()` means "start a new capture", and a capture whose records referred to

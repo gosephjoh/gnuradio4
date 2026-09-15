@@ -159,7 +159,8 @@ struct OwnedRing {
 
 std::mutex                              gRegistryMutex;
 std::vector<std::unique_ptr<OwnedRing>> gRings;
-std::size_t                             gRingCapacity = kDefaultRingCapacity;
+std::size_t                             gRingCapacity      = kDefaultRingCapacity;
+std::size_t                             gRingCapacityLimit = kDefaultRingCapacityLimitBytes;
 
 /// One interned identity. Owns its strings: the views handed to `intern()` belong to a `BlockModel`
 /// that may be destroyed long before the trace is written.
@@ -181,6 +182,14 @@ std::vector<EntityEntry>                  gEntities; /// index is `id - 1`; reti
 
 [[nodiscard]] std::size_t roundUpToPowerOfTwo(std::size_t value) noexcept { return value <= 1UZ ? 1UZ : std::bit_ceil(value); }
 
+/// The ceiling expressed in records, floored to a power of two. Rounding *down* here is what keeps
+/// the index mask valid: a clamp to a non-power-of-two capacity would corrupt every subsequent
+/// index. Never returns 0, so a ring always has somewhere to write.
+[[nodiscard]] std::size_t capacityCeilingRecords(std::size_t limitBytes) noexcept {
+    const std::size_t records = limitBytes / sizeof(Event);
+    return records <= 1UZ ? 1UZ : std::bit_floor(records);
+}
+
 /// Records lost from one ring: every push beyond the capacity overwrote something.
 [[nodiscard]] std::uint64_t lostFrom(const detail::Ring& ring) noexcept {
     const std::uint64_t capacity = ring.mask + 1UL;
@@ -195,7 +204,13 @@ std::uint32_t      gCategoryMask = 0U;
 thread_local Ring* tRing         = nullptr;
 
 Ring* createThreadRing() noexcept {
-    const std::size_t capacity = roundUpToPowerOfTwo(gRingCapacity);
+    // Read under the lock: `setRingCapacity()` writes it under the same one, and a thread creating
+    // its ring while another changes the capacity would otherwise be a data race.
+    std::size_t capacity = 0UZ;
+    {
+        const std::lock_guard lock(gRegistryMutex);
+        capacity = gRingCapacity;
+    }
 
     // Nothrow `new` rather than `make_unique`, wrapped immediately: this is library code on a
     // `noexcept` path (CLAUDE.md section 5), and a 2 MB allocation is the realistic failure. Losing
@@ -246,12 +261,24 @@ void setCategories(std::uint32_t mask) noexcept {
 
 std::uint32_t categories() noexcept { return gr::atomic_ref(detail::gCategoryMask).load_relaxed(); }
 
-void setRingCapacity(std::size_t capacity) noexcept {
-    if (capacity == 0UZ) {
-        return;
-    }
+std::size_t setRingCapacity(std::size_t capacity) noexcept {
     const std::lock_guard lock(gRegistryMutex);
-    gRingCapacity = roundUpToPowerOfTwo(capacity);
+    if (capacity == 0UZ) {
+        return gRingCapacity;
+    }
+    gRingCapacity = std::min(roundUpToPowerOfTwo(capacity), capacityCeilingRecords(gRingCapacityLimit));
+    return gRingCapacity;
+}
+
+void setRingCapacityLimitBytes(std::size_t bytes) noexcept {
+    const std::lock_guard lock(gRegistryMutex);
+    gRingCapacityLimit = bytes;
+    gRingCapacity      = std::min(gRingCapacity, capacityCeilingRecords(gRingCapacityLimit));
+}
+
+std::size_t ringCapacityLimitBytes() noexcept {
+    const std::lock_guard lock(gRegistryMutex);
+    return gRingCapacityLimit;
 }
 
 std::size_t ringCapacity() noexcept {

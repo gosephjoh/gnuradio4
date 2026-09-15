@@ -794,7 +794,44 @@ const boost::ut::suite<"TraceScheduler"> traceSchedulerTests = [] {
         std::ignore = scheduler.settings().applyStagedParameters();
         expect(eq(categories(), 0U)) << "clearing the setting must stop the capture";
 
-        setRingCapacity(kDefaultRingCapacity);
+        std::ignore = setRingCapacity(kDefaultRingCapacity);
+        reset();
+    };
+
+    "an oversized buffer request is clamped, and the scheduler says so"_test = [] {
+        reset();
+        setCategories(0U);
+
+        Chain chain;
+        chain.build(1024UZ);
+        TestScheduler scheduler;
+        gr::MsgPortIn fromScheduler;
+        expect(scheduler.exchange(std::move(chain.graph)).has_value() >> fatal);
+        expect(scheduler.msgOut.connect(fromScheduler).has_value() >> fatal);
+
+        // `trace_buffer_size` is a 32-bit record count, so a user can ask for tens of gigabytes per
+        // thread by typing one number too many. The request is honoured up to the ceiling and no
+        // further, and the shortfall is reported: a capture quietly smaller than asked for is the
+        // failure this layer exists to catch, so it must not be how the layer itself fails.
+        constexpr gr::Size_t  kOversized      = gr::Size_t{1U} << 31U;
+        constexpr std::size_t kCeilingRecords = gr::trace::kDefaultRingCapacityLimitBytes / sizeof(Event);
+        expect(lt(std::size_t{kCeilingRecords}, std::size_t{kOversized})) << "the request must actually exceed the ceiling, or this test asserts nothing";
+
+        expect(scheduler.settings().set({{"trace_buffer_size", kOversized}}).empty() >> fatal);
+        std::ignore = scheduler.settings().activateContext();
+        std::ignore = scheduler.settings().applyStagedParameters();
+
+        expect(eq(ringCapacity(), kCeilingRecords)) << "the ceiling must hold against the setting, not just the direct call";
+
+        auto span       = fromScheduler.streamReader().get();
+        bool complained = false;
+        for (const auto& message : span) {
+            complained = complained || (message.endpoint == "settingsChanged(trace_buffer_size)" && !message.data.has_value());
+        }
+        std::ignore = span.consume(span.size());
+        expect(complained) << "a clamp must be reported, not swallowed";
+
+        std::ignore = setRingCapacity(kDefaultRingCapacity);
         reset();
     };
 

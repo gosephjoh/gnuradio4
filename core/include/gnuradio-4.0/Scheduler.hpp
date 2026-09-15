@@ -310,8 +310,8 @@ public:
     Annotated<SelectionStrategy, "selection_strategy", Doc<"dynamic-key policies: how the next block is picked -- linearScan (O(n), no auxiliary state) or readyHeap (O(log n), heap rebuilt per pass)">> selection_strategy      = SelectionStrategy::linearScan;
     Annotated<gr::Size_t, "max_outstanding_jobs", Doc<"release-tracking policies: cap on a block's outstanding jobs, clamping the buffer-derived bound (0: uncapped)">>                                   max_outstanding_jobs    = kDefaultMaxOutstandingJobs;
 
-    Annotated<gr::Size_t, "trace_categories", Doc<"bitmask of live trace-marker groups (0: tracing off). Inert unless the trace layer was compiled in">>                      trace_categories  = 0U;
-    Annotated<gr::Size_t, "trace_buffer_size", Doc<"records retained per emitting thread; rounded up to a power of two. Takes effect for threads that have not yet emitted">> trace_buffer_size = 65536U;
+    Annotated<gr::Size_t, "trace_categories", Doc<"bitmask of live trace-marker groups (0: tracing off). Inert unless the trace layer was compiled in">>                                                                    trace_categories  = 0U;
+    Annotated<gr::Size_t, "trace_buffer_size", Doc<"records retained per emitting thread; rounded up to a power of two, capped at 4 GiB/thread (a clamp is reported). Takes effect for threads that have not yet emitted">> trace_buffer_size = 65536U;
 
     GR_MAKE_REFLECTABLE(SchedulerBase, timeout_ms, watchdog_timeout, timeout_inactivity_count, process_stream_to_message_ratio, house_keeping_policy, house_keeping_depth, max_work_items, max_selections_per_pass, max_outstanding_jobs, selection_strategy, trace_categories, trace_buffer_size, poolName, sched_settings);
 
@@ -698,7 +698,13 @@ public:
             // thread only emits once some category is live -- so setting the capacity afterwards would
             // leave every thread that had already started on the previous size.
             if (newSettings.contains("trace_buffer_size")) {
-                gr::trace::setRingCapacity(static_cast<std::size_t>(trace_buffer_size));
+                const std::size_t requested = static_cast<std::size_t>(trace_buffer_size);
+                const std::size_t adopted   = gr::trace::setRingCapacity(requested);
+                if (adopted < requested) {
+                    // Said out loud rather than swallowed. A silently shrunk buffer is a capture that
+                    // quietly loses the oldest records, which is the failure this layer exists to avoid.
+                    this->emitErrorMessage("settingsChanged(trace_buffer_size)", std::format("requested {} records per thread, clamped to {} by the {}-byte ceiling", requested, adopted, gr::trace::ringCapacityLimitBytes()));
+                }
             }
             if (newSettings.contains("trace_categories")) {
                 gr::trace::setCategories(static_cast<std::uint32_t>(trace_categories));

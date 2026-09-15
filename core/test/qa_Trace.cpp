@@ -311,7 +311,7 @@ const boost::ut::suite<"Trace"> traceTests = [] {
         constexpr std::size_t kExcess   = 3UZ;
 
         reset();
-        setRingCapacity(kCapacity);
+        std::ignore = setRingCapacity(kCapacity);
         setCategories(categoryMask(Category::work));
 
         // A fresh thread so the ring is created at the capacity just set: an existing ring keeps its
@@ -336,7 +336,7 @@ const boost::ut::suite<"Trace"> traceTests = [] {
         expect(eq(stats.lost, std::uint64_t{kExcess})) << "loss is derived from the sequence, not counted on the hot path";
 
         setCategories(0U);
-        setRingCapacity(kDefaultRingCapacity);
+        std::ignore = setRingCapacity(kDefaultRingCapacity);
     };
 
     "each thread gets its own ring and records never interleave"_test = [] {
@@ -344,7 +344,7 @@ const boost::ut::suite<"Trace"> traceTests = [] {
         constexpr std::uint32_t kPerThread = 64U;
 
         reset();
-        setRingCapacity(1024UZ);
+        std::ignore = setRingCapacity(1024UZ);
         setCategories(categoryMask(Category::work));
 
         std::vector<std::thread> emitters;
@@ -379,7 +379,60 @@ const boost::ut::suite<"Trace"> traceTests = [] {
         }
 
         setCategories(0U);
-        setRingCapacity(kDefaultRingCapacity);
+        std::ignore = setRingCapacity(kDefaultRingCapacity);
+    };
+
+    "a capacity request is rounded up, and reported back"_test = [] {
+        expect(eq(setRingCapacity(1000UZ), 1024UZ)) << "a non-power-of-two request rounds up to the next power of two";
+        expect(eq(ringCapacity(), 1024UZ)) << "the return value is what was actually stored";
+        expect(eq(setRingCapacity(1024UZ), 1024UZ)) << "an exact power of two is taken as given";
+        expect(eq(setRingCapacity(0UZ), 1024UZ)) << "zero is ignored, and the standing capacity is reported unchanged";
+        expect(eq(setRingCapacity(1UZ), 1UZ)) << "one record is the smallest ring, never zero";
+
+        std::ignore = setRingCapacity(kDefaultRingCapacity);
+    };
+
+    "a capacity above the ceiling is clamped, and the caller can tell"_test = [] {
+        expect(eq(ringCapacityLimitBytes(), kDefaultRingCapacityLimitBytes)) << "the shipped ceiling is what the header documents";
+
+        constexpr std::size_t kCeilingRecords = kDefaultRingCapacityLimitBytes / sizeof(Event);
+        constexpr std::size_t kTypo           = 1UZ << 40U; // a number a user could plausibly type by mistake
+
+        const std::size_t adopted = setRingCapacity(kTypo);
+        expect(lt(adopted, kTypo)) << "a request past the ceiling must not be granted";
+        expect(eq(adopted, kCeilingRecords)) << "it is granted the ceiling instead";
+        expect(eq(adopted & (adopted - 1UZ), 0UZ)) << "a clamped capacity stays a power of two, or the index mask is invalid";
+        expect(eq(ringCapacity(), adopted));
+
+        std::ignore = setRingCapacity(kDefaultRingCapacity);
+    };
+
+    "lowering the ceiling shrinks the standing capacity, and a new ring honours it"_test = [] {
+        constexpr std::size_t   kCeilingRecords = 8UZ;
+        constexpr std::uint32_t kEmitted        = 2U * static_cast<std::uint32_t>(kCeilingRecords);
+
+        reset();
+        std::ignore = setRingCapacity(4096UZ);
+        setRingCapacityLimitBytes(kCeilingRecords * sizeof(Event));
+        expect(eq(ringCapacity(), kCeilingRecords)) << "a standing capacity above a newly lowered ceiling comes down with it";
+
+        // The bookkeeping above proves little on its own. What matters is that a ring *allocated*
+        // after the clamp is the clamped size, so a thread emitting twice the ceiling must lose half.
+        setCategories(categoryMask(Category::work));
+        std::thread emitter([] {
+            for (std::uint32_t i = 0U; i < kEmitted; ++i) {
+                emit(Event{.payload0 = i, .kind = Kind::workEnd});
+            }
+        });
+        emitter.join();
+
+        expect(eq(collect().size(), kCeilingRecords)) << "the clamp reached the allocation, not just the bookkeeping";
+        expect(eq(ringStats().lost, std::uint64_t{kCeilingRecords}));
+
+        setCategories(0U);
+        setRingCapacityLimitBytes(kDefaultRingCapacityLimitBytes);
+        std::ignore = setRingCapacity(kDefaultRingCapacity);
+        reset();
     };
 
     "a scope emits one complete record, however it ends"_test = [] {
@@ -613,7 +666,7 @@ const boost::ut::suite<"Trace"> traceTests = [] {
     "a dumped trace round-trips byte-exactly"_test = [] {
         reset();
         setCategories(categoryMask(Category::work, Category::lifecycle));
-        setRingCapacity(64UZ);
+        std::ignore = setRingCapacity(64UZ);
 
         int            alpha = 0;
         int            beta  = 0;
@@ -687,13 +740,13 @@ const boost::ut::suite<"Trace"> traceTests = [] {
 
         std::filesystem::remove(file);
         setCategories(0U);
-        setRingCapacity(kDefaultRingCapacity);
+        std::ignore = setRingCapacity(kDefaultRingCapacity);
         reset();
     };
 
     "a trace that lost records says so in its header"_test = [] {
         reset();
-        setRingCapacity(8UZ);
+        std::ignore = setRingCapacity(8UZ);
         setCategories(categoryMask(Category::work));
 
         std::thread emitter([] {
@@ -716,7 +769,7 @@ const boost::ut::suite<"Trace"> traceTests = [] {
 
         std::filesystem::remove(file);
         setCategories(0U);
-        setRingCapacity(kDefaultRingCapacity);
+        std::ignore = setRingCapacity(kDefaultRingCapacity);
         reset();
     };
 
