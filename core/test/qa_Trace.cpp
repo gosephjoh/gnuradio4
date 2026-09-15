@@ -438,12 +438,14 @@ const boost::ut::suite<"Trace"> traceTests = [] {
         int alpha = 0;
         int beta  = 0;
 
-        const EntityId first  = intern(&alpha, EntityDescription{.uniqueName = "alpha", .typeName = "Src<float>", .workerId = 1U, .nInputPorts = 0U, .nOutputPorts = 1U});
-        const EntityId again  = intern(&alpha, EntityDescription{.uniqueName = "ignored", .typeName = "ignored"});
+        const EntityDescription alphaDescription{.uniqueName = "alpha", .typeName = "Src<float>", .workerId = 1U, .nInputPorts = 0U, .nOutputPorts = 1U};
+
+        const EntityId first  = intern(&alpha, alphaDescription);
+        const EntityId again  = intern(&alpha, alphaDescription);
         const EntityId second = intern(&beta, EntityDescription{.uniqueName = "beta", .typeName = "Sink<float>", .workerId = 1U, .nInputPorts = 1U, .nOutputPorts = 0U});
 
         expect(neq(first, kNoEntity)) << "ids run from 1; 0 is the worker-scoped sentinel";
-        expect(eq(again, first)) << "the same key must always return the same id";
+        expect(eq(again, first)) << "the same block at the same address must always return the same id";
         expect(neq(second, first)) << "distinct keys must never collide";
         expect(eq(internedId(&alpha), first)) << "a lookup must not assign";
 
@@ -452,17 +454,59 @@ const boost::ut::suite<"Trace"> traceTests = [] {
         expect(eq(intern(nullptr, EntityDescription{}), kNoEntity));
     };
 
-    "the description is kept from the first sight and not rewritten"_test = [] {
+    "a recycled address is given a new identity, not the dead block's"_test = [] {
+        // Found by qa_TraceScheduler, not by reading: destroying one graph and building another let
+        // the allocator hand a new block a dead block's address, and interning returned the dead
+        // block's id *and its name*. Every record the new block emitted would have been attributed
+        // to a block that no longer existed.
+        //
+        // `unique_name` is "{type}#{atomic counter}", unique per instance for the life of the
+        // process, so the mismatch is detectable at intern time -- which is a stronger guarantee than
+        // relying on every removal path remembering to call retire().
         reset();
-        int block   = 0;
-        std::ignore = intern(&block, EntityDescription{.uniqueName = "original", .typeName = "First", .workerId = 3U, .nInputPorts = 2U, .nOutputPorts = 1U});
-        std::ignore = intern(&block, EntityDescription{.uniqueName = "overwritten", .typeName = "Second", .workerId = 9U});
+        setCategories(categoryMask(Category::lifecycle));
 
-        std::vector<std::pair<EntityId, std::string>> seen;
-        std::ignore = forEachEntity([](EntityId id, const EntityDescription& description, void* user) noexcept { static_cast<std::vector<std::pair<EntityId, std::string>>*>(user)->emplace_back(id, std::string(description.uniqueName)); }, &seen);
+        int            address  = 0;
+        const EntityId original = intern(&address, EntityDescription{.uniqueName = "Copy<float>#7", .typeName = "Copy<float>"});
+        const EntityId recycled = intern(&address, EntityDescription{.uniqueName = "Copy<float>#42", .typeName = "Copy<float>"});
 
-        expect(eq(seen.size(), 1UZ));
-        expect(eq(seen.front().second, std::string("original"))) << "re-interning must not allocate a new description";
+        expect(neq(recycled, original)) << "a different block at a recycled address must not inherit the old identity";
+        expect(eq(internedId(&address), recycled)) << "the address now resolves to the live block";
+
+        // The displaced identity stays readable -- records already in a ring still name it -- and its
+        // departure is recorded, exactly as retire() does.
+        std::size_t entities = 0UZ;
+        std::ignore          = forEachEntity([](EntityId, const EntityDescription&, void* user) noexcept { ++*static_cast<std::size_t*>(user); }, &entities);
+        expect(eq(entities, 2UZ)) << "the displaced identity must survive for the records that name it";
+
+        const std::vector<Event> recorded = collect();
+        expect(eq(recorded.size(), 1UZ)) << "displacing an identity emits exactly one record";
+        expect(eq(std::to_underlying(recorded.front().kind), std::to_underlying(Kind::entityRetired)));
+        expect(eq(recorded.front().entity, original)) << "and it names the identity that went away";
+
+        setCategories(0U);
+    };
+
+    "the description is kept from the first sight and not rewritten"_test = [] {
+        // Only the *name* decides identity. Everything else in the description -- worker, port
+        // counts -- is stored once and left alone, which is what keeps the house-keeping path
+        // allocation-free: a block re-interned every re-sync must not copy two strings each time.
+        reset();
+        int                    block = 0;
+        const std::string_view name  = "Copy<float>#3";
+        std::ignore                  = intern(&block, EntityDescription{.uniqueName = name, .typeName = "First", .workerId = 3U, .nInputPorts = 2U, .nOutputPorts = 1U});
+        std::ignore                  = intern(&block, EntityDescription{.uniqueName = name, .typeName = "Second", .workerId = 9U});
+
+        std::vector<std::tuple<EntityId, std::string, std::uint8_t>> seen;
+        std::ignore = forEachEntity(
+            [](EntityId id, const EntityDescription& description, void* user) noexcept { //
+                static_cast<std::vector<std::tuple<EntityId, std::string, std::uint8_t>>*>(user)->emplace_back(id, std::string(description.typeName), description.workerId);
+            },
+            &seen);
+
+        expect(eq(seen.size(), 1UZ)) << "the same name at the same address is the same block";
+        expect(eq(std::get<1>(seen.front()), std::string("First"))) << "re-interning must not rewrite the description";
+        expect(eq(std::get<2>(seen.front()), std::uint8_t{3U})) << "a block re-homed after adoption keeps its original workerId -- recorded, not fixed";
     };
 
     "descriptions outlive the strings they were built from"_test = [] {

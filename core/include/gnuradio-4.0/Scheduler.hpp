@@ -353,7 +353,7 @@ public:
     /// Resolves each block's cached scheduling state from the analysis. A block the analysis does
     /// not know -- one adopted at run time, after the last derivation -- falls back to the
     /// scheduler's own ceiling, which is what every block received before per-block batches existed.
-    void syncSchedStates(const std::vector<std::shared_ptr<BlockModel>>& blocks, std::vector<SchedState>& states) const {
+    void syncSchedStates(const std::vector<std::shared_ptr<BlockModel>>& blocks, std::vector<SchedState>& states, std::uint8_t workerId = 0U) const {
         states.resize(blocks.size());
         for (std::size_t i = 0UZ; i < blocks.size(); ++i) {
             // The user's own declaration is block-local, so it survives adoption intact -- which is
@@ -377,7 +377,18 @@ public:
                 // blocks whose configuration arrived most recently.
                 ceiling = _batchStrategy->resolve(*blocks[i], static_cast<std::size_t>(max_work_items)).executionCeiling;
             }
-            states[i] = SchedState{.index = i, .batchCeiling = ceiling, .priority = priority, .userPriority = userPriority};
+            // Interned whenever tracing is *compiled in*, not only while a capture is live: the
+            // identities have to exist already when a category is switched on, or every capture would
+            // open with `kNoEntity` records until the next house-keeping pass re-synced. A known block
+            // costs one hash lookup and no allocation; with tracing compiled out the
+            // `if constexpr` leaves nothing at all.
+            gr::trace::EntityId entityId = gr::trace::kNoEntity;
+            if constexpr (gr::trace::kEnabled) {
+                entityId = gr::trace::intern(std::addressof(*blocks[i]), //
+                    gr::trace::EntityDescription{.uniqueName = blocks[i]->uniqueName(), .typeName = blocks[i]->typeName(), .workerId = workerId, .nInputPorts = static_cast<std::uint16_t>(blocks[i]->dynamicInputPortsSize()), .nOutputPorts = static_cast<std::uint16_t>(blocks[i]->dynamicOutputPortsSize())});
+            }
+
+            states[i] = SchedState{.index = i, .entityId = entityId, .batchCeiling = ceiling, .priority = priority, .userPriority = userPriority};
 
             if constexpr (needsReleaseTracking(TPolicy::kPriorityClass)) {
                 // The gates' inputs. A block the analysis does not know keeps period and deadline at
@@ -401,7 +412,7 @@ public:
         }
         _schedStates.resize(_executionOrder->size());
         for (std::size_t job = 0UZ; job < _executionOrder->size(); ++job) {
-            syncSchedStates((*_executionOrder)[job], _schedStates[job]);
+            syncSchedStates((*_executionOrder)[job], _schedStates[job], static_cast<std::uint8_t>(job));
 
             // Order the *shared* list too, not only the worker-local copies. `step()` executes
             // `(*_executionOrder)[0]` directly and has no worker-local copy to order, so without
@@ -1313,7 +1324,7 @@ protected:
         std::vector<std::size_t> localSuccessorArena;
         std::vector<ReadyEntry>  localReadyHeap;
 
-        syncSchedStates(localBlockList, localStates);
+        syncSchedStates(localBlockList, localStates, static_cast<std::uint8_t>(runnerID));
         gr::scheduler::detail::applyStaticOrder<TPolicy>(localBlockList, localStates); // no-op for RoundRobinPolicy: its key is the position itself
         if constexpr (needsReleaseTracking(TPolicy::kPriorityClass)) {
             buildReleaseStorage(localBlockList, localStates, localJobArena, localSuccessorArena, localReadyHeap);
@@ -1369,7 +1380,7 @@ protected:
                     // a removal and an adoption in the same pass leave the size unchanged while the
                     // *contents* differ, so a size comparison would silently hand each block its
                     // neighbour's ceiling. This runs on the house-keeping cadence, not per pass.
-                    syncSchedStates(localBlockList, localStates);
+                    syncSchedStates(localBlockList, localStates, static_cast<std::uint8_t>(runnerID));
 
                     // Re-order after the mutations (the M0 obligation): adoption appends to the end
                     // of the list, so without this a newly adopted block would run last whatever

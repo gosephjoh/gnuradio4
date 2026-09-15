@@ -15,6 +15,7 @@
 #include <vector>
 
 #include <gnuradio-4.0/BlockModel.hpp>
+#include <gnuradio-4.0/Trace.hpp>
 
 namespace gr::scheduler {
 
@@ -130,6 +131,12 @@ struct JobQueue {
 
 struct SchedState {
     std::size_t index = 0UZ;
+
+    /// Interned trace identity, assigned in `syncSchedStates()` and `kNoEntity` where tracing is
+    /// compiled out. Cached here rather than looked up per marker because this struct is already
+    /// beside the block in the worker's hot loop, and because an id derived from the block's address
+    /// survives `applyStaticOrder`'s permutation -- which a position-derived one would not.
+    gr::trace::EntityId entityId = gr::trace::kNoEntity;
 
     /// Per-invocation batch ceiling, resolved once during setup and handed to `work()` as its
     /// requested work. Ceiling only: a batch *floor* has no enforcement path at this layer, since

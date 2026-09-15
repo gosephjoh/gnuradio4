@@ -299,25 +299,52 @@ EntityId intern(const void* key, const EntityDescription& description) noexcept 
     if (key == nullptr) {
         return kNoEntity;
     }
-    const std::lock_guard lock(gEntityMutex);
 
-    if (const auto existing = gKeyToId.find(key); existing != gKeyToId.end()) {
-        return existing->second; // known: a hash lookup and nothing else, so the steady state never allocates
-    }
-    if (gEntities.size() >= std::size_t{kMaxEntities}) {
-        return kNoEntity;
+    EntityId displaced = kNoEntity;
+    EntityId assigned  = kNoEntity;
+    {
+        const std::lock_guard lock(gEntityMutex);
+
+        if (const auto existing = gKeyToId.find(key); existing != gKeyToId.end()) {
+            // The address is known -- but is it still the same block? `unique_name` is
+            // "{type}#{atomic counter}", unique per instance for the life of the process, so a
+            // mismatch means this address was recycled by the allocator after the original block was
+            // destroyed. Returning the stored id there would hand the new block the old one's
+            // identity *and its name*, and every record it emitted would be attributed to a block
+            // that no longer exists.
+            //
+            // Detected here rather than prevented by `retire()`, because prevention would depend on
+            // every removal path remembering to call it -- `exchange()`, `removeBlocks()`, zombie
+            // cleanup, scheduler destruction -- and missing one leaves the hazard silently. A string
+            // comparison on the house-keeping path is the cheaper guarantee, and it allocates nothing.
+            if (gEntities[existing->second - 1U].uniqueName == description.uniqueName) {
+                return existing->second; // the same block: one hash lookup, one compare, no allocation
+            }
+            displaced = existing->second;
+            gKeyToId.erase(existing);
+        }
+        if (gEntities.size() >= std::size_t{kMaxEntities}) {
+            return kNoEntity;
+        }
+
+        gEntities.push_back(EntityEntry{
+            .uniqueName   = std::string(description.uniqueName),
+            .typeName     = std::string(description.typeName),
+            .workerId     = description.workerId,
+            .nInputPorts  = description.nInputPorts,
+            .nOutputPorts = description.nOutputPorts,
+        });
+        assigned = static_cast<EntityId>(gEntities.size());
+        gKeyToId.emplace(key, assigned);
     }
 
-    gEntities.push_back(EntityEntry{
-        .uniqueName   = std::string(description.uniqueName),
-        .typeName     = std::string(description.typeName),
-        .workerId     = description.workerId,
-        .nInputPorts  = description.nInputPorts,
-        .nOutputPorts = description.nOutputPorts,
-    });
-    const auto id = static_cast<EntityId>(gEntities.size());
-    gKeyToId.emplace(key, id);
-    return id;
+    // Outside the lock: `emit()` can reach `createThreadRing()`, which takes the *registry* lock,
+    // and holding an unrelated lock across that is how lock-order bugs start. The displaced identity keeps its description -- records already in a ring still
+    // name it -- so this says when it stopped being reachable, exactly as `retire()` does.
+    if (displaced != kNoEntity) {
+        emit(Event{.startNs = now(), .entity = displaced, .kind = Kind::entityRetired});
+    }
+    return assigned;
 }
 
 EntityId internedId(const void* key) noexcept {
