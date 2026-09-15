@@ -1,13 +1,16 @@
 #include <boost/ut.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <format>
+#include <fstream>
 #include <set>
 #include <string>
+#include <thread>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -768,6 +771,264 @@ const boost::ut::suite<"TraceScheduler"> traceSchedulerTests = [] {
         std::ignore = syncsLosing;
 
         setCategories(0U);
+    };
+
+    "a pool worker brackets its own life, and two workers are told apart"_test = [] {
+        // Two independent chains so the graph partitions into two jobs and the pool runs two
+        // workers. A single chain is one job, which would make the distinctness claim vacuous.
+        reset();
+        setCategories(categoryMask(Category::lifecycle));
+
+        gr::Graph graph;
+        for (const std::string& suffix : {std::string("a"), std::string("b")}) {
+            auto& source = graph.emplaceBlock<gr::testing::ConstantSource<float>>({{"name", "src" + suffix}, {"n_samples_max", gr::Size_t{32768U}}});
+            auto& copy   = graph.emplaceBlock<gr::testing::Copy<float>>({{"name", "mid" + suffix}});
+            auto& sink   = graph.emplaceBlock<gr::testing::NullSink<float>>({{"name", "snk" + suffix}});
+            std::ignore  = graph.connect<"out", "in">(source, copy);
+            std::ignore  = graph.connect<"out", "in">(copy, sink);
+        }
+
+        gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multiThreaded> scheduler;
+        expect(scheduler.exchange(std::move(graph)).has_value() >> fatal);
+        expect(scheduler.runAndWait().has_value() >> fatal);
+
+        std::set<std::uint32_t> startedWorkers;
+        std::set<std::uint32_t> stoppedWorkers;
+        std::size_t             starts      = 0UZ;
+        std::size_t             stops       = 0UZ;
+        std::size_t             reaps       = 0UZ;
+        std::size_t             adopts      = 0UZ;
+        std::size_t             emptyStarts = 0UZ;
+        for (const Event& event : collect()) {
+            switch (event.kind) {
+            case Kind::workerStart:
+                ++starts;
+                startedWorkers.insert(event.workerId);
+                if (event.payload0 == 0U) {
+                    ++emptyStarts;
+                }
+                break;
+            case Kind::workerStop:
+                ++stops;
+                stoppedWorkers.insert(event.workerId);
+                break;
+            case Kind::zombieReap: ++reaps; break;
+            case Kind::adopt: ++adopts; break;
+            default: break;
+            }
+        }
+        exportTimeline("t1-worker-lifecycle");
+
+        expect(gt(starts, 0UZ) >> fatal) << "a pool run must record at least one worker starting";
+        expect(eq(starts, stops)) << "every worker that started must also record stopping -- an unpaired start is the shape of a worker that died";
+        expect(eq(startedWorkers.size(), starts)) << "each start must carry its own worker id, or two workers' records are indistinguishable";
+        expect(startedWorkers == stoppedWorkers) << "the set of workers that stopped must be the set that started";
+        expect(eq(emptyStarts, 0UZ)) << "a worker records how many blocks it owns, and a worker owning none returns before starting";
+
+        // The claim this scenario exists to make. With one job the ids would trivially be one set of
+        // one, and a hard-coded zero would pass; two jobs make the distinctness real.
+        expect(ge(startedWorkers.size(), 2UZ)) << "two independent chains must give two workers -- if the partitioner changed, this scenario no longer tests what it claims";
+
+        // Emitted every house-keeping pass on the working path, and asserted here because nothing
+        // else in the suite reads them.
+        expect(gt(reaps, 0UZ)) << "the zombie sweep must be recorded";
+        expect(gt(adopts, 0UZ)) << "the adoption phase must be recorded";
+
+        setCategories(0U);
+        reset();
+    };
+
+    "a real graph can overrun its ring, and the dumped trace says how much it lost"_test = [] {
+        // The synthetic wrap test in qa_Trace proves the ring overwrites. This proves the *reporting*
+        // path a user actually meets: undersize the buffer, run a real graph, and see whether the
+        // file admits it is incomplete. A trace that lost data and does not say so is the worst
+        // outcome this layer has, because every conclusion drawn from it is quietly wrong.
+        constexpr std::size_t kTinyRing = 64UZ;
+
+        reset();
+        expect(eq(setRingCapacity(kTinyRing), kTinyRing) >> fatal);
+        setCategories(kAllCategories);
+
+        gr::Graph graph;
+        auto&     source = graph.emplaceBlock<gr::testing::ConstantSource<float>>({{"name", std::string("src")}, {"n_samples_max", gr::Size_t{65536U}}});
+        auto&     copy   = graph.emplaceBlock<gr::testing::Copy<float>>({{"name", std::string("mid")}});
+        auto&     sink   = graph.emplaceBlock<gr::testing::NullSink<float>>({{"name", std::string("snk")}});
+        std::ignore      = graph.connect<"out", "in">(source, copy);
+        std::ignore      = graph.connect<"out", "in">(copy, sink);
+
+        // multiThreaded so the emitting threads are pool workers, created after the capacity was
+        // set. A ring already built at the old capacity would keep it and never wrap.
+        gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multiThreaded> scheduler;
+        expect(scheduler.exchange(std::move(graph)).has_value() >> fatal);
+        expect(scheduler.runAndWait().has_value() >> fatal);
+
+        const RingStats stats = ringStats();
+        expect(gt(stats.rings, 0UZ) >> fatal) << "the run must have emitted from at least one thread";
+        expect(gt(stats.lost, 0UL) >> fatal) << "a 64-record ring cannot hold a whole run; if it did, this scenario no longer tests overrun";
+        expect(le(stats.recorded, stats.rings * kTinyRing)) << "no ring may hold more than its capacity";
+
+        const std::filesystem::path file    = std::filesystem::temp_directory_path() / std::format("qa_TraceScheduler_wrap_{}.gr4trace", ::getpid());
+        const auto                  written = dump(file.string());
+        expect(written.has_value() >> fatal);
+
+        std::ifstream in(file, std::ios::binary);
+        FileHeader    header{};
+        in.read(reinterpret_cast<char*>(&header), sizeof(FileHeader));
+        expect(gt(header.lostCount, 0UL)) << "the header must carry the loss, or a report cannot know the trace is partial";
+        expect(eq(header.eventCount, written.value())) << "the header's count must match what was written";
+        expect(eq(header.ringCount, stats.rings));
+
+        std::filesystem::remove(file);
+        setCategories(0U);
+        std::ignore = setRingCapacity(kDefaultRingCapacity);
+        reset();
+    };
+
+    "a dump requested while pool workers are running parks them and still produces a valid file"_test = [] {
+        // The existing control-channel scenario drives an externalStep scheduler, where the work
+        // quiescence guard has no workers to park and therefore proves nothing about it. Here there
+        // are real workers mid-sweep when the dump arrives.
+        reset();
+        setCategories(0U);
+
+        gr::Graph graph;
+        auto&     source = graph.emplaceBlock<gr::testing::ConstantSource<float>>({{"name", std::string("src")}, {"n_samples_max", gr::Size_t{0U}}} /* infinite: the dump must find the workers mid-sweep */);
+        auto&     copy   = graph.emplaceBlock<gr::testing::Copy<float>>({{"name", std::string("mid")}});
+        auto&     sink   = graph.emplaceBlock<gr::testing::NullSink<float>>({{"name", std::string("snk")}});
+        std::ignore      = graph.connect<"out", "in">(source, copy);
+        std::ignore      = graph.connect<"out", "in">(copy, sink);
+
+        gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multiThreaded> scheduler;
+        gr::MsgPortOut                                                       toScheduler;
+        expect(scheduler.exchange(std::move(graph)).has_value() >> fatal);
+        expect(toScheduler.connect(scheduler.msgIn).has_value() >> fatal);
+        expect(scheduler.changeStateTo(gr::lifecycle::State::INITIALISED).has_value() >> fatal);
+        expect(scheduler.changeStateTo(gr::lifecycle::State::RUNNING).has_value() >> fatal);
+
+        gr::sendMessage<gr::message::Command::Set>(toScheduler, scheduler.unique_name, gr::scheduler::property::kTraceControl, {{"command", std::string("start")}, {"categories", gr::Size_t{kAllCategories}}});
+
+        // Wait on an observable condition rather than on the clock: records appearing is the proof
+        // that workers are live and emitting, which is the state the dump has to interrupt.
+        bool emitting = false;
+        for (std::size_t attempt = 0UZ; attempt < 10000UZ && !emitting; ++attempt) {
+            emitting = ringStats().recorded > 0UL;
+            std::this_thread::yield();
+        }
+        expect(emitting >> fatal) << "the pool must be emitting before the dump is requested, or the parking is untested";
+
+        const std::filesystem::path file = std::filesystem::temp_directory_path() / std::format("qa_TraceScheduler_live_{}.gr4trace", ::getpid());
+        gr::sendMessage<gr::message::Command::Set>(toScheduler, scheduler.unique_name, gr::scheduler::property::kTraceControl, {{"command", std::string("dump")}, {"path", file.string()}});
+
+        bool written = false;
+        for (std::size_t attempt = 0UZ; attempt < 100000UZ && !written; ++attempt) {
+            written = std::filesystem::exists(file);
+            std::this_thread::yield();
+        }
+        expect(written >> fatal) << "a dump requested over the channel must complete while the graph runs";
+
+        std::ignore = scheduler.changeStateTo(gr::lifecycle::State::REQUESTED_STOP);
+        std::ignore = scheduler.changeStateTo(gr::lifecycle::State::STOPPED);
+        scheduler.waitDone();
+
+        // Read after the run: a torn record would show up as a header that disagrees with the file.
+        std::ifstream in(file, std::ios::binary);
+        FileHeader    header{};
+        in.read(reinterpret_cast<char*>(&header), sizeof(FileHeader));
+        expect(eq(std::string_view(header.magic.data(), 8UZ), std::string_view("GR4TRACE"))) << "the file must be a well-formed trace, not a half-written one";
+        expect(eq(header.eventBytes, static_cast<std::uint32_t>(sizeof(Event))));
+        // Walk the variable-length entity section exactly as a reader would, then demand that what
+        // remains is precisely the events the header promised. A dump that raced an emitter, or that
+        // was truncated by the stop, fails this by a byte.
+        for (std::uint64_t entity = 0UL; entity < header.entityCount; ++entity) {
+            EntityRecord record{};
+            in.read(reinterpret_cast<char*>(&record), sizeof(EntityRecord));
+            in.seekg(std::streamoff{record.uniqueNameBytes} + std::streamoff{record.typeNameBytes}, std::ios::cur);
+        }
+        expect(in.good() >> fatal) << "the entity section must be complete";
+        const std::uint64_t eventSectionStart = static_cast<std::uint64_t>(in.tellg());
+        expect(eq(std::filesystem::file_size(file), eventSectionStart + header.eventCount * sizeof(Event))) << "the file's length must match what its header claims, or the dump raced the emitters";
+
+        std::filesystem::remove(file);
+        setCategories(0U);
+        reset();
+    };
+
+    "a paused worker records that it is idle, and says why"_test = [] {
+        // `idle` carries a four-valued reason that nothing had ever read back, so a wrong reason --
+        // or a hard-coded one -- would have gone unnoticed. Only the pool-worker path emits it;
+        // step() never reaches that code, so this must be a real pool and therefore asynchronous.
+        reset();
+        setCategories(0U);
+
+        gr::Graph graph;
+        auto&     source = graph.emplaceBlock<gr::testing::ConstantSource<float>>({{"name", std::string("src")}, {"n_samples_max", gr::Size_t{0U}}}); // infinite: the pause must find the graph still running
+        auto&     copy   = graph.emplaceBlock<gr::testing::Copy<float>>({{"name", std::string("mid")}});
+        auto&     sink   = graph.emplaceBlock<gr::testing::NullSink<float>>({{"name", std::string("snk")}});
+        std::ignore      = graph.connect<"out", "in">(source, copy);
+        std::ignore      = graph.connect<"out", "in">(copy, sink);
+
+        gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multiThreaded> scheduler;
+        expect(scheduler.exchange(std::move(graph)).has_value() >> fatal);
+
+        // A short idle period so a paused worker cycles promptly. The reflected key is the field
+        // name, not the annotation's display name.
+        expect(scheduler.settings().set({{"timeout_ms", gr::Size_t{5U}}}).empty() >> fatal);
+        std::ignore = scheduler.settings().activateContext();
+        std::ignore = scheduler.settings().applyStagedParameters();
+
+        expect(scheduler.changeStateTo(gr::lifecycle::State::INITIALISED).has_value() >> fatal);
+        expect(scheduler.changeStateTo(gr::lifecycle::State::RUNNING).has_value() >> fatal);
+
+        const auto spinUntil = [](auto&& predicate) {
+            for (std::size_t attempt = 0UZ; attempt < 20'000'000UZ; ++attempt) {
+                if (predicate()) {
+                    return true;
+                }
+                std::this_thread::yield();
+            }
+            return false;
+        };
+
+        expect(spinUntil([&scheduler] { return scheduler.isProcessing(); }) >> fatal) << "the pool must be running before it is paused";
+
+        // RUNNING -> PAUSED is not a legal edge; the request is what a worker observes, and a worker
+        // is what moves the scheduler the rest of the way.
+        expect(scheduler.changeStateTo(gr::lifecycle::State::REQUESTED_PAUSE).has_value() >> fatal);
+        expect(spinUntil([&scheduler] { return scheduler.state() == gr::lifecycle::State::PAUSED; }) >> fatal) << "the pause must be observed before anything is asserted about idling";
+
+        // The mask is opened only now, which is what makes this scenario deterministic rather than a
+        // race against a wrapping ring: every record that exists from here was emitted by a worker
+        // that had already been told to pause. Waiting on the ring while it fills would be the
+        // alternative, and reading a ring while its thread emits is undefined by contract.
+        const RingStats before = ringStats();
+        setCategories(categoryMask(Category::schedulerLoop));
+        expect(spinUntil([&before] {
+            const RingStats now = ringStats();
+            return (now.recorded + now.lost) > (before.recorded + before.lost) + 8UL;
+        })) << "a paused worker must keep recording, or it is not cycling at all";
+
+        std::ignore = scheduler.changeStateTo(gr::lifecycle::State::REQUESTED_STOP);
+        std::ignore = scheduler.changeStateTo(gr::lifecycle::State::STOPPED);
+        scheduler.waitDone();
+
+        // Collected only now the pool is joined.
+        std::size_t             pausedIdles = 0UZ;
+        std::set<std::uint32_t> reasons;
+        for (const Event& event : collect()) {
+            if (event.kind == Kind::idle) {
+                reasons.insert(event.payload0);
+                if (event.payload0 == std::to_underlying(IdleReason::paused)) {
+                    ++pausedIdles;
+                }
+            }
+        }
+        exportTimeline("t1-idle-paused");
+
+        expect(gt(pausedIdles, 0UZ)) << "pausing a running pool must leave idle records carrying the paused reason";
+        expect(!reasons.contains(std::to_underlying(IdleReason::noProgress))) << "noProgress belongs to singleThreadedBlocking; seeing it here would mean the reason is not taken from the branch it sits in";
+
+        setCategories(0U);
+        reset();
     };
 
     "the settings drive the layer, and the buffer size is applied before the mask"_test = [] {
