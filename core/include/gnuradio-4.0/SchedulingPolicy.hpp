@@ -75,7 +75,7 @@ enum class SelectionStrategy : std::uint8_t {
 /// Whether the ordering key is fixed once the schedule is formed, and the list can be pre-sorted.
 [[nodiscard]] constexpr bool hasStaticKey(PriorityClass priorityClass) noexcept { return priorityClass == PriorityClass::none || priorityClass == PriorityClass::fixedTask; }
 
-/// Whether the policy needs job-release and absolute-deadline bookkeeping (§3.4).
+/// Whether the policy needs job-release and absolute-deadline bookkeeping.
 [[nodiscard]] constexpr bool needsReleaseTracking(PriorityClass priorityClass) noexcept { return priorityClass == PriorityClass::fixedJob || priorityClass == PriorityClass::dynamic; }
 
 /// Whether the worker selects the highest-priority eligible block each time, rather than sweeping.
@@ -92,7 +92,7 @@ struct Job {
 
 /// Fixed-capacity ring over storage owned elsewhere: the scheduler allocates one arena during setup
 /// and hands each block a slice, so releasing a job never allocates. Capacity is per block and
-/// derived, not a constant -- see DEVLOG_M3 §5.7.
+/// derived from the gating input capacity divided by the block's batch floor, not a constant.
 struct JobQueue {
     std::span<Job> storage{};
     std::size_t    head = 0UZ;
@@ -157,7 +157,7 @@ struct SchedState {
     JobQueue jobs{};
 
     /// Zero-initialised on purpose: it makes the temporal gate vacuous on the first sweep, so a
-    /// block's first release is decided by data alone (DEVLOG_M3 §5A.5).
+    /// block's first release is decided by data alone.
     std::chrono::steady_clock::time_point lastRelease{};
 
     /// Samples already committed to released-but-unexecuted jobs, so two jobs cannot claim the
@@ -168,7 +168,7 @@ struct SchedState {
     std::size_t batchFloor = 1UZ;
 
     /// Resolved period and relative deadline in seconds, `0` meaning unset. A zero period imposes
-    /// no temporal gate, leaving release governed by data alone (DEVLOG_M3 §5.3).
+    /// no temporal gate, leaving release governed by data alone.
     double periodSeconds           = 0.0;
     double relativeDeadlineSeconds = 0.0;
 
@@ -179,12 +179,12 @@ struct SchedState {
     /// non-zero count used to imply a bookkeeping defect. The `max_outstanding_jobs` clamp removes
     /// that guarantee deliberately, and with it the distinction: under a clamp every block can
     /// saturate, and this counts how often the cap, rather than the data, was the binding
-    /// constraint (DEVLOG_M3 §5.7).
+    /// constraint.
     std::size_t overruns = 0UZ;
 
     /// Indices, within this worker's own list, of the blocks this one feeds. Event-driven release
     /// detection walks these after a `work()` that produced output; cross-worker edges are absent
-    /// by construction and are covered by the per-sweep backstop instead (DEVLOG_M3 §5A.12).
+    /// by construction and are covered by the per-sweep backstop instead.
     std::span<const std::size_t> successors{};
 };
 

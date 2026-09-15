@@ -75,7 +75,7 @@ struct Chain {
 
 /// Declares the `fixedJob` class purely to engage release tracking. Its key is the block's
 /// position, so the ordering is the identity permutation and any behaviour seen under it comes from
-/// the job machinery rather than from a new selection order (DEVLOG_M3 §5.9). Not a scheduling
+/// the job machinery rather than from a new selection order. Not a scheduling
 /// policy anyone should use -- `EdfPolicy` is what will key on the deadlines this builds.
 struct ReleaseProbePolicy {
     static constexpr std::string_view kName          = "ReleaseProbe";
@@ -828,7 +828,7 @@ const boost::ut::suite<"multi-threaded release tracking"> threadedTests = [] {
 
     "cross-worker chains deliver every sample"_test = [] {
         // Every edge crosses a worker boundary, so successor lists are empty by construction and the
-        // per-sweep backstop is the only thing that can release a consumer (DEVLOG_M3 §5A.12).
+        // per-sweep backstop is the only thing that can release a consumer.
         const auto [a, b] = runThreaded<EdfPolicy>(Placement::crossWorker, kThreadedSamples);
         expect(eq(a, kThreadedSamples)) << "chain A lost samples across the worker boundary";
         expect(eq(b, kThreadedSamples)) << "chain B lost samples across the worker boundary";
@@ -853,7 +853,7 @@ const boost::ut::suite<"multi-threaded release tracking"> threadedTests = [] {
         // `RateMonotonicPolicy` is `fixedTask`, so `hasStaticKey` holds, the list is pre-sorted and
         // the polling selection loop runs -- no release tracking, and therefore none of the
         // cross-worker problem. It is the deadline-derived ordering that *is* available under
-        // threads right now (DEVLOG_M3 §17).
+        // threads right now.
         const auto [crossA, crossB] = runThreaded<RateMonotonicPolicy>(Placement::crossWorker, kThreadedSamples);
         expect(eq(crossA, kThreadedSamples));
         expect(eq(crossB, kThreadedSamples));
@@ -878,7 +878,7 @@ const boost::ut::suite<"multi-threaded release tracking"> threadedTests = [] {
 
 const boost::ut::suite<"end-of-stream readiness"> eosTests = [] {
     "work(1) on an ended, empty port reports DONE"_test = [] {
-        // The assumption the whole termination argument rests on (DEVLOG_M3 §18.4). If an ended but
+        // The assumption the whole termination argument rests on. If an ended but
         // empty port answers INSUFFICIENT_INPUT_ITEMS instead, a waived-floor job would never finish
         // the block and the worker would spin.
         gr::Graph graph;

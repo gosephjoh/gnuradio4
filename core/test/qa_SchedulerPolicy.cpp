@@ -341,9 +341,10 @@ const boost::ut::suite<"SchedulingPolicy"> schedulingPolicyTests = [] {
     };
 
     "the selection bound returns control to the worker"_test = [] {
-        // The hang risk of §8.3: house-keeping, message handling and lifecycle checks all live
-        // *between* passes, so an unbounded selection loop would not merely starve low-priority
-        // blocks -- it would stop the worker responding at all. Every `step()` must return.
+        // The hang risk this bound exists to remove: house-keeping, message handling and lifecycle
+        // checks all live *between* passes, so an unbounded selection loop would not merely starve
+        // low-priority blocks -- it would stop the worker responding at all. Every `step()` must
+        // return.
         gr::Graph graph;
         auto&     src  = graph.emplaceBlock<gr::testing::ConstantSource<float>>({{"n_samples_max", gr::Size_t{100000}}});
         auto&     mid  = graph.emplaceBlock<RecordingCopy<float>>({{"name", std::string("mid")}, {"sched_priority", std::int32_t{99}}});

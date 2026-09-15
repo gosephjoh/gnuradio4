@@ -358,7 +358,7 @@ public:
         for (std::size_t i = 0UZ; i < blocks.size(); ++i) {
             // The user's own declaration is block-local, so it survives adoption intact -- which is
             // what makes an *absolute* priority scheme exact for adopted blocks where a
-            // rate-monotonic one cannot be (DEVLOG_M2 §3.2).
+            // rate-monotonic one cannot be.
             const std::int32_t userPriority = static_cast<std::int32_t>(gr::scheduler::detail::settingAsDouble(*blocks[i], "sched_priority", 0.0));
 
             std::size_t  ceiling  = kUnboundedBatch;
@@ -373,7 +373,7 @@ public:
                 // input to `executionCeiling` is block-local (its own `max_batch_size`, the
                 // scheduler ceiling, its own ports), so no graph pass is needed. Falling back to
                 // `max_work_items` would silently discard an explicit per-block ceiling for the
-                // rest of the run, breaking "user-set values always win" (§4.2) for exactly the
+                // rest of the run, breaking "user-set values always win" for exactly the
                 // blocks whose configuration arrived most recently.
                 ceiling = _batchStrategy->resolve(*blocks[i], static_cast<std::size_t>(max_work_items)).executionCeiling;
             }
@@ -381,7 +381,7 @@ public:
 
             if constexpr (needsReleaseTracking(TPolicy::kPriorityClass)) {
                 // The gates' inputs. A block the analysis does not know keeps period and deadline at
-                // zero, which by DEVLOG_M3 §5.3 leaves it released on data alone -- the same
+                // zero, which leaves it released on data alone -- the same
                 // deliberately-imperfect treatment adopted blocks already receive for priority.
                 states[i].batchFloor = gr::scheduler::detail::releaseThreshold(*blocks[i]);
                 if (const DerivedAttributes* attributes = _schedulingAnalysis.find(*blocks[i]); attributes != nullptr) {
@@ -926,7 +926,7 @@ protected:
 
     /// N.B. `states` is parallel to `blocks`; each entry supplies that block's batch ceiling.
     /// Do not reach for `max_work_items` directly here -- routing every batch decision through the
-    /// resolver is what keeps the executor and the derivation from disagreeing (DEVLOG_M1 §14.2).
+    /// resolver is what keeps the executor and the derivation from disagreeing.
     ///
     /// Two loops, selected by the policy's `PriorityClass`:
     ///
@@ -1377,9 +1377,9 @@ protected:
                     gr::scheduler::detail::applyStaticOrder<TPolicy>(localBlockList, localStates);
 
                     // N.B. `syncSchedStates()` assigns whole `SchedState`s, so this also discards
-                    // every outstanding job and resets `lastRelease`. Correct on an actual mutation
-                    // (DEVLOG_M3 §5A.8), but it rides the house-keeping cadence and so fires even
-                    // when nothing changed -- a known defect, recorded rather than papered over.
+                    // every outstanding job and resets `lastRelease`. That is correct on an actual
+                    // graph mutation, but it rides the house-keeping cadence and so fires even when
+                    // nothing changed -- a known defect, recorded rather than papered over.
                     if constexpr (needsReleaseTracking(TPolicy::kPriorityClass)) {
                         buildReleaseStorage(localBlockList, localStates, localJobArena, localSuccessorArena, localReadyHeap);
                     }

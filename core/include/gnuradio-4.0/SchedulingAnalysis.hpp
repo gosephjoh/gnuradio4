@@ -68,12 +68,12 @@ struct DerivedAttributes {
 
     /// The source this block's rate descends from. Periods are anchored against *this* source's
     /// `sample_rate`, not a single graph-wide one, so independent chains keep independent
-    /// timebases and one chain's rate cannot rescale another's (debt D3).
+    /// timebases and one chain's rate cannot rescale another's.
     const BlockModel* originSource = nullptr;
 
     /// Rate of the stream this block processes, relative to its source's -- the propagated
     /// primitive. It depends only on resampling ratios and strides, never on batch sizes, which is
-    /// what lets blocks run at different batches without disturbing one another (§14.5).
+    /// what lets blocks run at different batches without disturbing one another.
     double relativeSampleRate = 1.0;
 
     double      relativeRate = 1.0; /// invocations per invocation of the component's source; derived from the above
@@ -178,7 +178,7 @@ namespace detail {
 /// Samples the stream advances per invocation -- `stride` where it is active, otherwise the
 /// window itself. This is the *consumption* quantum, which sets invocation rate and downstream
 /// sample rate; the *work* quantum, which execution cost scales with, is the window. The two
-/// coincide only while stride is inactive -- see STRIDE_SEMANTICS.md, "the two quanta".
+/// coincide only while stride is inactive.
 [[nodiscard]] inline std::size_t effectiveAdvance(const BlockModel& block) {
     const std::size_t chunk = std::max(settingAsSize(block, "input_chunk_size", 1UZ), 1UZ);
     return strideActive(block) ? std::max(settingAsSize(block, "stride", chunk), 1UZ) : chunk;
@@ -189,7 +189,7 @@ namespace detail {
 /// The one place the port-gating rule lives: which ports count, and how their per-port quantities
 /// combine. Everything that reasons about a block's input gate goes through it, because two
 /// implementations of this rule agreeing on the combination and diverging on the membership is
-/// exactly how the capacity bound came to be computed over the wrong ports (§15).
+/// exactly how the capacity bound came to be computed over the wrong ports.
 ///
 /// A port counts when it is **connected** and is a **stream** port. Message ports are excluded
 /// deliberately: `Port::kIsSynch` is "synchronous unless marked `Async`", so a message port reports
@@ -765,7 +765,7 @@ requires std::invocable<const TUserSetLookup&, const BlockModel&>
     // reference source, so it stays meaningful on graphs with no absolute anchor at all.
     const auto consumedPerInvocation = [&analysis](BlockModel& block) {
         // What the *stream* advances per invocation, which is what sets how often the block fires.
-        // Only stride separates this from the batch the block processes -- STRIDE_SEMANTICS.md.
+        // Only stride separates this from the batch the block processes.
         return detail::strideActive(block) ? static_cast<double>(detail::effectiveAdvance(block)) : static_cast<double>(analysis.perBlock.at(std::addressof(block)).nominalBatch);
     };
 
@@ -788,7 +788,7 @@ requires std::invocable<const TUserSetLookup&, const BlockModel&>
     // different sample rates have two timebases, and forcing them onto one silently rescales every
     // period in the losing chain -- by 48x for a 1 kHz chain measured against a 48 kHz anchor. It
     // was also decided by block *name*, since findSourceBlocks() sorts by name, so renaming a block
-    // could change every derived period in the graph (debt D3).
+    // could change every derived period in the graph.
     std::unordered_map<const BlockModel*, double> anchorOf;
     std::size_t                                   anchoredSources = 0UZ;
     for (const std::shared_ptr<BlockModel>& source : sources) {
