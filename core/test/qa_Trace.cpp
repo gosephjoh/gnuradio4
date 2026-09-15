@@ -34,7 +34,7 @@ namespace {
 
 /// The on-disk layout, restated independently of the struct so that a field reorder fails here
 /// rather than silently changing the `.gr4trace` format. Any change to this table is a format
-/// change and must bump `formatVersion` in the file header (T0e).
+/// change and must bump `formatVersion` in the file header.
 struct FieldOffset {
     std::string_view name;
     std::size_t      offset;

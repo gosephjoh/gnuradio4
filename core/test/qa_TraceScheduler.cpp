@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <filesystem>
 #include <format>
 #include <set>
 #include <string>
@@ -767,6 +768,105 @@ const boost::ut::suite<"TraceScheduler"> traceSchedulerTests = [] {
         std::ignore = syncsLosing;
 
         setCategories(0U);
+    };
+
+    "the settings drive the layer, and the buffer size is applied before the mask"_test = [] {
+        reset();
+        setCategories(0U);
+
+        Chain chain;
+        chain.build(1024UZ);
+        TestScheduler scheduler;
+        expect(scheduler.exchange(std::move(chain.graph)).has_value() >> fatal);
+
+        // Order matters and is asserted here rather than trusted: a ring is allocated when a thread
+        // first emits, and a thread only emits once a category is live, so a capacity applied after
+        // the mask would leave already-started threads on the previous size.
+        expect(scheduler.settings().set({{"trace_buffer_size", gr::Size_t{128U}}, {"trace_categories", gr::Size_t{categoryMask(Category::work)}}}).empty() >> fatal);
+        std::ignore = scheduler.settings().activateContext();
+        std::ignore = scheduler.settings().applyStagedParameters();
+
+        expect(eq(categories(), categoryMask(Category::work))) << "the setting must reach the layer";
+        expect(eq(ringCapacity(), 128UZ)) << "and so must the buffer size";
+
+        std::ignore = scheduler.settings().set({{"trace_categories", gr::Size_t{0U}}});
+        std::ignore = scheduler.settings().activateContext();
+        std::ignore = scheduler.settings().applyStagedParameters();
+        expect(eq(categories(), 0U)) << "clearing the setting must stop the capture";
+
+        setRingCapacity(kDefaultRingCapacity);
+        reset();
+    };
+
+    "trace control over the message channel starts, dumps and stops a capture"_test = [] {
+        reset();
+        setCategories(0U);
+
+        Chain chain;
+        chain.build(4096UZ);
+        TestScheduler  scheduler;
+        gr::MsgPortOut toScheduler;
+        gr::MsgPortIn  fromScheduler;
+        expect(scheduler.exchange(std::move(chain.graph)).has_value() >> fatal);
+        expect(toScheduler.connect(scheduler.msgIn).has_value() >> fatal);
+        expect(scheduler.msgOut.connect(fromScheduler).has_value() >> fatal);
+        expect(scheduler.changeStateTo(gr::lifecycle::State::INITIALISED).has_value() >> fatal);
+        expect(scheduler.changeStateTo(gr::lifecycle::State::RUNNING).has_value() >> fatal);
+
+        // Driven through the real channel rather than by calling the handler: the handler is
+        // protected, and reaching past that would test a path no user can take.
+        const auto request = [&](gr::property_map data) {
+            gr::sendMessage<gr::message::Command::Set>(toScheduler, scheduler.unique_name, gr::scheduler::property::kTraceControl, std::move(data));
+            scheduler.processScheduledMessages();
+            std::ignore = scheduler.step();
+            std::vector<gr::Message> replies;
+            auto                     span = fromScheduler.streamReader().get();
+            for (const auto& reply : span) {
+                replies.push_back(reply);
+            }
+            std::ignore = span.consume(span.size());
+            return replies;
+        };
+        const auto lastReply = [](const std::vector<gr::Message>& replies) -> std::optional<gr::Message> { return replies.empty() ? std::nullopt : std::optional{replies.back()}; };
+        const auto field     = [](const std::optional<gr::Message>& reply, std::string_view key) -> gr::Size_t {
+            if (!reply.has_value() || !reply->data.has_value()) {
+                return gr::Size_t{0U};
+            }
+            const auto& map = reply->data.value();
+            const auto  it  = map.find(key);
+            return it != map.end() ? (*it).second.value_or(gr::Size_t{0U}) : gr::Size_t{0U};
+        };
+
+        const auto started = lastReply(request({{"command", std::string("start")}, {"categories", gr::Size_t{categoryMask(Category::work)}}}));
+        expect(started.has_value() >> fatal) << "start must be answered";
+        expect(eq(field(started, "categories"), categoryMask(Category::work))) << "and must report the mask it set";
+        expect(eq(categories(), categoryMask(Category::work))) << "the layer itself must be live";
+
+        for (std::size_t pass = 0UZ; pass < 8UZ; ++pass) {
+            std::ignore = scheduler.step();
+        }
+
+        const std::filesystem::path file   = std::filesystem::temp_directory_path() / std::format("qa_TraceScheduler_msg_{}.gr4trace", ::getpid());
+        const auto                  dumped = lastReply(request({{"command", std::string("dump")}, {"path", file.string()}}));
+        expect(dumped.has_value() >> fatal) << "dump must be answered";
+        expect(gt(field(dumped, "records"), gr::Size_t{0U})) << "a live capture must have recorded something";
+        expect(std::filesystem::exists(file)) << "and the file must be on disk";
+        expect(gt(std::filesystem::file_size(file), sizeof(FileHeader))) << "with records in it, not just a header";
+
+        const auto stopped = lastReply(request({{"command", std::string("stop")}}));
+        expect(stopped.has_value() >> fatal);
+        expect(eq(categories(), 0U)) << "stop must clear the mask";
+
+        // A malformed request arrives over a message channel from anywhere, so it must come back as
+        // an error rather than take the scheduler down.
+        const auto bad = lastReply(request({{"command", std::string("frobnicate")}}));
+        expect(bad.has_value() >> fatal) << "an unknown command must still be answered";
+        expect(!bad->data.has_value()) << "and the answer must be an error";
+        expect(scheduler.state() == gr::lifecycle::State::RUNNING) << "a bad request must not stop the scheduler";
+
+        std::filesystem::remove(file);
+        std::ignore = scheduler.changeStateTo(gr::lifecycle::State::STOPPED);
+        reset();
     };
 };
 

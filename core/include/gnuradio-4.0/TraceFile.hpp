@@ -108,7 +108,8 @@ static_assert(std::is_standard_layout_v<EntityRecord>);
  *
  * Zero records is a success, not an error: "nothing was traced" and "the file could not be opened"
  * are different answers and a caller will want to tell them apart — which is why this returns
- * `std::expected` rather than a count with a magic value, and why it does not throw (CLAUDE.md §5).
+ * `std::expected` rather than a count with a magic value, and why it does not throw: this is
+ * library code, and the project's error handling is exception-free.
  */
 [[nodiscard]] std::expected<std::size_t, gr::Error> dump(std::string_view path);
 

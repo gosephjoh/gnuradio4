@@ -20,6 +20,7 @@
 #include <gnuradio-4.0/SchedulerModel.hpp> // nested-scheduler dispatch (detail::asSchedulerModel)
 #include <gnuradio-4.0/SchedulingAnalysis.hpp>
 #include <gnuradio-4.0/SchedulingPolicy.hpp>
+#include <gnuradio-4.0/TraceFile.hpp>
 #include <gnuradio-4.0/meta/indirect.hpp>
 #include <gnuradio-4.0/meta/reflection.hpp>
 #include <gnuradio-4.0/thread/thread_pool.hpp>
@@ -66,6 +67,8 @@ inline static const char* const kGroupBlocks   = "GroupBlocks";
 inline static const char* const kUngroupBlocks = "UngroupBlocks";
 inline static const char* const kEmplaceEdge   = "EmplaceEdge";
 inline static const char* const kRemoveEdge    = "RemoveEdge";
+
+inline static const char* const kTraceControl = "TraceControl";
 
 inline static const char* const kBlockEmplaced   = "BlockEmplaced";
 inline static const char* const kBlockRemoved    = "BlockRemoved";
@@ -286,6 +289,7 @@ private:
         callbacks[scheduler::property::kReplaceBlock]     = static_cast<PropertyCallback>(&SchedulerBase::propertyCallbackReplaceBlock);
         callbacks[scheduler::property::kGraphGRC]         = static_cast<PropertyCallback>(&SchedulerBase::propertyCallbackGraphGRC);
         callbacks[scheduler::property::kSchedulerInspect] = static_cast<PropertyCallback>(&SchedulerBase::propertyCallbackSchedulerInspect);
+        callbacks[scheduler::property::kTraceControl]     = static_cast<PropertyCallback>(&SchedulerBase::propertyCallbackTraceControl);
         this->settings().updateActiveParameters();
     }
 
@@ -306,7 +310,10 @@ public:
     Annotated<SelectionStrategy, "selection_strategy", Doc<"dynamic-key policies: how the next block is picked -- linearScan (O(n), no auxiliary state) or readyHeap (O(log n), heap rebuilt per pass)">> selection_strategy      = SelectionStrategy::linearScan;
     Annotated<gr::Size_t, "max_outstanding_jobs", Doc<"release-tracking policies: cap on a block's outstanding jobs, clamping the buffer-derived bound (0: uncapped)">>                                   max_outstanding_jobs    = kDefaultMaxOutstandingJobs;
 
-    GR_MAKE_REFLECTABLE(SchedulerBase, timeout_ms, watchdog_timeout, timeout_inactivity_count, process_stream_to_message_ratio, house_keeping_policy, house_keeping_depth, max_work_items, max_selections_per_pass, max_outstanding_jobs, selection_strategy, poolName, sched_settings);
+    Annotated<gr::Size_t, "trace_categories", Doc<"bitmask of live trace-marker groups (0: tracing off). Inert unless the trace layer was compiled in">>                      trace_categories  = 0U;
+    Annotated<gr::Size_t, "trace_buffer_size", Doc<"records retained per emitting thread; rounded up to a power of two. Takes effect for threads that have not yet emitted">> trace_buffer_size = 65536U;
+
+    GR_MAKE_REFLECTABLE(SchedulerBase, timeout_ms, watchdog_timeout, timeout_inactivity_count, process_stream_to_message_ratio, house_keeping_policy, house_keeping_depth, max_work_items, max_selections_per_pass, max_outstanding_jobs, selection_strategy, trace_categories, trace_buffer_size, poolName, sched_settings);
 
     constexpr static block::Category blockCategory = block::Category::ScheduledBlockGroup;
 
@@ -686,6 +693,18 @@ public:
     }
 
     void settingsChanged(const property_map& /*oldSettings*/, const property_map& newSettings) noexcept {
+        if constexpr (gr::trace::kEnabled) {
+            // Capacity first, then categories. A ring is allocated when a thread first emits, and a
+            // thread only emits once some category is live -- so setting the capacity afterwards would
+            // leave every thread that had already started on the previous size.
+            if (newSettings.contains("trace_buffer_size")) {
+                gr::trace::setRingCapacity(static_cast<std::size_t>(trace_buffer_size));
+            }
+            if (newSettings.contains("trace_categories")) {
+                gr::trace::setCategories(static_cast<std::uint32_t>(trace_categories));
+            }
+        }
+
         if (!newSettings.contains("poolName")) {
             return;
         }
@@ -1803,6 +1822,73 @@ protected:
             std::lock_guard movedBlockGuard(*movedBlockList.mutex);
 
             moveToMovedList(workList, movedBlockList);
+        }
+    }
+
+    /**
+     * @brief Starts, stops and dumps a trace capture over the message channel.
+     *
+     * `command` is one of `start`, `stop`, `dump` or `status`. `start` takes an optional
+     * `categories` mask and `stop` clears it; `dump` takes a `path` and writes the capture there.
+     * Every reply carries the live mask and the record counts, so a caller that only wants to know
+     * what is being captured sends `status`.
+     *
+     * A dump parks the workers first. Records are fixed-size but not written atomically, so a reader
+     * walking a ring while its thread is still emitting can observe a torn record; with the workers
+     * quiescent there is nothing to tear.
+     */
+    std::optional<Message> propertyCallbackTraceControl([[maybe_unused]] std::string_view propertyName, Message message) {
+        assert(propertyName == scheduler::property::kTraceControl);
+        auto&      messageData = message.data.value();
+        const auto findOr      = [&messageData](std::string_view key) -> Value {
+            auto it = messageData.find(key);
+            return it != messageData.end() ? (*it).second : Value{};
+        };
+
+        const Value       commandValue = findOr(std::string_view{"command"});
+        const std::string command(commandValue.value_or(std::string_view{"status"}));
+
+        if constexpr (!gr::trace::kEnabled) {
+            message.data = std::unexpected(Error{"trace control requested, but the trace layer was not compiled in: configure with -DGR4_ENABLE_TRACING=ON"});
+            return message;
+        } else {
+            if (command == "start") {
+                const Value      maskValue = findOr(std::string_view{"categories"});
+                const gr::Size_t mask      = maskValue.value_or(gr::Size_t{gr::trace::kAllCategories});
+                trace_categories.value     = mask;
+                gr::trace::setCategories(mask); // routed through here, so starting a capture re-anchors its clock
+            } else if (command == "stop") {
+                trace_categories.value = 0U;
+                gr::trace::setCategories(0U);
+            } else if (command == "dump") {
+                const Value       pathValue = findOr(std::string_view{"path"});
+                const std::string path(pathValue.value_or(std::string_view{}));
+                if (path.empty()) {
+                    message.data = std::unexpected(Error{"trace dump requires a non-empty 'path'"});
+                    return message;
+                }
+
+                // Parked, not merely asked: the dump reads rings that other threads own.
+                const std::expected<std::size_t, gr::Error> written = [&] {
+                    WorkQuiescenceGuard quiescence(this);
+                    return gr::trace::dump(path);
+                }();
+                if (!written) {
+                    message.data = std::unexpected(written.error());
+                    return message;
+                }
+                messageData.insert_or_assign(std::string_view{"records"}, static_cast<gr::Size_t>(*written));
+            } else if (command != "status") {
+                message.data = std::unexpected(Error{std::format("unknown trace command '{}': expected start, stop, dump or status", command)});
+                return message;
+            }
+
+            const gr::trace::RingStats stats = gr::trace::ringStats();
+            messageData.insert_or_assign(std::string_view{"categories"}, gr::trace::categories());
+            messageData.insert_or_assign(std::string_view{"recorded"}, static_cast<gr::Size_t>(stats.recorded));
+            messageData.insert_or_assign(std::string_view{"lost"}, static_cast<gr::Size_t>(stats.lost));
+            messageData.insert_or_assign(std::string_view{"rings"}, static_cast<gr::Size_t>(stats.rings));
+            return message;
         }
     }
 
