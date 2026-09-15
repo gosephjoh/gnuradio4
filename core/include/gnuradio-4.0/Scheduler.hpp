@@ -976,10 +976,40 @@ protected:
         // apart: an unproductive probe, accounted for by the `workProbe` that follows in the same
         // sweep; or -- if it is the last record on its ring -- a `work()` that never returned.
         [[maybe_unused]] const auto traceLeave = [&](std::size_t i, std::uint64_t entered, std::size_t requested, std::size_t performed, work::Status status, gr::trace::LoopKind loopKind, std::uint8_t extraFlags) {
-            if (!traceWork || status == work::Status::INSUFFICIENT_INPUT_ITEMS || status == work::Status::INSUFFICIENT_OUTPUT_ITEMS) {
+            if (!traceWork) {
+                return;
+            }
+            if (status == work::Status::INSUFFICIENT_INPUT_ITEMS || status == work::Status::INSUFFICIENT_OUTPUT_ITEMS) {
+                // Aggregated, not recorded. The second clock read is bought deliberately: differencing
+                // adjacent records would fold the scheduler overhead between invocations into the probe
+                // cost, and separating those two is the entire reason `work()` emits a pair at all.
+                if (i < states.size()) {
+                    ++states[i].probeCount;
+                    states[i].probeNs += gr::trace::now() - entered;
+                }
                 return;
             }
             gr::trace::emit(gr::trace::Event{.startNs = entered, .durationNs = gr::trace::durationOf(entered, gr::trace::now()), .payload0 = gr::trace::saturate(requested), .payload1 = gr::trace::saturate(performed), .entity = entityFor(i), .kind = gr::trace::Kind::workEnd, .workerId = traceWorkerId, .status = static_cast<std::int8_t>(status), .flags = static_cast<std::uint8_t>(std::to_underlying(loopKind) | extraFlags)});
+        };
+
+        // Flushed on *every* exit path, the two ERROR returns included, so a pass that failed still
+        // reports what its probing cost -- which is exactly the pass someone will be looking at.
+        // `on_scope_exit` rather than a line before each return: three call sites that must not drift
+        // is how the ERROR path ends up silently uninstrumented.
+        [[maybe_unused]] on_scope_exit flushProbes = [&] {
+            if constexpr (gr::trace::kEnabled) {
+                if (!traceWork) {
+                    return;
+                }
+                for (std::size_t i = 0UZ; i < std::min(blocks.size(), states.size()); ++i) {
+                    if (states[i].probeCount == 0U) {
+                        continue;
+                    }
+                    gr::trace::emit(gr::trace::Event{.startNs = gr::trace::now(), .payload0 = states[i].probeCount, .payload1 = gr::trace::saturate(states[i].probeNs), .entity = states[i].entityId, .kind = gr::trace::Kind::workProbe, .workerId = traceWorkerId});
+                    states[i].probeCount = 0U;
+                    states[i].probeNs    = 0UL;
+                }
+            }
         };
 
         // Backstop release pass. Covers what event-driven detection cannot reach: sources, which

@@ -153,6 +153,16 @@ struct SchedState {
     /// inheriting a derived rank -- and because, being block-local, it survives adoption intact.
     std::int32_t userPriority = 0;
 
+    /// Unproductive `work()` invocations this sweep, and what they cost. Aggregated rather than
+    /// recorded one record at a time: under round robin and fixed priority `work()` doubles as the
+    /// eligibility oracle, so most invocations do nothing, and a record each would bury the
+    /// productive ones. Flushed to one `workProbe` per block per sweep and zeroed.
+    ///
+    /// Reset wholesale by `syncSchedStates()` on the house-keeping cadence, which is harmless: these
+    /// are per-sweep quantities and the sweep that filled them has already flushed them.
+    std::uint32_t probeCount = 0U;
+    std::uint64_t probeNs    = 0UL;
+
     /// Set when the block has reported `DONE`, so a selection loop can skip it instead of
     /// re-probing it on every restart. Cleared whenever the states are re-derived, which is the
     /// right scope: a graph mutation invalidates the conclusion.

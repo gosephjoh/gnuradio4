@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <format>
 #include <set>
 #include <string>
 #include <tuple>
@@ -62,6 +64,21 @@ void collectingConsumer(const gr::trace::Event& event, void* user) noexcept { st
     std::vector<gr::trace::Event> events;
     std::ignore = gr::trace::forEachEvent(collectingConsumer, &events);
     return events;
+}
+
+/// Writes the capture to `$GR4_TRACE_ARTEFACT_DIR/<name>.gr4trace` when that variable is set.
+///
+/// Unset -- every ordinary test run, and CI -- and this is a no-op, so the suite stays hermetic and
+/// writes nothing. Capturing a timeline to inspect by hand is an explicit opt-in, which keeps a
+/// test that asserts behaviour from also being a test that depends on a writable directory.
+void exportTimeline([[maybe_unused]] std::string_view name) {
+    if constexpr (gr::trace::kEnabled) {
+        const char* directory = std::getenv("GR4_TRACE_ARTEFACT_DIR");
+        if (directory == nullptr) {
+            return;
+        }
+        std::ignore = gr::trace::dump(std::format("{}/{}.gr4trace", directory, name));
+    }
 }
 
 [[nodiscard]] std::vector<gr::trace::EntityId> idsOf(const std::vector<const void*>& keys) {
@@ -320,6 +337,7 @@ const boost::ut::suite<"TraceScheduler"> traceSchedulerTests = [] {
             }
             expect(neq(event.entity, kNoEntity)) << "every work record must name the block it came from";
         }
+        exportTimeline("t1b-progress-filter");
         expect(gt(begins, 0UZ));
         expect(gt(ends, 0UZ));
         expect(ge(begins, ends)) << "every workEnd has a workBegin; the surplus is probes and, at most, one hang";
@@ -365,6 +383,7 @@ const boost::ut::suite<"TraceScheduler"> traceSchedulerTests = [] {
             }
             totalWork += ends[i].durationNs;
         }
+        exportTimeline("t1b-overhead");
         expect(eq(measurable, ends.size() - 1UZ)) << "an invocation must not appear to start before the previous one finished";
         expect(gt(totalWork, 0UL)) << "durations must be non-zero -- a work() that did something takes time";
 
@@ -427,6 +446,113 @@ const boost::ut::suite<"TraceScheduler"> traceSchedulerTests = [] {
 
         expect(eq(untraced.size(), traced.size()) >> fatal);
         expect(std::ranges::equal(untraced, traced)) << "tracing changed the work::Result sequence -- the layer is not behaviour-neutral";
+    };
+
+    "unproductive invocations are counted, not recorded one by one"_test = [] {
+        reset();
+        setCategories(categoryMask(Category::work));
+
+        // Sink first again, so the opening passes starve it and the copy (see the filter scenario).
+        gr::Graph graph;
+        auto&     sink   = graph.emplaceBlock<gr::testing::NullSink<float>>({{"name", std::string("snk")}});
+        auto&     copy   = graph.emplaceBlock<gr::testing::Copy<float>>({{"name", std::string("mid")}});
+        auto&     source = graph.emplaceBlock<gr::testing::ConstantSource<float>>({{"name", std::string("src")}, {"n_samples_max", gr::Size_t{1024U}}});
+        std::ignore      = graph.connect<"out", "in">(source, copy);
+        std::ignore      = graph.connect<"out", "in">(copy, sink);
+
+        TestScheduler scheduler;
+        expect(scheduler.exchange(std::move(graph)).has_value() >> fatal);
+        expect(scheduler.changeStateTo(gr::lifecycle::State::INITIALISED).has_value() >> fatal);
+        expect(scheduler.changeStateTo(gr::lifecycle::State::RUNNING).has_value() >> fatal);
+        for (std::size_t pass = 0UZ; pass < 8UZ; ++pass) {
+            std::ignore = scheduler.step();
+        }
+
+        std::size_t   probeRecords = 0UZ;
+        std::uint64_t probedCalls  = 0UL;
+        std::size_t   begins       = 0UZ;
+        std::size_t   ends         = 0UZ;
+        for (const Event& event : collect()) {
+            switch (event.kind) {
+            case Kind::workProbe:
+                ++probeRecords;
+                probedCalls += event.payload0;
+                expect(gt(event.payload0, 0U)) << "an empty aggregate must not be emitted at all";
+                expect(neq(event.entity, kNoEntity)) << "a probe record must name its block";
+                expect(eq(event.durationNs, 0U)) << "workProbe is an instant; the cost is in payload1";
+                break;
+            case Kind::workBegin: ++begins; break;
+            case Kind::workEnd: ++ends; break;
+            default: break;
+            }
+        }
+
+        exportTimeline("t1c-probes-roundrobin");
+        expect(gt(probeRecords, 0UZ) >> fatal) << "this graph must starve blocks, or the aggregation is never reached";
+        expect(eq(probedCalls, std::uint64_t{begins - ends})) << "every unmatched workBegin must be accounted for by exactly one probe count: "
+                                                                 "the two are the same invocations counted two ways";
+
+        // Note what is *not* asserted here: that aggregation reduced the record count. Round robin
+        // calls each block exactly once per sweep, so a block can probe at most once before the flush
+        // and one record per probe is the floor. Aggregation only bites where a block is re-probed
+        // within a single pass, which is the fixed-priority loop's strict restart -- covered below.
+
+        setCategories(0U);
+        std::ignore = scheduler.changeStateTo(gr::lifecycle::State::STOPPED);
+    };
+
+    "the fixed-priority restart is where aggregation actually pays"_test = [] {
+        reset();
+        setCategories(categoryMask(Category::work));
+
+        // The fixed-priority loop restarts at index 0 after every successful selection, so a starved
+        // high-priority block is re-probed once per selection rather than once per sweep. That is the
+        // shape the aggregation exists for, and round robin -- one call per block per sweep -- can
+        // never exhibit it.
+        gr::Graph graph;
+        auto&     sink   = graph.emplaceBlock<gr::testing::NullSink<float>>({{"name", std::string("snk")}, {"sched_priority", 9}});
+        auto&     copy   = graph.emplaceBlock<gr::testing::Copy<float>>({{"name", std::string("mid")}, {"sched_priority", 5}});
+        auto&     source = graph.emplaceBlock<gr::testing::ConstantSource<float>>({{"name", std::string("src")}, {"sched_priority", 1}, {"n_samples_max", gr::Size_t{4096U}}});
+        std::ignore      = graph.connect<"out", "in">(source, copy);
+        std::ignore      = graph.connect<"out", "in">(copy, sink);
+
+        gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::externalStep, gr::profiling::null::Profiler, gr::scheduler::FixedPriorityPolicy> scheduler;
+        expect(scheduler.exchange(std::move(graph)).has_value() >> fatal);
+        expect(scheduler.changeStateTo(gr::lifecycle::State::INITIALISED).has_value() >> fatal);
+        expect(scheduler.changeStateTo(gr::lifecycle::State::RUNNING).has_value() >> fatal);
+        for (std::size_t pass = 0UZ; pass < 8UZ; ++pass) {
+            std::ignore = scheduler.step();
+        }
+
+        std::uint32_t largestAggregate = 0U;
+        std::uint64_t probedCalls      = 0UL;
+        std::size_t   begins           = 0UZ;
+        std::size_t   ends             = 0UZ;
+        for (const Event& event : collect()) {
+            switch (event.kind) {
+            case Kind::workProbe:
+                largestAggregate = std::max(largestAggregate, event.payload0);
+                probedCalls += event.payload0;
+                break;
+            case Kind::workBegin: ++begins; break;
+            case Kind::workEnd: ++ends; break;
+            default: break;
+            }
+        }
+
+        exportTimeline("t1c-probes-fixedpriority");
+        expect(gt(probedCalls, 0UL) >> fatal) << "the restart must re-probe starved blocks";
+        expect(eq(probedCalls, std::uint64_t{begins - ends})) << "the accounting identity holds under every loop";
+
+        // Asserted as the mechanism, not as a ratio. `records < calls` happens to hold here by a
+        // margin of one, which is a statistical accident of how much this graph probes rather than
+        // evidence that anything was collapsed; a single record carrying a count above one is the
+        // property itself.
+        expect(gt(largestAggregate, 1U)) << "no probe record collapsed more than one invocation, so the aggregation "
+                                            "did nothing that a record-per-probe would not have done";
+
+        setCategories(0U);
+        std::ignore = scheduler.changeStateTo(gr::lifecycle::State::STOPPED);
     };
 };
 
