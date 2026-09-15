@@ -1420,6 +1420,9 @@ protected:
         // job list has been copied, and "how many blocks did this worker own" is the first thing a
         // reader wants from a worker's first record.
         [[maybe_unused]] std::size_t sweepCount = 0UZ;
+        // Previous pass's block list, by address, so a re-sync can say whether anything actually
+        // changed. Only populated when tracing is compiled in.
+        [[maybe_unused]] std::vector<const void*> traceListFingerprint;
         if constexpr (gr::trace::kEnabled) {
             gr::trace::emit(gr::trace::Event{.startNs = gr::trace::now(), .payload0 = static_cast<std::uint32_t>(localBlockList.size()), .payload1 = static_cast<std::uint32_t>(gr::trace::currentCpu()), .kind = gr::trace::Kind::workerStart, .workerId = static_cast<std::uint8_t>(runnerID)});
         }
@@ -1447,6 +1450,7 @@ protected:
             const bool hasMessagesToProcess = msgToCount == 0UZ || //
                                               (runnerID == 0UZ && (this->msgIn.available() > 0UZ || _fromChildMessagePort.available() > 0UZ));
             if (hasMessagesToProcess) {
+                [[maybe_unused]] gr::trace::Scope messageScope{gr::trace::Event{.payload0 = gr::trace::saturate(msgToCount), .payload1 = static_cast<std::uint32_t>(localBlockList.size()), .kind = gr::trace::Kind::messagePhase, .workerId = static_cast<std::uint8_t>(runnerID)}};
                 if (runnerID == 0UZ) {
                     this->processScheduledMessages(); // execute the scheduler- and Graph-specific message handler only once globally
                     if (initialGeneration != gr::atomic_ref(_graphGeneration).load_acquire()) {
@@ -1460,21 +1464,63 @@ protected:
                 // this block to preserve adoption/removal ordering. Some messages, such as grouping/ungrouping
                 // and emplacing and removing edges, may modify these ports while work quiescence is requested.
                 WorkGuard isWorking(this);
+                if (!isWorking) {
+                    // Not a wait: the guard denies the pass outright while a structural change is in
+                    // flight. Recorded so that a stall shows up as "quiescence was requested" rather
+                    // than as an unexplained gap between sweeps.
+                    if constexpr (gr::trace::kEnabled) {
+                        messageScope.event().flags |= gr::trace::flag::kQuiescenceDenied;
+                        gr::trace::emit(gr::trace::Event{.startNs = gr::trace::now(), .kind = gr::trace::Kind::quiescenceWait, .workerId = static_cast<std::uint8_t>(runnerID)});
+                    }
+                }
                 if (isWorking) {
                     // we must always clean up removed blocks before accessing localBlockList
                     cleanupRemovedBlocks(runnerID, localBlockList);
 
                     // Zombies are cleaned per-thread, as we remove from the localBlockList as well.
                     // Cleaning zombies has low priority, so uses process_stream_to_message_ratio (a different ratio could be introduced)
-                    cleanupZombieBlocks(localBlockList);
+                    {
+                        [[maybe_unused]] gr::trace::Scope reapScope{gr::trace::Event{.payload0 = gr::trace::saturate(localBlockList.size()), .kind = gr::trace::Kind::zombieReap, .workerId = static_cast<std::uint8_t>(runnerID)}};
+                        cleanupZombieBlocks(localBlockList);
+                        if constexpr (gr::trace::kEnabled) {
+                            reapScope.event().payload1 = gr::trace::saturate(localBlockList.size());
+                        }
+                    }
 
-                    adoptBlocks(runnerID, localBlockList);
+                    {
+                        [[maybe_unused]] gr::trace::Scope adoptScope{gr::trace::Event{.payload0 = gr::trace::saturate(localBlockList.size()), .kind = gr::trace::Kind::adopt, .workerId = static_cast<std::uint8_t>(runnerID)}};
+                        adoptBlocks(runnerID, localBlockList);
+                        if constexpr (gr::trace::kEnabled) {
+                            adoptScope.event().payload1 = gr::trace::saturate(localBlockList.size());
+                        }
+                    }
 
                     // Removal, zombie cleanup and adoption all mutate `localBlockList`, so the
                     // parallel state must be re-derived before it is indexed again. Unconditionally:
                     // a removal and an adoption in the same pass leave the size unchanged while the
                     // *contents* differ, so a size comparison would silently hand each block its
                     // neighbour's ceiling. This runs on the house-keeping cadence, not per pass.
+                    // The re-sync rides the message/house-keeping cadence, not an actual mutation, and
+                    // it assigns whole states -- so it also discards every outstanding job and resets
+                    // each block's last-release time. Whether that is a real cost depends on how often
+                    // it fires with nothing having changed, which nobody had measured. The comparison
+                    // is over the block *pointers*, because a removal and an adoption in the same pass
+                    // leave the size identical while the contents differ.
+                    [[maybe_unused]] gr::trace::Scope syncScope{gr::trace::Event{.payload0 = gr::trace::saturate(localBlockList.size()), .kind = gr::trace::Kind::stateSync, .workerId = static_cast<std::uint8_t>(runnerID)}};
+                    if constexpr (gr::trace::kEnabled) {
+                        std::uint64_t discarded = 0UL;
+                        for (const SchedState& state : localStates) {
+                            discarded += state.jobs.size;
+                        }
+                        syncScope.event().payload1 = gr::trace::saturate(discarded);
+                        syncScope.event().flags    = (localBlockList.size() != traceListFingerprint.size() || !std::ranges::equal(localBlockList, traceListFingerprint, {}, [](const auto& b) { return b.get(); }, [](const void* p) { return p; })) ? gr::trace::flag::kListChanged : std::uint8_t{0U};
+                        traceListFingerprint.clear();
+                        traceListFingerprint.reserve(localBlockList.size());
+                        for (const auto& block : localBlockList) {
+                            traceListFingerprint.push_back(static_cast<const void*>(block.get()));
+                        }
+                    }
+
                     syncSchedStates(localBlockList, localStates, static_cast<std::uint8_t>(runnerID));
 
                     // Re-order after the mutations (the M0 obligation): adoption appends to the end
@@ -1495,8 +1541,9 @@ protected:
                     // the scheduler-driven trigger entirely (intrinsic writer-pressure path still
                     // fires inside the buffer); Aggressive's post-consume hook is a follow-up.
                     if (house_keeping_policy.value != HouseKeepPolicy::Light) {
-                        const HouseKeepPolicy policy = house_keeping_policy.value;
-                        const HouseKeepDepth  depth  = house_keeping_depth.value;
+                        const HouseKeepPolicy             policy = house_keeping_policy.value;
+                        const HouseKeepDepth              depth  = house_keeping_depth.value;
+                        [[maybe_unused]] gr::trace::Scope houseKeepScope{gr::trace::Event{.payload0 = gr::trace::saturate(localBlockList.size()), .payload1 = static_cast<std::uint32_t>(std::to_underlying(policy)), .payload2 = static_cast<std::uint32_t>(std::to_underlying(depth)), .kind = gr::trace::Kind::houseKeeping, .workerId = static_cast<std::uint8_t>(runnerID)}};
                         std::ranges::for_each(localBlockList, [policy, depth](auto& b) { b->houseKeeping(policy, depth); });
                     }
                 }

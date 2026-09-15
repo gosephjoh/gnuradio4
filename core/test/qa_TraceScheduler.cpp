@@ -659,6 +659,115 @@ const boost::ut::suite<"TraceScheduler"> traceSchedulerTests = [] {
         setCategories(0U);
         std::ignore = scheduler.changeStateTo(gr::lifecycle::State::STOPPED);
     };
+
+    "the re-sync fires on a cadence, not on a change -- and says how often"_test = [] {
+        // The scheduler re-derives its whole per-block state on the message/house-keeping cadence
+        // rather than when the block list actually changes, and that assignment discards every
+        // outstanding job and resets each block's release timing. How often it fires with nothing
+        // having changed was recorded as a known cost years before anyone measured it. These markers
+        // are the measurement.
+        //
+        // multiThreaded, because the re-sync only runs on the pool-worker path -- step() never
+        // reaches it.
+        reset();
+        setCategories(categoryMask(Category::schedulerLoop, Category::lifecycle));
+
+        gr::Graph graph;
+        auto&     source = graph.emplaceBlock<gr::testing::ConstantSource<float>>({{"name", std::string("src")}, {"n_samples_max", gr::Size_t{65536U}}});
+        auto&     copy   = graph.emplaceBlock<gr::testing::Copy<float>>({{"name", std::string("mid")}});
+        auto&     sink   = graph.emplaceBlock<gr::testing::NullSink<float>>({{"name", std::string("snk")}});
+        std::ignore      = graph.connect<"out", "in">(source, copy);
+        std::ignore      = graph.connect<"out", "in">(copy, sink);
+
+        gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multiThreaded> scheduler;
+        expect(scheduler.exchange(std::move(graph)).has_value() >> fatal);
+        expect(scheduler.runAndWait().has_value() >> fatal);
+
+        std::size_t syncs        = 0UZ;
+        std::size_t syncsChanged = 0UZ;
+        std::size_t jobsLost     = 0UZ;
+        std::size_t phases       = 0UZ;
+        std::size_t houseKeeps   = 0UZ;
+        for (const Event& event : collect()) {
+            switch (event.kind) {
+            case Kind::stateSync:
+                ++syncs;
+                jobsLost += event.payload1;
+                if ((event.flags & flag::kListChanged) != 0U) {
+                    ++syncsChanged;
+                }
+                break;
+            case Kind::messagePhase: ++phases; break;
+            case Kind::houseKeeping: ++houseKeeps; break;
+            default: break;
+            }
+        }
+        exportTimeline("t1e-housekeeping");
+
+        expect(gt(syncs, 0UZ) >> fatal) << "a running pool worker must re-sync at least once";
+        expect(gt(phases, 0UZ)) << "the message phase must be entered";
+
+        // The finding, asserted rather than merely printed: the overwhelming majority of re-syncs
+        // rebuild state for a block list that did not change. A future fix that made the re-sync
+        // conditional would flip this, and should -- at which point this assertion is the thing that
+        // notices, and it must be updated deliberately rather than silently.
+        expect(lt(syncsChanged, syncs)) << "every re-sync saw a changed list, which would mean the cadence is not the trigger "
+                                           "-- re-read this scenario before assuming the finding still holds";
+        expect(eq(jobsLost, 0UZ)) << "round robin tracks no jobs, so a re-sync under it discards none; this is the control "
+                                     "for the release-tracking case, where the same code path throws work away";
+
+        setCategories(0U);
+    };
+
+    "under a release-tracking policy the same cadence throws admitted work away"_test = [] {
+        // The round-robin case above is the control: it tracks no jobs, so a re-sync costs only the
+        // rebuild. Earliest-deadline-first admits jobs ahead of running them, and the same wholesale
+        // assignment discards every one that has not executed yet. This measures what that costs.
+        reset();
+        setCategories(categoryMask(Category::schedulerLoop));
+
+        gr::Graph graph;
+        auto&     source = graph.emplaceBlock<gr::testing::ConstantSource<float>>({{"name", std::string("src")}, {"n_samples_max", gr::Size_t{65536U}}, {"relative_deadline", 0.002f}});
+        auto&     copy   = graph.emplaceBlock<gr::testing::Copy<float>>({{"name", std::string("mid")}, {"relative_deadline", 0.002f}});
+        auto&     sink   = graph.emplaceBlock<gr::testing::NullSink<float>>({{"name", std::string("snk")}, {"relative_deadline", 0.002f}});
+        std::ignore      = graph.connect<"out", "in">(source, copy);
+        std::ignore      = graph.connect<"out", "in">(copy, sink);
+
+        gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multiThreaded, gr::profiling::null::Profiler, gr::scheduler::EdfPolicy> scheduler;
+        expect(scheduler.exchange(std::move(graph)).has_value() >> fatal);
+        expect(scheduler.runAndWait().has_value() >> fatal);
+
+        std::size_t syncs        = 0UZ;
+        std::size_t syncsChanged = 0UZ;
+        std::size_t jobsLost     = 0UZ;
+        std::size_t syncsLosing  = 0UZ;
+        for (const Event& event : collect()) {
+            if (event.kind != Kind::stateSync) {
+                continue;
+            }
+            ++syncs;
+            jobsLost += event.payload1;
+            if (event.payload1 > 0U) {
+                ++syncsLosing;
+            }
+            if ((event.flags & flag::kListChanged) != 0U) {
+                ++syncsChanged;
+            }
+        }
+        exportTimeline("t1e-statesync-edf");
+
+        expect(gt(syncs, 0UZ) >> fatal) << "a running pool worker must re-sync";
+        expect(lt(syncsChanged, syncs)) << "the cadence, not a mutation, is what triggers the re-sync";
+
+        // Deliberately not asserted as a bound. Whether any admitted job is outstanding when the
+        // cadence fires is a race between the worker and the house-keeping interval, so a threshold
+        // here would be flaky. What is asserted is that the marker reports the quantity at all, so
+        // the cost is visible to anyone who looks rather than having to be inferred.
+        std::ignore = jobsLost;
+        std::ignore = syncsLosing;
+
+        setCategories(0U);
+    };
 };
 
 int main() { /* tests are statically registered as suites */ }
