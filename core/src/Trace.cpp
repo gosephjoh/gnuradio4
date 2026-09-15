@@ -22,6 +22,11 @@
 #define GR_TRACE_HAS_GETPID 1
 #endif
 
+#if !defined(EMBEDDED) && defined(__linux__) && __has_include(<sched.h>)
+#include <sched.h>
+#define GR_TRACE_HAS_SCHED_GETCPU 1
+#endif
+
 #if !defined(EMBEDDED)
 #if defined(__has_include)
 #if __has_include(<time.h>)
@@ -218,6 +223,14 @@ Ring* createThreadRing() noexcept {
 }
 
 } // namespace detail
+
+std::int32_t currentCpu() noexcept {
+#if defined(GR_TRACE_HAS_SCHED_GETCPU)
+    return ::sched_getcpu();
+#else
+    return -1; // not knowable here; a report must say "unknown" rather than invent core 0
+#endif
+}
 
 void setCategories(std::uint32_t mask) noexcept {
     const std::uint32_t previous = gr::atomic_ref(detail::gCategoryMask).load_relaxed();

@@ -554,6 +554,111 @@ const boost::ut::suite<"TraceScheduler"> traceSchedulerTests = [] {
         setCategories(0U);
         std::ignore = scheduler.changeStateTo(gr::lifecycle::State::STOPPED);
     };
+
+    "a sweep brackets the work it drove, and says which driver drove it"_test = [] {
+        reset();
+        setCategories(categoryMask(Category::work, Category::schedulerLoop));
+
+        Chain chain;
+        chain.build(4096UZ);
+        TestScheduler scheduler;
+        expect(scheduler.exchange(std::move(chain.graph)).has_value() >> fatal);
+        expect(scheduler.changeStateTo(gr::lifecycle::State::INITIALISED).has_value() >> fatal);
+        expect(scheduler.changeStateTo(gr::lifecycle::State::RUNNING).has_value() >> fatal);
+        constexpr std::size_t kPasses = 6UZ;
+        for (std::size_t pass = 0UZ; pass < kPasses; ++pass) {
+            std::ignore = scheduler.step();
+        }
+
+        std::vector<Event> sweeps;
+        std::vector<Event> works;
+        for (const Event& event : collect()) {
+            if (event.kind == Kind::sweep) {
+                sweeps.push_back(event);
+            }
+            if (event.kind == Kind::workEnd) {
+                works.push_back(event);
+            }
+        }
+        exportTimeline("t1d-sweeps");
+
+        expect(eq(sweeps.size(), kPasses)) << "exactly one sweep record per step()";
+        for (const Event& sweep : sweeps) {
+            expect(eq(sweep.entity, kNoEntity)) << "a sweep is worker-scoped, not block-scoped";
+            expect(eq(static_cast<std::uint8_t>(sweep.flags & flag::kViaStep), flag::kViaStep)) << "an externalStep scheduler's sweeps must say so -- otherwise a step()-driven trace "
+                                                                                                   "reads as a pool worker's and the idle behaviour looks inexplicable";
+            expect(eq(sweep.payload0, 3U)) << "the sweep records how many blocks it swept";
+        }
+
+        // Every invocation must fall inside the sweep that drove it. This is what makes the two
+        // record kinds one timeline rather than two overlaid guesses.
+        std::size_t contained = 0UZ;
+        for (const Event& work : works) {
+            for (const Event& sweep : sweeps) {
+                if (work.startNs >= sweep.startNs && (work.startNs + work.durationNs) <= (sweep.startNs + sweep.durationNs)) {
+                    ++contained;
+                    break;
+                }
+            }
+        }
+        expect(eq(contained, works.size())) << "a work record fell outside every sweep";
+
+        setCategories(0U);
+        std::ignore = scheduler.changeStateTo(gr::lifecycle::State::STOPPED);
+    };
+
+    "a finished graph keeps re-invoking its blocks, and the sweep records say so"_test = [] {
+        // After a graph finishes, round robin calls every block again on every sweep and each
+        // reports DONE, which the progress filter treats as productive -- correctly, since a source
+        // that publishes everything and finishes reports zero performed work. The concern is that in
+        // an *overwriting* ring a flood of terminal DONE records would evict the history worth
+        // keeping, so this pins down how far that can actually go.
+        reset();
+        setCategories(categoryMask(Category::work, Category::schedulerLoop));
+
+        Chain chain;
+        chain.build(256UZ); // finishes almost immediately, then is stepped well past the end
+        TestScheduler scheduler;
+        expect(scheduler.exchange(std::move(chain.graph)).has_value() >> fatal);
+        expect(scheduler.changeStateTo(gr::lifecycle::State::INITIALISED).has_value() >> fatal);
+        expect(scheduler.changeStateTo(gr::lifecycle::State::RUNNING).has_value() >> fatal);
+        for (std::size_t pass = 0UZ; pass < 40UZ; ++pass) {
+            std::ignore = scheduler.step();
+        }
+
+        std::size_t doneRecords = 0UZ;
+        std::size_t okRecords   = 0UZ;
+        std::size_t doneSweeps  = 0UZ;
+        std::size_t sweeps      = 0UZ;
+        for (const Event& event : collect()) {
+            if (event.kind == Kind::workEnd) {
+                if (event.status == static_cast<std::int8_t>(gr::work::Status::DONE)) {
+                    ++doneRecords;
+                }
+                if (event.status == static_cast<std::int8_t>(gr::work::Status::OK)) {
+                    ++okRecords;
+                }
+            }
+            if (event.kind == Kind::sweep) {
+                ++sweeps;
+                if (event.status == static_cast<std::int8_t>(gr::work::Status::DONE)) {
+                    ++doneSweeps;
+                }
+            }
+        }
+        exportTimeline("t1d-terminal-done");
+
+        expect(gt(okRecords, 0UZ) >> fatal) << "the graph must actually have done work";
+        expect(gt(doneSweeps, 0UZ)) << "a sweep whose blocks have all finished must report DONE, which is what lets a real "
+                                       "worker break its loop -- the bound on the flood";
+        // Recorded rather than asserted as a limit: the ratio is what it is, and the point is that a
+        // caller who keeps step()ing a finished graph pays for it in records. A pool worker does not,
+        // because it breaks out when a sweep returns DONE.
+        expect(lt(doneSweeps, sweeps)) << "not every sweep can be terminal, or the graph never ran";
+
+        setCategories(0U);
+        std::ignore = scheduler.changeStateTo(gr::lifecycle::State::STOPPED);
+    };
 };
 
 int main() { /* tests are statically registered as suites */ }

@@ -992,12 +992,25 @@ protected:
             gr::trace::emit(gr::trace::Event{.startNs = entered, .durationNs = gr::trace::durationOf(entered, gr::trace::now()), .payload0 = gr::trace::saturate(requested), .payload1 = gr::trace::saturate(performed), .entity = entityFor(i), .kind = gr::trace::Kind::workEnd, .workerId = traceWorkerId, .status = static_cast<std::int8_t>(status), .flags = static_cast<std::uint8_t>(std::to_underlying(loopKind) | extraFlags)});
         };
 
+        // One sweep marker here rather than one at each caller: `traverseBlockListOnce` *is* the sweep,
+        // and `poolWorker` is unreachable under `externalStep` (only singleThreaded, its blocking
+        // variant and multiThreaded call it), so which driver produced this pass is a compile-time
+        // fact and needs no parameter.
+        constexpr std::uint8_t            kSweepFlags = (executionPolicy() == ExecutionPolicy::externalStep) ? gr::trace::flag::kViaStep : std::uint8_t{0U};
+        [[maybe_unused]] gr::trace::Scope sweepScope{gr::trace::Event{.kind = gr::trace::Kind::sweep, .workerId = traceWorkerId, .flags = kSweepFlags}};
+
         // Flushed on *every* exit path, the two ERROR returns included, so a pass that failed still
         // reports what its probing cost -- which is exactly the pass someone will be looking at.
         // `on_scope_exit` rather than a line before each return: three call sites that must not drift
         // is how the ERROR path ends up silently uninstrumented.
+        //
+        // Declared *after* `sweepScope`, so it destructs *before* it: the probe records and the
+        // sweep's own payload are both in place by the time the scope emits.
         [[maybe_unused]] on_scope_exit flushProbes = [&] {
             if constexpr (gr::trace::kEnabled) {
+                sweepScope.event().payload0 = static_cast<std::uint32_t>(blocks.size());
+                sweepScope.event().payload1 = gr::trace::saturate(performedWorkAllBlocks);
+                sweepScope.event().status   = static_cast<std::int8_t>(unfinishedBlocksExist ? work::Status::OK : work::Status::DONE);
                 if (!traceWork) {
                     return;
                 }
@@ -1403,6 +1416,19 @@ protected:
             return;
         }
 
+        // Placed here rather than at function entry because `localBlockList` is only known once the
+        // job list has been copied, and "how many blocks did this worker own" is the first thing a
+        // reader wants from a worker's first record.
+        [[maybe_unused]] std::size_t sweepCount = 0UZ;
+        if constexpr (gr::trace::kEnabled) {
+            gr::trace::emit(gr::trace::Event{.startNs = gr::trace::now(), .payload0 = static_cast<std::uint32_t>(localBlockList.size()), .payload1 = static_cast<std::uint32_t>(gr::trace::currentCpu()), .kind = gr::trace::Kind::workerStart, .workerId = static_cast<std::uint8_t>(runnerID)});
+        }
+        [[maybe_unused]] on_scope_exit traceWorkerStop = [&] {
+            if constexpr (gr::trace::kEnabled) {
+                gr::trace::emit(gr::trace::Event{.startNs = gr::trace::now(), .payload0 = gr::trace::saturate(sweepCount), .payload1 = static_cast<std::uint32_t>(gr::trace::ringStats().lost), .kind = gr::trace::Kind::workerStop, .workerId = static_cast<std::uint8_t>(runnerID)});
+            }
+        };
+
         const auto            initialGeneration  = gr::atomic_ref(_graphGeneration).load_acquire();
         [[maybe_unused]] auto currentProgress    = this->_graph->progress().value();
         std::size_t           inactiveCycleCount = 0UZ;
@@ -1491,6 +1517,7 @@ protected:
                     cleanupRemovedBlocks(runnerID, localBlockList);
                     idleUntilAdoption = localBlockList.empty();
                     if (!idleUntilAdoption) {
+                        ++sweepCount;
                         gr::work::Result result = traverseBlockListOnce(localBlockList, localStates, std::span<ReadyEntry>{localReadyHeap}, static_cast<std::uint8_t>(runnerID));
                         if (result.status == work::Status::DONE) {
                             break; // nothing happened -> shutdown this worker
@@ -1501,13 +1528,16 @@ protected:
                     }
                 }
                 if (idleUntilAdoption) {
+                    [[maybe_unused]] gr::trace::Scope idleScope{gr::trace::Event{.payload0 = std::to_underlying(gr::trace::IdleReason::awaitingAdoption), .kind = gr::trace::Kind::idle, .workerId = static_cast<std::uint8_t>(runnerID)}};
                     std::this_thread::sleep_for(std::chrono::milliseconds(timeout_ms));
                     msgToCount = 0UZ;
                 }
             } else if (activeState == PAUSED) {
+                [[maybe_unused]] gr::trace::Scope idleScope{gr::trace::Event{.payload0 = std::to_underlying(gr::trace::IdleReason::paused), .kind = gr::trace::Kind::idle, .workerId = static_cast<std::uint8_t>(runnerID)}};
                 std::this_thread::sleep_for(std::chrono::milliseconds(timeout_ms));
                 msgToCount = 0UZ;
             } else { // other states
+                [[maybe_unused]] gr::trace::Scope idleScope{gr::trace::Event{.payload0 = std::to_underlying(gr::trace::IdleReason::otherState), .kind = gr::trace::Kind::idle, .workerId = static_cast<std::uint8_t>(runnerID)}};
                 std::this_thread::sleep_for(std::chrono::milliseconds(timeout_ms));
                 msgToCount = 0UZ;
             }
@@ -1525,6 +1555,7 @@ protected:
                 if (inactiveCycleCount > timeout_inactivity_count) {
                     // allow a scheduler process to wait on progress before retrying (N.B. intended to save CPU/battery power)
                     // N.B. a watchdog will periodically update the progress to check for non-responsive blocks.
+                    [[maybe_unused]] gr::trace::Scope idleScope{gr::trace::Event{.payload0 = std::to_underlying(gr::trace::IdleReason::noProgress), .payload1 = gr::trace::saturate(inactiveCycleCount), .kind = gr::trace::Kind::idle, .workerId = static_cast<std::uint8_t>(runnerID)}};
                     waitUntilChanged(*progress, currentProgress, timeout_ms);
                     msgToCount = 0UZ;
                 }

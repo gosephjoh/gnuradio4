@@ -191,6 +191,14 @@ inline constexpr std::uint8_t kDeadlineSuspect   = 1U << 1; /// ... but the dead
 
 } // namespace flag
 
+/// Why a worker slept rather than worked, in `Kind::idle`'s `payload0`.
+enum class IdleReason : std::uint32_t {
+    awaitingAdoption, /// the block list is empty and the worker is waiting to be given work
+    paused,           /// the scheduler is PAUSED
+    otherState,       /// neither RUNNING nor PAUSED
+    noProgress        /// `singleThreadedBlocking` waiting on the progress counter
+};
+
 /// Which loop ran a `workBegin`/`workEnd` invocation, in `flags & flag::kLoopKindMask`.
 enum class LoopKind : std::uint8_t { roundRobin = 0U, fixedPriority = 1U, jobDriven = 2U };
 
@@ -442,6 +450,11 @@ struct RingStats {
 /// Default ring: 65536 records, 2 MB per thread. Affordable because a ring is allocated lazily on a
 /// thread's first *enabled* emit — a tracing-enabled binary with a zero mask allocates nothing.
 inline constexpr std::size_t kDefaultRingCapacity = 65536UZ;
+
+/// The CPU this thread is running on, or -1 where the platform cannot say. Read once per worker at
+/// start-up and never on the hot path: it is the thread-to-core mapping a report needs in order to
+/// explain why two workers that ought to be independent are not.
+[[nodiscard]] std::int32_t currentCpu() noexcept;
 
 void                        setCategories(std::uint32_t mask) noexcept;
 [[nodiscard]] std::uint32_t categories() noexcept;
