@@ -252,6 +252,20 @@ static_assert(std::is_standard_layout_v<Event>); /// so the writer may `offsetof
  */
 [[nodiscard]] constexpr std::uint32_t saturate(std::uint64_t value) noexcept { return value >= std::uint64_t{kUnsetDeadline} ? kSaturated : static_cast<std::uint32_t>(value); }
 
+/// A worker beyond what the 8-bit field can express. Distinct from every real id, so an overflowed
+/// record is recognisable rather than silently attributed to somebody else.
+inline constexpr std::uint8_t kWorkerOverflow = 255U;
+
+/**
+ * Narrows a runner id into `Event::workerId`, saturating onto `kWorkerOverflow`.
+ *
+ * A plain cast wraps: worker 256 becomes worker 0 and its records merge with the *busiest* worker's,
+ * which is the one a reader is most likely to be studying. Saturating costs the single id 255 and
+ * keeps every surviving attribution honest. Unreachable on today's hardware -- and invisible on the
+ * day it is not, which is why it is a named function rather than a cast repeated at each marker.
+ */
+[[nodiscard]] constexpr std::uint8_t workerIdOf(std::size_t runnerId) noexcept { return runnerId >= std::size_t{kWorkerOverflow} ? kWorkerOverflow : static_cast<std::uint8_t>(runnerId); }
+
 /**
  * @brief The marker clock, and why it is this one.
  *
@@ -345,6 +359,17 @@ Ring* createThreadRing() noexcept;
 
 [[nodiscard]] inline Ring* threadRing() noexcept { return tRing != nullptr ? tRing : createThreadRing(); }
 
+/// The push itself, with **no category check**. Callers that have already decided to record use this;
+/// everything else goes through `emit()`.
+inline void append(const Event& event) noexcept {
+    Ring* ring = threadRing();
+    if (ring == nullptr) [[unlikely]] {
+        return; // the slab could not be allocated; losing records beats failing the graph
+    }
+    ring->slots[ring->sequence & ring->mask] = event;
+    ++ring->sequence;
+}
+
 } // namespace detail
 
 /// One relaxed load and a predictable branch — the whole cost of a marker whose category is off.
@@ -373,12 +398,7 @@ inline void emit(Event event) noexcept {
         if (!categoryEnabled(categoryOf(event.kind))) [[likely]] {
             return;
         }
-        detail::Ring* ring = detail::threadRing();
-        if (ring == nullptr) [[unlikely]] {
-            return; // the slab could not be allocated; losing records beats failing the graph
-        }
-        ring->slots[ring->sequence & ring->mask] = event;
-        ++ring->sequence;
+        detail::append(event);
     }
 }
 
@@ -424,7 +444,13 @@ public:
             }
             _armed            = false;
             _event.durationNs = durationOf(_event.startNs, endNs);
-            emit(_event);
+
+            // Deliberately **not** `emit()`. A scope that armed has already had its category
+            // decision made, and re-checking the live mask here would let a capture stopped
+            // mid-scope discard the enclosing record while the markers nested inside it -- emitted
+            // while the mask was still live -- survive. A reader would then see an interval that
+            // opened and never closed, which is the shape of a hang. The latch is the decision.
+            detail::append(_event);
         }
     }
 

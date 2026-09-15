@@ -286,6 +286,29 @@ const boost::ut::suite<"Trace"> traceTests = [] {
             expect(eq(forEachEvent(countingConsumer, &gCounter), 0UZ)) << "GR_ENABLE_TRACING is off; emit must be a no-op";
             expect(eq(ringStats().rings, 0UZ)) << "and no ring may be allocated";
         };
+
+        "a compiled-out build still dumps a valid, empty file"_test = [] {
+            // A tool pointed at a build with tracing off must get a well-formed file saying "nothing
+            // was captured", not a missing file, an error, or a truncated one. Otherwise the tool has
+            // to special-case a configuration it cannot detect from the outside.
+            const std::filesystem::path file    = std::filesystem::temp_directory_path() / std::format("qa_Trace_off_{}.gr4trace", ::getpid());
+            const auto                  written = dump(file.string());
+            expect(written.has_value() >> fatal) << "tracing being compiled out is not a dump failure";
+            expect(eq(written.value(), 0UZ));
+            expect(eq(std::filesystem::file_size(file), sizeof(FileHeader))) << "a header and nothing else";
+
+            std::ifstream in(file, std::ios::binary);
+            FileHeader    header{};
+            in.read(reinterpret_cast<char*>(&header), sizeof(FileHeader));
+            expect(eq(std::string_view(header.magic.data(), 8UZ), std::string_view("GR4TRACE")));
+            expect(eq(header.eventCount, 0UL));
+            expect(eq(header.entityCount, 0UL));
+            expect(eq(header.ringCount, 0UL));
+            expect(eq(header.lostCount, 0UL)) << "nothing was captured, so nothing was lost -- the two must not be conflated";
+            expect(eq(header.eventBytes, static_cast<std::uint32_t>(sizeof(Event)))) << "the layout must still be declared, so a reader can reject a mismatched build";
+
+            std::filesystem::remove(file);
+        };
         return;
     }
 
@@ -299,7 +322,7 @@ const boost::ut::suite<"Trace"> traceTests = [] {
 
         emit(Event{.payload0 = 7U, .kind = Kind::workEnd});
         const std::vector<Event> recorded = collect();
-        expect(eq(recorded.size(), 1UZ));
+        expect(eq(recorded.size(), 1UZ) >> fatal);
         expect(eq(recorded.front().payload0, 7U));
         expect(eq(std::to_underlying(recorded.front().kind), std::to_underlying(Kind::workEnd)));
 
@@ -446,7 +469,7 @@ const boost::ut::suite<"Trace"> traceTests = [] {
             scope.finish(9'999UL);        // a second finish must not emit a second record
         }
         std::vector<Event> recorded = collect();
-        expect(eq(recorded.size(), 1UZ)) << "exactly one record per scope";
+        expect(eq(recorded.size(), 1UZ) >> fatal) << "exactly one record per scope";
         expect(eq(recorded.front().durationNs, 250U)) << "the explicit end instant must be used";
         expect(eq(recorded.front().payload1, 42U));
 
@@ -459,6 +482,57 @@ const boost::ut::suite<"Trace"> traceTests = [] {
         expect(eq(recorded.size(), 1UZ)) << "falling out of scope emits too";
 
         setCategories(0U);
+    };
+
+    "an armed scope finishes even if the capture is stopped underneath it"_test = [] {
+        reset();
+        setCategories(categoryMask(Category::schedulerLoop));
+
+        // The markers nested inside a scope are emitted while the mask is live and survive a stop.
+        // If the enclosing scope re-checked the mask on the way out it would be the one record
+        // dropped, leaving an interval that opened and never closed -- the shape of a hang, invented
+        // by the tracer rather than observed in the scheduler.
+        {
+            Scope scope{Event{.kind = Kind::sweep}};
+            expect(neq(scope.event().startNs, 0UL)) << "the scope armed, so it stamped a start";
+            setCategories(0U);
+        }
+
+        const std::vector<Event> recorded = collect();
+        expect(eq(recorded.size(), 1UZ) >> fatal) << "an armed scope owes exactly one record, whatever the mask now says";
+        expect(recorded.front().kind == Kind::sweep);
+
+        reset();
+    };
+
+    "a scope that never armed stays silent even if the capture starts underneath it"_test = [] {
+        reset();
+        setCategories(0U);
+        {
+            Scope scope{Event{.kind = Kind::sweep}};
+            setCategories(categoryMask(Category::schedulerLoop));
+        }
+        expect(eq(collect().size(), 0UZ)) << "a record with no start instant is worse than no record; the latch cuts both ways";
+
+        setCategories(0U);
+        reset();
+    };
+
+    "a worker id past the field saturates rather than wrapping onto another worker"_test = [] {
+        // Widened to 32 bits purely so a failure prints a number rather than a control character.
+        const auto id = [](std::size_t runner) { return std::uint32_t{workerIdOf(runner)}; };
+
+        expect(eq(id(0UZ), 0U));
+        expect(eq(id(254UZ), 254U)) << "the last id the field can express is passed through";
+        expect(eq(id(255UZ), std::uint32_t{kWorkerOverflow}));
+        expect(eq(id(256UZ), std::uint32_t{kWorkerOverflow})) << "a plain cast would make this worker 0 and merge it with the busiest one";
+        expect(eq(id(std::numeric_limits<std::size_t>::max()), std::uint32_t{kWorkerOverflow}));
+
+        // The property that matters is not the value but the collision: no overflowed worker may be
+        // mistaken for a real one, and worker 0 is the one it would otherwise land on.
+        for (const std::size_t runner : {255UZ, 256UZ, 1000UZ, 1UZ << 20U}) {
+            expect(neq(id(runner), id(0UZ))) << "an overflowed id must never read as worker 0";
+        }
     };
 
     "a scope whose category is off costs nothing and emits nothing"_test = [] {
@@ -533,7 +607,7 @@ const boost::ut::suite<"Trace"> traceTests = [] {
         expect(eq(entities, 2UZ)) << "the displaced identity must survive for the records that name it";
 
         const std::vector<Event> recorded = collect();
-        expect(eq(recorded.size(), 1UZ)) << "displacing an identity emits exactly one record";
+        expect(eq(recorded.size(), 1UZ) >> fatal) << "displacing an identity emits exactly one record";
         expect(eq(std::to_underlying(recorded.front().kind), std::to_underlying(Kind::entityRetired)));
         expect(eq(recorded.front().entity, original)) << "and it names the identity that went away";
 
@@ -585,7 +659,7 @@ const boost::ut::suite<"Trace"> traceTests = [] {
         expect(eq(internedId(&block), kNoEntity)) << "the address mapping must be gone";
 
         const std::vector<Event> recorded = collect();
-        expect(eq(recorded.size(), 1UZ)) << "retiring emits exactly one record";
+        expect(eq(recorded.size(), 1UZ) >> fatal) << "retiring emits exactly one record";
         expect(eq(std::to_underlying(recorded.front().kind), std::to_underlying(Kind::entityRetired)));
         expect(eq(recorded.front().entity, id)) << "the record names the identity that went away";
 
@@ -787,6 +861,28 @@ const boost::ut::suite<"Trace"> traceTests = [] {
         expect(eq(written.value(), 0UZ));
         expect(eq(std::filesystem::file_size(file), sizeof(FileHeader)));
         std::filesystem::remove(file);
+    };
+
+    "the image id is stable within a run, which is the only claim it makes"_test = [] {
+        // Two dumps from one process must agree, because that is the comparison the field exists to
+        // support. It deliberately says nothing across runs -- it is an address, and ASLR moves it --
+        // so a reader that compares two files from two executions is reading noise.
+        const std::filesystem::path first  = std::filesystem::temp_directory_path() / std::format("qa_Trace_image_a_{}.gr4trace", ::getpid());
+        const std::filesystem::path second = std::filesystem::temp_directory_path() / std::format("qa_Trace_image_b_{}.gr4trace", ::getpid());
+        expect(dump(first.string()).has_value() >> fatal);
+        expect(dump(second.string()).has_value() >> fatal);
+
+        const auto imageIdOf = [](const std::filesystem::path& path) {
+            std::ifstream in(path, std::ios::binary);
+            FileHeader    header{};
+            in.read(reinterpret_cast<char*>(&header), sizeof(FileHeader));
+            return header.imageId;
+        };
+        expect(neq(imageIdOf(first), 0UL)) << "an unset image id would make every trace look like it came from the same place";
+        expect(eq(imageIdOf(first), imageIdOf(second))) << "two dumps from one process describe one image";
+
+        std::filesystem::remove(first);
+        std::filesystem::remove(second);
     };
 
     "the build flag reaches the header"_test = [] {

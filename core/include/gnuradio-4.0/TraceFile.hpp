@@ -66,6 +66,11 @@ struct FileHeader {
      *
      * It distinguishes images; it does not name them. Naming would need `dladdr`, and a `libdl`
      * dependency in `gnuradio-core` is too much to pay for a diagnostic.
+     *
+     * **Meaningful only within one run.** The value is the address of a file-local object, so address
+     * space layout randomisation gives the same image a different id on every execution. Two traces
+     * captured in the same process may be compared; two captured in different runs may not, and an
+     * equal pair across runs is coincidence rather than evidence.
      */
     std::uint64_t imageId{};
 

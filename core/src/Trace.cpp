@@ -429,7 +429,7 @@ std::size_t forEachEntity(EntityConsumer consumer, void* user) noexcept {
 namespace {
 
 /// Distinguishes this image's copy of the trace layer from any other. The address of a file-local
-/// object is unique per loaded image, which is exactly the distinction `TraceHeader::imageId` has to
+/// object is unique per loaded image, which is exactly the distinction `FileHeader::imageId` has to
 /// record: a statically-linked plugin carries its own rings, so two traces must be tellable apart.
 const char gImageAnchor = '\0';
 

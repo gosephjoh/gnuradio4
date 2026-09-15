@@ -1431,7 +1431,7 @@ protected:
         std::vector<std::size_t> localSuccessorArena;
         std::vector<ReadyEntry>  localReadyHeap;
 
-        syncSchedStates(localBlockList, localStates, static_cast<std::uint8_t>(runnerID));
+        syncSchedStates(localBlockList, localStates, gr::trace::workerIdOf(runnerID));
         gr::scheduler::detail::applyStaticOrder<TPolicy>(localBlockList, localStates); // no-op for RoundRobinPolicy: its key is the position itself
         if constexpr (needsReleaseTracking(TPolicy::kPriorityClass)) {
             buildReleaseStorage(localBlockList, localStates, localJobArena, localSuccessorArena, localReadyHeap);
@@ -1449,11 +1449,11 @@ protected:
         // changed. Only populated when tracing is compiled in.
         [[maybe_unused]] std::vector<const void*> traceListFingerprint;
         if constexpr (gr::trace::kEnabled) {
-            gr::trace::emit(gr::trace::Event{.startNs = gr::trace::now(), .payload0 = static_cast<std::uint32_t>(localBlockList.size()), .payload1 = static_cast<std::uint32_t>(gr::trace::currentCpu()), .kind = gr::trace::Kind::workerStart, .workerId = static_cast<std::uint8_t>(runnerID)});
+            gr::trace::emit(gr::trace::Event{.startNs = gr::trace::now(), .payload0 = static_cast<std::uint32_t>(localBlockList.size()), .payload1 = static_cast<std::uint32_t>(gr::trace::currentCpu()), .kind = gr::trace::Kind::workerStart, .workerId = gr::trace::workerIdOf(runnerID)});
         }
         [[maybe_unused]] on_scope_exit traceWorkerStop = [&] {
             if constexpr (gr::trace::kEnabled) {
-                gr::trace::emit(gr::trace::Event{.startNs = gr::trace::now(), .payload0 = gr::trace::saturate(sweepCount), .payload1 = static_cast<std::uint32_t>(gr::trace::ringStats().lost), .kind = gr::trace::Kind::workerStop, .workerId = static_cast<std::uint8_t>(runnerID)});
+                gr::trace::emit(gr::trace::Event{.startNs = gr::trace::now(), .payload0 = gr::trace::saturate(sweepCount), .payload1 = static_cast<std::uint32_t>(gr::trace::ringStats().lost), .kind = gr::trace::Kind::workerStop, .workerId = gr::trace::workerIdOf(runnerID)});
             }
         };
 
@@ -1475,7 +1475,7 @@ protected:
             const bool hasMessagesToProcess = msgToCount == 0UZ || //
                                               (runnerID == 0UZ && (this->msgIn.available() > 0UZ || _fromChildMessagePort.available() > 0UZ));
             if (hasMessagesToProcess) {
-                [[maybe_unused]] gr::trace::Scope messageScope{gr::trace::Event{.payload0 = gr::trace::saturate(msgToCount), .payload1 = static_cast<std::uint32_t>(localBlockList.size()), .kind = gr::trace::Kind::messagePhase, .workerId = static_cast<std::uint8_t>(runnerID)}};
+                [[maybe_unused]] gr::trace::Scope messageScope{gr::trace::Event{.payload0 = gr::trace::saturate(msgToCount), .payload1 = static_cast<std::uint32_t>(localBlockList.size()), .kind = gr::trace::Kind::messagePhase, .workerId = gr::trace::workerIdOf(runnerID)}};
                 if (runnerID == 0UZ) {
                     this->processScheduledMessages(); // execute the scheduler- and Graph-specific message handler only once globally
                     if (initialGeneration != gr::atomic_ref(_graphGeneration).load_acquire()) {
@@ -1495,7 +1495,7 @@ protected:
                     // than as an unexplained gap between sweeps.
                     if constexpr (gr::trace::kEnabled) {
                         messageScope.event().flags |= gr::trace::flag::kQuiescenceDenied;
-                        gr::trace::emit(gr::trace::Event{.startNs = gr::trace::now(), .kind = gr::trace::Kind::quiescenceWait, .workerId = static_cast<std::uint8_t>(runnerID)});
+                        gr::trace::emit(gr::trace::Event{.startNs = gr::trace::now(), .kind = gr::trace::Kind::quiescenceWait, .workerId = gr::trace::workerIdOf(runnerID)});
                     }
                 }
                 if (isWorking) {
@@ -1505,7 +1505,7 @@ protected:
                     // Zombies are cleaned per-thread, as we remove from the localBlockList as well.
                     // Cleaning zombies has low priority, so uses process_stream_to_message_ratio (a different ratio could be introduced)
                     {
-                        [[maybe_unused]] gr::trace::Scope reapScope{gr::trace::Event{.payload0 = gr::trace::saturate(localBlockList.size()), .kind = gr::trace::Kind::zombieReap, .workerId = static_cast<std::uint8_t>(runnerID)}};
+                        [[maybe_unused]] gr::trace::Scope reapScope{gr::trace::Event{.payload0 = gr::trace::saturate(localBlockList.size()), .kind = gr::trace::Kind::zombieReap, .workerId = gr::trace::workerIdOf(runnerID)}};
                         cleanupZombieBlocks(localBlockList);
                         if constexpr (gr::trace::kEnabled) {
                             reapScope.event().payload1 = gr::trace::saturate(localBlockList.size());
@@ -1513,7 +1513,7 @@ protected:
                     }
 
                     {
-                        [[maybe_unused]] gr::trace::Scope adoptScope{gr::trace::Event{.payload0 = gr::trace::saturate(localBlockList.size()), .kind = gr::trace::Kind::adopt, .workerId = static_cast<std::uint8_t>(runnerID)}};
+                        [[maybe_unused]] gr::trace::Scope adoptScope{gr::trace::Event{.payload0 = gr::trace::saturate(localBlockList.size()), .kind = gr::trace::Kind::adopt, .workerId = gr::trace::workerIdOf(runnerID)}};
                         adoptBlocks(runnerID, localBlockList);
                         if constexpr (gr::trace::kEnabled) {
                             adoptScope.event().payload1 = gr::trace::saturate(localBlockList.size());
@@ -1531,7 +1531,7 @@ protected:
                     // it fires with nothing having changed, which nobody had measured. The comparison
                     // is over the block *pointers*, because a removal and an adoption in the same pass
                     // leave the size identical while the contents differ.
-                    [[maybe_unused]] gr::trace::Scope syncScope{gr::trace::Event{.payload0 = gr::trace::saturate(localBlockList.size()), .kind = gr::trace::Kind::stateSync, .workerId = static_cast<std::uint8_t>(runnerID)}};
+                    [[maybe_unused]] gr::trace::Scope syncScope{gr::trace::Event{.payload0 = gr::trace::saturate(localBlockList.size()), .kind = gr::trace::Kind::stateSync, .workerId = gr::trace::workerIdOf(runnerID)}};
                     if constexpr (gr::trace::kEnabled) {
                         std::uint64_t discarded = 0UL;
                         for (const SchedState& state : localStates) {
@@ -1546,7 +1546,7 @@ protected:
                         }
                     }
 
-                    syncSchedStates(localBlockList, localStates, static_cast<std::uint8_t>(runnerID));
+                    syncSchedStates(localBlockList, localStates, gr::trace::workerIdOf(runnerID));
 
                     // Re-order after the mutations: adoption appends to the end of the list, so
                     // without this a newly adopted block would run last whatever its priority. A no-op for `RoundRobinPolicy`, whose key is the position.
@@ -1567,7 +1567,7 @@ protected:
                     if (house_keeping_policy.value != HouseKeepPolicy::Light) {
                         const HouseKeepPolicy             policy = house_keeping_policy.value;
                         const HouseKeepDepth              depth  = house_keeping_depth.value;
-                        [[maybe_unused]] gr::trace::Scope houseKeepScope{gr::trace::Event{.payload0 = gr::trace::saturate(localBlockList.size()), .payload1 = static_cast<std::uint32_t>(std::to_underlying(policy)), .payload2 = static_cast<std::uint32_t>(std::to_underlying(depth)), .kind = gr::trace::Kind::houseKeeping, .workerId = static_cast<std::uint8_t>(runnerID)}};
+                        [[maybe_unused]] gr::trace::Scope houseKeepScope{gr::trace::Event{.payload0 = gr::trace::saturate(localBlockList.size()), .payload1 = static_cast<std::uint32_t>(std::to_underlying(policy)), .payload2 = static_cast<std::uint32_t>(std::to_underlying(depth)), .kind = gr::trace::Kind::houseKeeping, .workerId = gr::trace::workerIdOf(runnerID)}};
                         std::ranges::for_each(localBlockList, [policy, depth](auto& b) { b->houseKeeping(policy, depth); });
                     }
                 }
@@ -1589,7 +1589,7 @@ protected:
                     idleUntilAdoption = localBlockList.empty();
                     if (!idleUntilAdoption) {
                         ++sweepCount;
-                        gr::work::Result result = traverseBlockListOnce(localBlockList, localStates, std::span<ReadyEntry>{localReadyHeap}, static_cast<std::uint8_t>(runnerID));
+                        gr::work::Result result = traverseBlockListOnce(localBlockList, localStates, std::span<ReadyEntry>{localReadyHeap}, gr::trace::workerIdOf(runnerID));
                         if (result.status == work::Status::DONE) {
                             break; // nothing happened -> shutdown this worker
                         } else if (result.status == work::Status::ERROR) {
@@ -1599,16 +1599,16 @@ protected:
                     }
                 }
                 if (idleUntilAdoption) {
-                    [[maybe_unused]] gr::trace::Scope idleScope{gr::trace::Event{.payload0 = std::to_underlying(gr::trace::IdleReason::awaitingAdoption), .kind = gr::trace::Kind::idle, .workerId = static_cast<std::uint8_t>(runnerID)}};
+                    [[maybe_unused]] gr::trace::Scope idleScope{gr::trace::Event{.payload0 = std::to_underlying(gr::trace::IdleReason::awaitingAdoption), .kind = gr::trace::Kind::idle, .workerId = gr::trace::workerIdOf(runnerID)}};
                     std::this_thread::sleep_for(std::chrono::milliseconds(timeout_ms));
                     msgToCount = 0UZ;
                 }
             } else if (activeState == PAUSED) {
-                [[maybe_unused]] gr::trace::Scope idleScope{gr::trace::Event{.payload0 = std::to_underlying(gr::trace::IdleReason::paused), .kind = gr::trace::Kind::idle, .workerId = static_cast<std::uint8_t>(runnerID)}};
+                [[maybe_unused]] gr::trace::Scope idleScope{gr::trace::Event{.payload0 = std::to_underlying(gr::trace::IdleReason::paused), .kind = gr::trace::Kind::idle, .workerId = gr::trace::workerIdOf(runnerID)}};
                 std::this_thread::sleep_for(std::chrono::milliseconds(timeout_ms));
                 msgToCount = 0UZ;
             } else { // other states
-                [[maybe_unused]] gr::trace::Scope idleScope{gr::trace::Event{.payload0 = std::to_underlying(gr::trace::IdleReason::otherState), .kind = gr::trace::Kind::idle, .workerId = static_cast<std::uint8_t>(runnerID)}};
+                [[maybe_unused]] gr::trace::Scope idleScope{gr::trace::Event{.payload0 = std::to_underlying(gr::trace::IdleReason::otherState), .kind = gr::trace::Kind::idle, .workerId = gr::trace::workerIdOf(runnerID)}};
                 std::this_thread::sleep_for(std::chrono::milliseconds(timeout_ms));
                 msgToCount = 0UZ;
             }
@@ -1626,7 +1626,7 @@ protected:
                 if (inactiveCycleCount > timeout_inactivity_count) {
                     // allow a scheduler process to wait on progress before retrying (N.B. intended to save CPU/battery power)
                     // N.B. a watchdog will periodically update the progress to check for non-responsive blocks.
-                    [[maybe_unused]] gr::trace::Scope idleScope{gr::trace::Event{.payload0 = std::to_underlying(gr::trace::IdleReason::noProgress), .payload1 = gr::trace::saturate(inactiveCycleCount), .kind = gr::trace::Kind::idle, .workerId = static_cast<std::uint8_t>(runnerID)}};
+                    [[maybe_unused]] gr::trace::Scope idleScope{gr::trace::Event{.payload0 = std::to_underlying(gr::trace::IdleReason::noProgress), .payload1 = gr::trace::saturate(inactiveCycleCount), .kind = gr::trace::Kind::idle, .workerId = gr::trace::workerIdOf(runnerID)}};
                     waitUntilChanged(*progress, currentProgress, timeout_ms);
                     msgToCount = 0UZ;
                 }
