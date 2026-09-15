@@ -30,9 +30,22 @@ thing that does need GR3 is the optional fixture gate (`scripts/gate4`).
 
 ### 0. Moving it to another machine
 
-Copy two directories: this repo and the GR4 tree it builds against
-(`~/gnuradio4`, fork `gosephjoh/gnuradio4`, branch `modular-scheduling`,
-commit `29320de`; set `-DGNURADIO4_DIR=/path` if it is not at `~/gnuradio4`).
+The port is also a directory of the GR4 fork itself: branch
+`ieee80211-rx-latency` of `github.com/gosephjoh/gnuradio4`, at
+`ports/gr4-ieee80211/`, based on `modular-scheduling` (`29320de`). Cloning
+that branch gives both the GR4 tree and the port in one checkout, and the
+port's CMake finds the tree two levels up:
+
+```
+git clone -b ieee80211-rx-latency https://github.com/gosephjoh/gnuradio4.git
+cd gnuradio4/ports/gr4-ieee80211
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=g++-15
+cmake --build build -j1 --target rx_latency4 gen4
+```
+
+Standalone, copy two directories instead: this repo and the GR4 tree it
+builds against (`~/gnuradio4`; set `-DGNURADIO4_DIR=/path` if it is
+elsewhere).
 Needs GCC 15 (or Clang 20), CMake ≥ 3.27, Python 3 with numpy for the check
 scripts, about 2.5 GB of RAM for the one heavy translation unit, and network
 access at configure time for GR4's own dependency (`vir-simd`). The JSON

@@ -10,7 +10,16 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
 
-set(GNURADIO4_DIR "$ENV{HOME}/gnuradio4" CACHE PATH "gnuradio4 source tree")
+# The GR4 tree: when this directory sits inside one (ports/gr4-ieee80211/ on
+# the ieee80211-rx-latency branch of gosephjoh/gnuradio4) it is two levels
+# up; otherwise ~/gnuradio4, or pass -DGNURADIO4_DIR=/path.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../../core/include/gnuradio-4.0/Block.hpp")
+  get_filename_component(_gr4_default "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
+else()
+  set(_gr4_default "$ENV{HOME}/gnuradio4")
+endif()
+set(GNURADIO4_DIR "${_gr4_default}" CACHE PATH "gnuradio4 source tree")
+message(STATUS "gr4-ieee80211: building against GNU Radio 4 at ${GNURADIO4_DIR}")
 set(ENABLE_TESTING OFF CACHE BOOL "" FORCE)
 set(ENABLE_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(ENABLE_BENCHMARKS OFF CACHE BOOL "" FORCE)
