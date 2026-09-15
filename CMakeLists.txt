@@ -194,6 +194,7 @@ option(USE_CCACHE "Use ccache if available" ON)
 option(INTERNAL_ENABLE_BLOCK_PLUGINS "Enable building the plugin system" ${REGISTRY_DEFAULT})
 option(WARNINGS_AS_ERRORS "Enable -Werror flags" ON)
 option(TIMETRACE "Enable clang's -ftime-trace" OFF)
+option(GR4_ENABLE_TRACING "Enable the scheduler/work() trace-marker layer (off: every marker compiles away)" OFF)
 option(ADDRESS_SANITIZER "Enable address sanitizer" OFF)
 option(UB_SANITIZER "Enable undefined behavior sanitizer" OFF)
 option(THREAD_SANITIZER "Enable thread sanitizer" OFF)
@@ -452,6 +453,12 @@ find_program(INCLUDE_WHAT_YOU_USE_TOOL_PATH NAMES include-what-you-use iwyu)
 if(INCLUDE_WHAT_YOU_USE_TOOL_PATH)
   message(" using 'Include What You Use' path: (${INCLUDE_WHAT_YOU_USE_TOOL_PATH})")
   set_property(GLOBAL PROPERTY CMAKE_CXX_INCLUDE_WHAT_YOU_USE ${INCLUDE_WHAT_YOU_USE_TOOL_PATH})
+endif()
+
+if(GR4_ENABLE_TRACING)
+  # Compiles the trace-marker bodies in. They stay inert until a runtime category mask is set, so
+  # an enabled binary still ships at production speed.
+  target_compile_definitions(gnuradio-options INTERFACE GR_ENABLE_TRACING)
 endif()
 
 set_project_warnings(gnuradio-options)
