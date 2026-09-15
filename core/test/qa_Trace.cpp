@@ -173,7 +173,7 @@ const boost::ut::suite<"Trace"> traceTests = [] {
         for (const LoopKind loopKind : {LoopKind::roundRobin, LoopKind::fixedPriority, LoopKind::jobDriven}) {
             expect(le(std::to_underlying(loopKind), flag::kLoopKindMask)) << "a loop kind must not spill into the neighbouring flag bits";
         }
-        expect(eq(flag::kLoopKindMask & flag::kIsSource, 0)) << "`Kind::work`'s own flags clear the loop-kind field";
+        expect(eq(flag::kLoopKindMask & flag::kIsSource, 0)) << "`Kind::workEnd`'s own flags clear the loop-kind field";
         expect(eq(flag::kLoopKindMask & flag::kJobBacked, 0));
     };
 
@@ -191,7 +191,7 @@ const boost::ut::suite<"Trace"> traceTests = [] {
             return true;
         };
 
-        expect(disjoint({flag::kLoopKindMask, flag::kIsSource, flag::kJobBacked})) << "Kind::work";
+        expect(disjoint({flag::kLoopKindMask, flag::kIsSource, flag::kJobBacked})) << "Kind::workEnd";
         expect(disjoint({flag::kBoundHit, flag::kViaStep})) << "Kind::sweep";
         expect(disjoint({flag::kDidAdopt, flag::kDidRemove, flag::kDidReap, flag::kDidHouseKeep, flag::kDidStateSync})) << "Kind::messagePhase";
         expect(disjoint({flag::kViaSuccessorWalk, flag::kEosWaived})) << "Kind::jobRelease";
@@ -267,7 +267,7 @@ const boost::ut::suite<"Trace"> traceTests = [] {
             seen |= std::to_underlying(categoryOf(static_cast<Kind>(raw)));
         }
         expect(eq(seen, kAllCategories)) << "some category has no kind, or some kind has the wrong one";
-        expect(eq(std::to_underlying(categoryOf(Kind::work)), std::to_underlying(Category::work)));
+        expect(eq(std::to_underlying(categoryOf(Kind::workEnd)), std::to_underlying(Category::work)));
         expect(eq(std::to_underlying(categoryOf(Kind::deadlineMiss)), std::to_underlying(Category::deadline)));
         expect(eq(std::to_underlying(categoryOf(Kind::heapFallback)), std::to_underlying(Category::select)));
     };
@@ -282,7 +282,7 @@ const boost::ut::suite<"Trace"> traceTests = [] {
     if constexpr (!kEnabled) {
         "a compiled-out build records nothing at all"_test = [] {
             setCategories(kAllCategories);
-            emit(Event{.kind = Kind::work});
+            emit(Event{.kind = Kind::workEnd});
             expect(eq(forEachEvent(countingConsumer, &gCounter), 0UZ)) << "GR_ENABLE_TRACING is off; emit must be a no-op";
             expect(eq(ringStats().rings, 0UZ)) << "and no ring may be allocated";
         };
@@ -297,11 +297,11 @@ const boost::ut::suite<"Trace"> traceTests = [] {
         emit(Event{.kind = Kind::deadlineMiss}); // Category::deadline      -- masked off
         expect(eq(collect().size(), 0UZ)) << "records of a disabled category must not reach the ring";
 
-        emit(Event{.payload0 = 7U, .kind = Kind::work});
+        emit(Event{.payload0 = 7U, .kind = Kind::workEnd});
         const std::vector<Event> recorded = collect();
         expect(eq(recorded.size(), 1UZ));
         expect(eq(recorded.front().payload0, 7U));
-        expect(eq(std::to_underlying(recorded.front().kind), std::to_underlying(Kind::work)));
+        expect(eq(std::to_underlying(recorded.front().kind), std::to_underlying(Kind::workEnd)));
 
         setCategories(0U);
     };
@@ -318,7 +318,7 @@ const boost::ut::suite<"Trace"> traceTests = [] {
         // own, which is the documented behaviour of setRingCapacity.
         std::thread emitter([] {
             for (std::uint32_t i = 0U; i < static_cast<std::uint32_t>(kCapacity + kExcess); ++i) {
-                emit(Event{.payload0 = i, .kind = Kind::work});
+                emit(Event{.payload0 = i, .kind = Kind::workEnd});
             }
         });
         emitter.join();
@@ -351,7 +351,7 @@ const boost::ut::suite<"Trace"> traceTests = [] {
         for (std::uint32_t worker = 0U; worker < kThreads; ++worker) {
             emitters.emplace_back([worker] {
                 for (std::uint32_t i = 0U; i < kPerThread; ++i) {
-                    emit(Event{.payload0 = i, .kind = Kind::work, .workerId = static_cast<std::uint8_t>(worker)});
+                    emit(Event{.payload0 = i, .kind = Kind::workEnd, .workerId = static_cast<std::uint8_t>(worker)});
                 }
             });
         }
@@ -387,7 +387,7 @@ const boost::ut::suite<"Trace"> traceTests = [] {
         setCategories(categoryMask(Category::work));
 
         {
-            Scope scope{Event{.startNs = 1'000UL, .kind = Kind::work}};
+            Scope scope{Event{.startNs = 1'000UL, .kind = Kind::workEnd}};
             scope.event().payload1 = 42U; // counts discovered during the scope
             scope.finish(1'250UL);        // explicit end instant: the timestamp-chaining path
             scope.finish(9'999UL);        // a second finish must not emit a second record
@@ -399,7 +399,7 @@ const boost::ut::suite<"Trace"> traceTests = [] {
 
         reset();
         {
-            Scope scope{Event{.kind = Kind::work}};
+            Scope scope{Event{.kind = Kind::workEnd}};
             expect(gt(scope.event().startNs, 0UL)) << "an unset start is stamped at construction";
         } // emitted by the destructor
         recorded = collect();
@@ -546,7 +546,7 @@ const boost::ut::suite<"Trace"> traceTests = [] {
 
         int            block = 0;
         const EntityId id    = intern(&block, EntityDescription{.uniqueName = "warm", .typeName = "T"});
-        emit(Event{.entity = id, .kind = Kind::work}); // create this thread's ring before arming
+        emit(Event{.entity = id, .kind = Kind::workEnd}); // create this thread's ring before arming
 
         {
             // `intern()` is reached from `syncSchedStates`, which runs on the house-keeping cadence,
@@ -554,7 +554,7 @@ const boost::ut::suite<"Trace"> traceTests = [] {
             // a latency source in the loop it is measuring.
             const AllocationSentinel sentinel;
             for (std::uint32_t i = 0U; i < 1'000U; ++i) {
-                emit(Event{.payload0 = i, .entity = id, .kind = Kind::work});
+                emit(Event{.payload0 = i, .entity = id, .kind = Kind::workEnd});
             }
             std::ignore = intern(&block, EntityDescription{.uniqueName = "warm", .typeName = "T"});
             std::ignore = internedId(&block);
@@ -578,7 +578,7 @@ const boost::ut::suite<"Trace"> traceTests = [] {
 
         std::vector<Event> expected;
         for (std::uint32_t i = 0U; i < 5U; ++i) {
-            const Event event{.startNs = 1'000UL + i, .durationNs = 10U + i, .payload0 = i, .payload1 = 2U * i, .payload2 = 3U * i, .entity = (i % 2U == 0U) ? one : two, .kind = Kind::work, .workerId = 2U, .status = -2, .flags = flag::kIsSource};
+            const Event event{.startNs = 1'000UL + i, .durationNs = 10U + i, .payload0 = i, .payload1 = 2U * i, .payload2 = 3U * i, .entity = (i % 2U == 0U) ? one : two, .kind = Kind::workEnd, .workerId = 2U, .status = -2, .flags = flag::kIsSource};
             emit(event);
             expected.push_back(event);
         }
@@ -654,7 +654,7 @@ const boost::ut::suite<"Trace"> traceTests = [] {
 
         std::thread emitter([] {
             for (std::uint32_t i = 0U; i < 20U; ++i) {
-                emit(Event{.payload0 = i, .kind = Kind::work});
+                emit(Event{.payload0 = i, .kind = Kind::workEnd});
             }
         });
         emitter.join();

@@ -37,7 +37,8 @@ inline constexpr bool kEnabled = false;
 /// What a record describes. The `Kind` is the discriminant for `Event`'s payload words and flag
 /// bits: the same 32 bytes mean different things per kind, as a wire format does.
 enum class Kind : std::uint8_t {
-    work,              /// one productive `work()` invocation
+    workBegin,         /// entry to one productive `work()` invocation; an instant
+    workEnd,           /// its exit; `durationNs` carries how long the call took
     workProbe,         /// aggregate of the unproductive ones, one per block per sweep
     workerStart,       /// worker thread entered its loop
     workerStop,        /// ... and left it
@@ -78,46 +79,59 @@ enum class Category : std::uint32_t {
     workPhases    = 1U << 7  /// the finer-grained markers inside one `work()`
 };
 
-/// One past the last `Kind`. Guards the `categoryOf` table against an enumerator added without a
-/// category, which would otherwise index out of bounds at run time on a marker nobody tested.
-inline constexpr std::size_t kKindCount = 26UZ;
-static_assert(std::to_underlying(Kind::workPhase) + 1U == kKindCount, "a Kind was added or removed without updating kKindCount and the categoryOf table");
+/// One past the last `Kind`, so a test can walk every enumerator. `categoryOf`'s own completeness is
+/// guaranteed by `-Wswitch` rather than by this count.
+inline constexpr std::size_t kKindCount = 27UZ;
+static_assert(std::to_underlying(Kind::workPhase) + 1U == kKindCount, "a Kind was added or removed without updating kKindCount");
 
 /**
- * Every `Kind` belongs to exactly one `Category`, so the category is a property of the record
- * rather than a second argument every call site has to supply and could get wrong. The mapping
- * lives here, once, instead of being restated at twenty-six emit sites.
+ * Every `Kind` belongs to exactly one `Category`, so the category is a property of the record rather
+ * than a second argument every call site has to supply and could get wrong. The mapping lives here,
+ * once, instead of being restated at every emit site.
+ *
+ * A `switch` with no `default:` rather than a lookup table: `-Wswitch` is part of `-Wall` and
+ * `-Werror` is on, so a `Kind` added without a category becomes a **compile error naming the
+ * enumerator**. A table can only be guarded by a size assertion, which catches a changed count but
+ * never a wrong mapping.
  */
 [[nodiscard]] constexpr Category categoryOf(Kind kind) noexcept {
-    constexpr std::array<Category, kKindCount> kCategories{{
-        Category::work,
-        Category::work, // work, workProbe
-        Category::lifecycle,
-        Category::lifecycle, // workerStart, workerStop
-        Category::schedulerLoop,
-        Category::schedulerLoop,
-        Category::schedulerLoop,
-        Category::schedulerLoop, // sweep, messagePhase, houseKeeping, stateSync
-        Category::lifecycle,
-        Category::lifecycle, // adopt, zombieReap
-        Category::schedulerLoop,
-        Category::schedulerLoop, // quiescenceWait, idle
-        Category::release,
-        Category::release,
-        Category::release, // jobRelease, jobReleaseDropped, releaseScan
-        Category::select,
-        Category::select,
-        Category::select,
-        Category::select,   // select, selectEmpty, selectionBoundHit, heapFallback
-        Category::deadline, // deadlineMiss
-        Category::counters,
-        Category::counters,
-        Category::lifecycle, // blockCounter, workerCounter, blockStateChange
-        Category::lifecycle, // entityRetired
-        Category::workPhases,
-        Category::workPhases, // workExact, workPhase
-    }};
-    return kCategories[std::to_underlying(kind)];
+    switch (kind) {
+    case Kind::workBegin:
+    case Kind::workEnd:
+    case Kind::workProbe: return Category::work;
+
+    case Kind::workerStart:
+    case Kind::workerStop:
+    case Kind::adopt:
+    case Kind::zombieReap:
+    case Kind::blockStateChange:
+    case Kind::entityRetired: return Category::lifecycle;
+
+    case Kind::sweep:
+    case Kind::messagePhase:
+    case Kind::houseKeeping:
+    case Kind::stateSync:
+    case Kind::quiescenceWait:
+    case Kind::idle: return Category::schedulerLoop;
+
+    case Kind::jobRelease:
+    case Kind::jobReleaseDropped:
+    case Kind::releaseScan: return Category::release;
+
+    case Kind::select:
+    case Kind::selectEmpty:
+    case Kind::selectionBoundHit:
+    case Kind::heapFallback: return Category::select;
+
+    case Kind::deadlineMiss: return Category::deadline;
+
+    case Kind::blockCounter:
+    case Kind::workerCounter: return Category::counters;
+
+    case Kind::workExact:
+    case Kind::workPhase: return Category::workPhases;
+    }
+    return Category::lifecycle; // unreachable for a declared Kind; -Wswitch guarantees the cases are complete
 }
 
 /// Folds categories into the mask `setCategories()` takes. `Category` is a scoped enum, so the bare
@@ -150,12 +164,12 @@ inline constexpr std::uint32_t kSaturated     = 0xFFFFFFFFU; /// the real value 
 /// collides with itself, and no cross-group meaning is implied.
 namespace flag {
 
-/// Which selection loop produced a `Kind::work` record. Occupies the low two bits, so a report
+/// Which selection loop produced a `workBegin`/`workEnd` pair. Occupies the low two bits, so a report
 /// cannot silently compare a round-robin trace against an EDF one.
 inline constexpr std::uint8_t kLoopKindMask = 0b0000'0011U;
 
-inline constexpr std::uint8_t kIsSource     = 1U << 2; /// `Kind::work`: performed_work is processedOut
-inline constexpr std::uint8_t kJobBacked    = 1U << 3; /// `Kind::work`: ran against a released job
+inline constexpr std::uint8_t kIsSource     = 1U << 2; /// `Kind::workEnd`: performed_work is processedOut
+inline constexpr std::uint8_t kJobBacked    = 1U << 3; /// `Kind::work*`: ran against a released job
 inline constexpr std::uint8_t kBoundHit     = 1U << 0; /// `Kind::sweep`: the selection bound was reached
 inline constexpr std::uint8_t kViaStep      = 1U << 1; /// `Kind::sweep`: `externalStep`, not a pool worker
 inline constexpr std::uint8_t kDidAdopt     = 1U << 0; /// `Kind::messagePhase`
@@ -177,15 +191,21 @@ inline constexpr std::uint8_t kDeadlineSuspect   = 1U << 1; /// ... but the dead
 
 } // namespace flag
 
-/// Which loop ran a `Kind::work` invocation, in `flags & flag::kLoopKindMask`.
+/// Which loop ran a `workBegin`/`workEnd` invocation, in `flags & flag::kLoopKindMask`.
 enum class LoopKind : std::uint8_t { roundRobin = 0U, fixedPriority = 1U, jobDriven = 2U };
 
 /**
  * @brief One trace record: 32 bytes, trivially copyable, no indirection.
  *
- * Complete-event form — a start timestamp plus a duration, rather than a begin/end pair — so one
- * `work()` invocation costs one record instead of two. Records are therefore appended at *end*
- * time and a ring is ordered by completion, not by start; the converter sorts by `startNs`.
+ * Phase markers use the **complete-event** form — a start timestamp plus a duration, one record
+ * rather than a begin/end pair. Records are appended at *end* time, so a ring is ordered by
+ * completion rather than by start; the converter sorts by `startNs`.
+ *
+ * `work()` is the deliberate exception and emits a `workBegin`/`workEnd` **pair**. A complete event
+ * would fold the scheduler overhead preceding an invocation into that invocation's duration, which
+ * pollutes exactly the execution-time-against-samples regression this layer exists to feed; the
+ * pair separates them, and the gap from one `workEnd` to the next `workBegin` *is* the scheduler
+ * overhead, measured rather than inferred.
  *
  * `payload0..2` are named for their position rather than their meaning because the meaning is
  * given by `kind`. That is at odds with the project's usual naming rule and is the deliberate
