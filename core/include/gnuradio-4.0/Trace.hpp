@@ -210,6 +210,13 @@ enum class IdleReason : std::uint32_t {
 /// Which loop ran a `workBegin`/`workEnd` invocation, in `flags & flag::kLoopKindMask`.
 enum class LoopKind : std::uint8_t { roundRobin = 0U, fixedPriority = 1U, jobDriven = 2U };
 
+/// `Kind::workPhase`'s `payload0`: which stage of one `workInternal` the record covers. Together the
+/// four partition the invocation, so their durations sum to no more than the enclosing `workExact`.
+enum class Phase : std::uint32_t { computeSampleLimits = 0U, prepareStreams = 1U, dispatchProcessing = 2U, finaliseIO = 3U };
+
+inline constexpr std::size_t kPhaseCount = 4UZ;
+static_assert(std::to_underlying(Phase::finaliseIO) + 1U == kPhaseCount, "a Phase was added or removed without updating kPhaseCount");
+
 /**
  * @brief One trace record: 32 bytes, trivially copyable, no indirection.
  *

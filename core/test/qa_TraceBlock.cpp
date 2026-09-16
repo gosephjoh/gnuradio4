@@ -340,6 +340,67 @@ const boost::ut::suite<"TraceBlock"> traceBlockTests = [] {
         expect(eq(ofKind(withExact.events, Kind::workEnd).size(), ofKind(withoutExact.events, Kind::workEnd).size())) << "enabling workExact must not perturb the scheduler-side capture";
     };
 
+    "the four phases are contained by the invocation they partition"_test = [] {
+        DecimatingRun run;
+        run.run(categoryMask(Category::workExact, Category::workPhases));
+
+        // Grouped per invocation, not summed across the capture. An aggregate comparison is too weak:
+        // a scope that wrongly spans its neighbours double-counts their time, and the surplus can
+        // still hide under the total of every other invocation in the run.
+        //
+        // Records are appended at *completion*, so one entity's stream reads as the phases of an
+        // invocation followed by the `workExact` that encloses them. Walking until each `workExact`
+        // is therefore the grouping, and it holds however the phases are ordered among themselves.
+        const std::vector<Event> stream = forEntity(run.events, run.decimator);
+        expect(gt(stream.size(), 0UZ) >> fatal);
+
+        std::set<std::uint32_t> seen;
+        std::uint64_t           pendingNs    = 0UL;
+        std::size_t             pendingCount = 0UZ;
+        std::size_t             nFullGroups  = 0UZ;
+        std::size_t             nGrouped     = 0UZ;
+        std::uint64_t           totalPhaseNs = 0UL;
+        for (const Event& event : stream) {
+            if (event.kind == Kind::workPhase) {
+                seen.insert(event.payload0);
+                expect(lt(event.payload0, static_cast<std::uint32_t>(kPhaseCount))) << "a phase id outside the enum means the payload word is being read as something else";
+                pendingNs += event.durationNs;
+                totalPhaseNs += event.durationNs;
+                ++pendingCount;
+                continue;
+            }
+            if (event.kind != Kind::workExact) {
+                continue;
+            }
+            if (pendingCount > 0UZ) {
+                expect(le(pendingNs, static_cast<std::uint64_t>(event.durationNs))) << "the phases of one invocation must fit inside it -- a larger sum means a scope spans more than the call it names";
+                // An invocation contributes either all four phases or just the first: the zero-work
+                // exit is taken *after* computeSampleLimits and before the other three, so a group of
+                // one is a real shape and any other size means a scope leaked across a boundary.
+                expect((pendingCount == kPhaseCount) || (pendingCount == 1UZ)) << "an invocation must contribute four phases or the one that precedes its early exit";
+                nFullGroups += (pendingCount == kPhaseCount) ? 1UZ : 0UZ;
+                ++nGrouped;
+            }
+            pendingNs    = 0UL;
+            pendingCount = 0UZ;
+        }
+        expect(eq(seen.size(), kPhaseCount)) << "all four stages must be represented, or the split does not partition the invocation";
+        expect(gt(nFullGroups, 1UZ) >> fatal) << "fewer than two complete invocations cannot demonstrate containment";
+        expect(eq(nFullGroups, 8UZ)) << "4096 samples at a 512 cap is eight productive invocations";
+        expect(gt(totalPhaseNs, 0UL)) << "phases that all measure zero are not measuring anything";
+    };
+
+    "the phase split is opt-in on top of the exact counts"_test = [] {
+        DecimatingRun exactOnly;
+        exactOnly.run(categoryMask(Category::workExact));
+        DecimatingRun both;
+        both.run(categoryMask(Category::workExact, Category::workPhases));
+
+        expect(eq(ofKind(exactOnly.events, Kind::workPhase).size(), 0UZ)) << "workExact alone must not pay for the four phase scopes";
+        expect(gt(ofKind(both.events, Kind::workPhase).size(), 0UZ));
+        expect(eq(ofKind(exactOnly.events, Kind::workExact).size(), ofKind(both.events, Kind::workExact).size())) << "turning the phases on must not change how many invocations are recorded";
+    };
+
     "the block-side markers do not change what a block does"_test = [] {
         // The gate that matters most in this milestone: `Block.hpp` is instantiated per block *type*
         // and `workInternal` is the innermost frame in the framework, so a perturbation here reaches

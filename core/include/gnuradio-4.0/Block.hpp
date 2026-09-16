@@ -2084,7 +2084,15 @@ public:
             pendingForwardParams.emplace();
             applyChangedSettings(true, &*pendingForwardParams);
         }
-        SampleLimits limits = computeSampleLimits(requestedWork);
+        // The four phase scopes sit at their call sites here rather than inside the functions
+        // themselves: `prepareStreams` is static and shared with the skip and epilogue paths, so
+        // instrumenting it would attribute those to this invocation. Placed here they partition
+        // `workInternal` and nest inside `exactScope` by construction.
+        SampleLimits limits;
+        {
+            [[maybe_unused]] gr::trace::Scope phaseScope{gr::trace::Event{.payload0 = std::to_underlying(gr::trace::Phase::computeSampleLimits), .entity = _traceEntityId, .kind = gr::trace::Kind::workPhase}};
+            limits = computeSampleLimits(requestedWork);
+        }
 
         if (limits.inputSkipBefore > 0) {
             auto skipSpans = prepareStreams(inputPorts<PortType::STREAM>(&self()), limits.inputSkipBefore);
@@ -2123,8 +2131,10 @@ public:
         std::size_t processedIn  = limits.resampledIn;
         std::size_t processedOut = limits.resampledOut;
 
-        auto inputSpans  = prepareStreams(inputPorts<PortType::STREAM>(&self()), processedIn);
-        auto outputSpans = prepareStreams(outputPorts<PortType::STREAM>(&self()), processedOut);
+        [[maybe_unused]] gr::trace::Scope prepareScope{gr::trace::Event{.payload0 = std::to_underlying(gr::trace::Phase::prepareStreams), .payload1 = gr::trace::saturate(processedIn), .payload2 = gr::trace::saturate(processedOut), .entity = _traceEntityId, .kind = gr::trace::Kind::workPhase}};
+        auto                             inputSpans  = prepareStreams(inputPorts<PortType::STREAM>(&self()), processedIn);
+        auto                             outputSpans = prepareStreams(outputPorts<PortType::STREAM>(&self()), processedOut);
+        prepareScope.finish();
 
         if constexpr (gr::trace::kEnabled) {
             // Input position for a non-source, output for a source -- the convention
@@ -2221,7 +2231,15 @@ public:
             }
         }
 
-        work::Status userReturnStatus = dispatchProcessing(inputSpans, outputSpans, processedIn, processedOut);
+        work::Status userReturnStatus{};
+        {
+            // The block's own arithmetic. Separating this from the three framework phases either
+            // side of it is what measures I_v directly instead of inferring it from a regression.
+            [[maybe_unused]] gr::trace::Scope phaseScope{gr::trace::Event{.payload0 = std::to_underlying(gr::trace::Phase::dispatchProcessing), .entity = _traceEntityId, .kind = gr::trace::Kind::workPhase}};
+            userReturnStatus = dispatchProcessing(inputSpans, outputSpans, processedIn, processedOut);
+            phaseScope.event().payload1 = gr::trace::saturate(processedIn);
+            phaseScope.event().payload2 = gr::trace::saturate(processedOut);
+        }
 
         if constexpr (HasProcessOneFunction<Derived> && !HasProcessBulkFunction<Derived>) {
             _inputTagPresent  = false;
@@ -2231,7 +2249,10 @@ public:
             _inProcessOneDispatch = false;
         }
         work::sanitiseProcessStatus(userReturnStatus, processedIn, processedOut);
-        finaliseIO(inputSpans, outputSpans, userReturnStatus, processedIn, processedOut, limits.resampledIn);
+        {
+            [[maybe_unused]] gr::trace::Scope phaseScope{gr::trace::Event{.payload0 = std::to_underlying(gr::trace::Phase::finaliseIO), .payload1 = gr::trace::saturate(processedIn), .payload2 = gr::trace::saturate(processedOut), .entity = _traceEntityId, .kind = gr::trace::Kind::workPhase}};
+            finaliseIO(inputSpans, outputSpans, userReturnStatus, processedIn, processedOut, limits.resampledIn);
+        }
 
         tracedIn     = processedIn;
         tracedOut    = processedOut;
