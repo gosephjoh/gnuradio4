@@ -792,9 +792,9 @@ public:
     bool         _deviceFallbackWarned  = false; // warn-once when a device compute_domain falls back to the CPU path
 
     // Pushed down by the scheduler on its house-keeping cadence, because a marker inside work() cannot
-    // name itself: identities are interned against the BlockModel address, and BlockWrapper *contains*
-    // its block, so `this` here is not that address. Two bytes, kept unconditionally rather than behind
-    // a conditional member, which would put a std::conditional_t in the framework's most-read struct.
+    // name itself: identities are interned against the BlockModel address, and BlockWrapper holds its
+    // block by value or by pointer, never at that address. Two bytes, kept unconditionally rather than
+    // behind a conditional member, which would put a std::conditional_t in the most-read struct here.
     gr::trace::EntityId _traceEntityId = gr::trace::kNoEntity;
 
     // intermediate non-real-time<->real-time setting states
@@ -2111,6 +2111,31 @@ public:
                     invokeProcessEpilogue(epilogueIn, epilogueOut);
                     publishSamples(0UZ, epilogueOut); // publish only what the block explicitly requested via out.publish(n)
                     consumeReaders(trailing, epilogueIn);
+
+                    if constexpr (gr::trace::kEnabled) {
+                        // The epilogue moves real samples and then returns DONE. Leaving the counts at
+                        // zero here would reproduce, in the marker built to fix it, exactly the blindness
+                        // `computePerformedWork()` has: a final batch that is processed and never reported.
+                        tracedIn                          = trailing;
+                        [[maybe_unused]] bool firstInSpan = true;
+                        for_each_reader_span(
+                            [&](auto& span) {
+                                if (firstInSpan) {
+                                    tracedPosition = span.streamIndex;
+                                    firstInSpan    = false;
+                                }
+                            },
+                            epilogueIn);
+                        [[maybe_unused]] bool firstOutSpan = true;
+                        for_each_writer_span(
+                            [&](auto& span) {
+                                if (firstOutSpan) {
+                                    tracedOut    = static_cast<std::size_t>(span.nRequestedSamplesToPublish());
+                                    firstOutSpan = false;
+                                }
+                            },
+                            epilogueOut);
+                    }
                 }
             }
             emitErrorMessageIfAny("workInternal(): EOS tag arrived -> REQUESTED_STOP", this->changeStateTo(lifecycle::State::REQUESTED_STOP));
@@ -2132,8 +2157,8 @@ public:
         std::size_t processedOut = limits.resampledOut;
 
         [[maybe_unused]] gr::trace::Scope prepareScope{gr::trace::Event{.payload0 = std::to_underlying(gr::trace::Phase::prepareStreams), .payload1 = gr::trace::saturate(processedIn), .payload2 = gr::trace::saturate(processedOut), .entity = _traceEntityId, .kind = gr::trace::Kind::workPhase}};
-        auto                             inputSpans  = prepareStreams(inputPorts<PortType::STREAM>(&self()), processedIn);
-        auto                             outputSpans = prepareStreams(outputPorts<PortType::STREAM>(&self()), processedOut);
+        auto                              inputSpans  = prepareStreams(inputPorts<PortType::STREAM>(&self()), processedIn);
+        auto                              outputSpans = prepareStreams(outputPorts<PortType::STREAM>(&self()), processedOut);
         prepareScope.finish();
 
         if constexpr (gr::trace::kEnabled) {
@@ -2236,7 +2261,7 @@ public:
             // The block's own arithmetic. Separating this from the three framework phases either
             // side of it is what measures I_v directly instead of inferring it from a regression.
             [[maybe_unused]] gr::trace::Scope phaseScope{gr::trace::Event{.payload0 = std::to_underlying(gr::trace::Phase::dispatchProcessing), .entity = _traceEntityId, .kind = gr::trace::Kind::workPhase}};
-            userReturnStatus = dispatchProcessing(inputSpans, outputSpans, processedIn, processedOut);
+            userReturnStatus            = dispatchProcessing(inputSpans, outputSpans, processedIn, processedOut);
             phaseScope.event().payload1 = gr::trace::saturate(processedIn);
             phaseScope.event().payload2 = gr::trace::saturate(processedOut);
         }

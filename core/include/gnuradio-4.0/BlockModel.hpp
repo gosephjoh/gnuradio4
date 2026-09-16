@@ -495,8 +495,9 @@ public:
     /**
      * Caches the interned trace identity inside the wrapped block, so a marker in `Block::work()` can
      * name itself. Identities are interned against the `BlockModel` address, but `BlockWrapper<T>`
-     * *contains* its block, so `this` inside `Block::workInternal` is a different address and no
-     * lookup from there would find the right entry.
+     * holds its block as `std::conditional_t<kOwning, T, T*>` -- by value or by pointer, and in
+     * neither case at the model's own address -- so `this` inside `Block::workInternal` is a
+     * different address and no lookup from there would find the right entry.
      *
      * Called by the scheduler on its house-keeping cadence, never per invocation. Defaulted to a no-op
      * rather than pure so that a `BlockModel` implementation outside this repository keeps compiling;

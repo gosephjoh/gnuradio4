@@ -68,6 +68,28 @@ void exportTimeline([[maybe_unused]] std::string_view name) {
     }
 }
 
+/// Fixed 10-sample chunks with a trailing `processEpilogue`, so a stream whose length is not a
+/// multiple of ten leaves a remainder that only the epilogue path moves.
+template<typename T>
+struct EpilogueBlock : gr::Block<EpilogueBlock<T>, gr::Resampling<10UZ, 10UZ, true>> {
+    gr::PortIn<T>  in;
+    gr::PortOut<T> out;
+
+    GR_MAKE_REFLECTABLE(EpilogueBlock, in, out);
+
+    gr::work::Status processBulk(gr::InputSpanLike auto& input, gr::OutputSpanLike auto& output) noexcept {
+        std::copy_n(input.begin(), std::min(input.size(), output.size()), output.begin());
+        return gr::work::Status::OK;
+    }
+
+    gr::work::Status processEpilogue(gr::InputSpanLike auto& input, gr::OutputSpanLike auto& output) noexcept {
+        const auto n = std::min(input.size(), output.size());
+        std::copy_n(input.begin(), n, output.begin());
+        output.publish(n);
+        return gr::work::Status::OK;
+    }
+};
+
 void collectingConsumer(const gr::trace::Event& event, void* user) noexcept { static_cast<std::vector<gr::trace::Event>*>(user)->push_back(event); }
 
 [[nodiscard]] std::vector<gr::trace::Event> collect() {
@@ -145,13 +167,9 @@ struct DecimatingRun {
 /// a real chain has a stable ratio and positions that match its counts -- so they are driven from
 /// constructed records, the same way `qa_TraceReport.cpp` drives its fit gates.
 /// One scheduler-side invocation, so `timingReport` has something to fold.
-[[nodiscard]] gr::trace::Event invocationOf(gr::trace::EntityId entity, std::uint32_t performedWork, std::uint32_t durationNs) {
-    return gr::trace::Event{.durationNs = durationNs, .payload0 = performedWork, .payload1 = performedWork, .entity = entity, .kind = gr::trace::Kind::workEnd};
-}
+[[nodiscard]] gr::trace::Event invocationOf(gr::trace::EntityId entity, std::uint32_t performedWork, std::uint32_t durationNs) { return gr::trace::Event{.durationNs = durationNs, .payload0 = performedWork, .payload1 = performedWork, .entity = entity, .kind = gr::trace::Kind::workEnd}; }
 
-[[nodiscard]] gr::trace::Event exactRecord(gr::trace::EntityId entity, std::uint32_t processedIn, std::uint32_t processedOut, std::uint32_t position, std::uint64_t startNs = 0UL) {
-    return gr::trace::Event{.startNs = startNs, .durationNs = 100U, .payload0 = processedIn, .payload1 = processedOut, .payload2 = position, .entity = entity, .kind = gr::trace::Kind::workExact};
-}
+[[nodiscard]] gr::trace::Event exactRecord(gr::trace::EntityId entity, std::uint32_t processedIn, std::uint32_t processedOut, std::uint32_t position, std::uint64_t startNs = 0UL) { return gr::trace::Event{.startNs = startNs, .durationNs = 100U, .payload0 = processedIn, .payload1 = processedOut, .payload2 = position, .entity = entity, .kind = gr::trace::Kind::workExact}; }
 
 } // namespace
 
@@ -239,7 +257,7 @@ const boost::ut::suite<"TraceBlock"> traceBlockTests = [] {
         // are aggregated into `workProbe` instead. Every other exit, `DONE` included, still records.
         // So the identity that must hold is a conservation law, not an inequality: every invocation
         // leaves either a `workEnd` or a probe behind it.
-        const std::vector<Event> probes    = forEntity(ofKind(run.events, Kind::workProbe), run.decimator);
+        const std::vector<Event> probes     = forEntity(ofKind(run.events, Kind::workProbe), run.decimator);
         std::size_t              probedRuns = 0UZ;
         for (const Event& event : probes) {
             probedRuns += event.payload0; // probeCount, aggregated per block per sweep
@@ -438,6 +456,40 @@ const boost::ut::suite<"TraceBlock"> traceBlockTests = [] {
         expect(eq(ofKind(exactOnly.events, Kind::workExact).size(), ofKind(both.events, Kind::workExact).size())) << "turning the phases on must not change how many invocations are recorded";
     };
 
+    "phases alone are self-delimiting, without the exact counts to group them"_test = [] {
+        // `workPhases` is independent of `workExact`, so a capture may carry phases and no invocation
+        // records to bracket them. That is still groupable: `computeSampleLimits` is emitted exactly
+        // once per invocation that gets past `checkLifecycle`, with no early exit between the two, so
+        // it marks the start of every instrumented invocation. Asserted because the alternative --
+        // phases that cannot be attributed to an invocation at all -- would make the category useless
+        // on its own, and nothing else in the suite would notice.
+        DecimatingRun run;
+        run.run(categoryMask(Category::workPhases));
+
+        const std::vector<Event> phases = forEntity(ofKind(run.events, Kind::workPhase), run.decimator);
+        expect(gt(phases.size(), 0UZ) >> fatal) << "the phase category must stand on its own";
+        expect(eq(ofKind(run.events, Kind::workExact).size(), 0UZ)) << "and must not drag the exact counts in with it";
+
+        std::size_t starts   = 0UZ;
+        std::size_t inGroup  = 0UZ;
+        std::size_t complete = 0UZ;
+        for (const Event& event : phases) {
+            if (event.payload0 == std::to_underlying(Phase::computeSampleLimits)) {
+                if (inGroup == kPhaseCount) {
+                    ++complete;
+                }
+                ++starts;
+                inGroup = 0UZ;
+            }
+            ++inGroup;
+        }
+        if (inGroup == kPhaseCount) {
+            ++complete;
+        }
+        expect(eq(starts, phases.size() - complete * (kPhaseCount - 1UZ))) << "every group must begin with computeSampleLimits";
+        expect(eq(complete, 8UZ)) << "the eight productive invocations must each be recoverable as a group of four";
+    };
+
     "a stable ratio is derived, an unstable one refused"_test = [] {
         DecimatingRun run;
         run.run(categoryMask(Category::workExact));
@@ -575,8 +627,8 @@ const boost::ut::suite<"TraceBlock"> traceBlockTests = [] {
         // acceptance criterion is scoped to predictable ratios, so this is out of scope by
         // construction -- and reporting the mean would be the failure the scoping exists to prevent.
         const std::vector<Event> varying{
-            exactRecord(EntityId{2U}, 100U, 100U, 0U),   //
-            exactRecord(EntityId{2U}, 100U, 50U, 100U),  //
+            exactRecord(EntityId{2U}, 100U, 100U, 0U),  //
+            exactRecord(EntityId{2U}, 100U, 50U, 100U), //
             exactRecord(EntityId{2U}, 100U, 100U, 200U),
         };
         const RatioEstimate estimate = ratioOf(varying, EntityId{2U});
@@ -604,6 +656,101 @@ const boost::ut::suite<"TraceBlock"> traceBlockTests = [] {
         const RatioEstimate estimate = ratioOf(wrapped, EntityId{3U});
         expect(!estimate.stable) << "a backwards step must not be read as a huge forward jump";
         expect(estimate.reason.find("backwards") != std::string::npos) << estimate.reason;
+    };
+
+    "a non-dyadic ratio maps to the right batch, not the one before it"_test = [] {
+        // 14:9. A sink coordinate normally lands *exactly* on a source batch boundary, and in double
+        // precision 9 / (9.0/14.0) is 13.999999999999998 rather than 14 -- which matches the previous
+        // batch and reports a latency a whole batch period out. A 4:1 chain never shows this because
+        // 0.25 is dyadic and the division is exact, which is why the real-graph test could not catch
+        // it. The walk is done in integers for this reason.
+        const std::vector<Event> events{
+            exactRecord(EntityId{1U}, 0U, 14U, 0U, 1000UL),  // source batches of 14
+            exactRecord(EntityId{1U}, 0U, 14U, 14U, 2000UL), //
+            exactRecord(EntityId{1U}, 0U, 14U, 28U, 3000UL), //
+            exactRecord(EntityId{2U}, 14U, 9U, 0U, 1200UL),  // 14:9 middle
+            exactRecord(EntityId{2U}, 14U, 9U, 14U, 2200UL), //
+            exactRecord(EntityId{2U}, 14U, 9U, 28U, 3200UL), //
+            exactRecord(EntityId{3U}, 9U, 9U, 0U, 1500UL),   // sink consumes 9 at a time
+            exactRecord(EntityId{3U}, 9U, 9U, 9U, 2500UL),   //
+            exactRecord(EntityId{3U}, 9U, 9U, 18U, 3500UL),
+        };
+        const std::vector<EntityId> chain{EntityId{1U}, EntityId{2U}, EntityId{3U}};
+
+        const RatioEstimate middle = ratioOf(events, EntityId{2U});
+        expect(middle.stable >> fatal) << middle.reason;
+        expect(eq(middle.outTotal, std::uint64_t{9U})) << "the ratio must also be carried as an exact fraction";
+        expect(eq(middle.inTotal, std::uint64_t{14U}));
+
+        const ChainLinks links = chainLinks(events, chain);
+        expect(links.computed >> fatal) << links.reason;
+        expect(eq(links.links.size(), 3UZ) >> fatal) << "every sink batch has a producer inside this capture";
+
+        // Every record has durationNs 100, so the answers are exact and computable by hand: sink
+        // batch k reads source batch k, produced at 1000k+1100 and consumed at 1000k+1600.
+        for (std::size_t k = 0UZ; k < links.links.size(); ++k) {
+            expect(eq(links.links[k].producedAt, 1000UL * k + 1100UL)) << "sink batch " << k << " must map to source batch " << k;
+            expect(eq(links.links[k].latencyNs, 500UL)) << "a batch matched one too early reports a latency a whole period out";
+        }
+    };
+
+    "the trailing epilogue batch is recorded, not lost"_test = [] {
+        // The epilogue consumes real samples and then returns DONE. Leaving its counts at zero would
+        // reproduce, in the marker built to fix it, exactly the blindness the acceptance criterion
+        // blames `computePerformedWork()` for: a final batch that is processed and never reported.
+        //
+        // 4096 is a multiple of ten, so the remainder has to be made deliberately: 4095 samples
+        // through a fixed-10-chunk block leaves five for the epilogue.
+        gr::trace::reset();
+        gr::trace::setCategories(categoryMask(Category::workExact));
+
+        gr::Graph graph;
+        auto&     src = graph.emplaceBlock<gr::testing::ConstantSource<float>>({{"name", std::string("src")}, {"n_samples_max", gr::Size_t{4095U}}});
+        auto&     mid = graph.emplaceBlock<EpilogueBlock<float>>({{"name", std::string("mid")}});
+        auto&     snk = graph.emplaceBlock<gr::testing::NullSink<float>>({{"name", std::string("snk")}});
+        std::ignore   = graph.connect<"out", "in">(src, mid);
+        std::ignore   = graph.connect<"out", "in">(mid, snk);
+
+        TestScheduler scheduler;
+        expect(scheduler.exchange(std::move(graph)).has_value() >> fatal);
+        expect(scheduler.changeStateTo(gr::lifecycle::State::INITIALISED).has_value() >> fatal);
+        EntityId middle = kNoEntity;
+        for (const auto& block : scheduler.graph().blocks()) {
+            if (block->name() == "mid") {
+                middle = gr::trace::internedId(static_cast<const void*>(block.get()));
+            }
+        }
+        expect(neq(middle, kNoEntity) >> fatal);
+        expect(scheduler.changeStateTo(gr::lifecycle::State::RUNNING).has_value() >> fatal);
+        for (std::size_t pass = 0UZ; pass < 256UZ; ++pass) {
+            std::ignore = scheduler.step();
+        }
+        std::ignore = scheduler.changeStateTo(gr::lifecycle::State::STOPPED);
+
+        const std::vector<Event> events = collect();
+        gr::trace::setCategories(0U);
+
+        std::uint64_t consumed    = 0UL;
+        std::uint64_t produced    = 0UL;
+        std::uint64_t epilogueIn  = 0UL;
+        std::uint64_t epilogueOut = 0UL;
+        for (const Event& event : events) {
+            if (event.kind != Kind::workExact || event.entity != middle) {
+                continue;
+            }
+            consumed += event.payload0;
+            produced += event.payload1;
+            if (event.status == static_cast<std::int8_t>(gr::work::Status::DONE) && event.payload0 > 0U) {
+                epilogueIn += event.payload0;
+                epilogueOut += event.payload1;
+            }
+        }
+        // 4095 through a fixed-10-chunk block is 409 full chunks and a remainder of five that only
+        // the epilogue moves, so the remainder is the whole point of the arithmetic below.
+        expect(eq(epilogueIn, 5UL)) << "the DONE invocation that ran the epilogue must report what it consumed";
+        expect(eq(epilogueOut, 5UL)) << "and what it produced -- a 10:10 block publishes what it took";
+        expect(eq(consumed, 4095UL)) << "every sample the block consumed must appear in some record, remainder included";
+        expect(eq(produced, 4095UL)) << "and every sample it produced";
     };
 
     "a chain with an unstable hop is refused, not averaged"_test = [] {
@@ -688,12 +835,54 @@ const boost::ut::suite<"TraceBlock"> traceBlockTests = [] {
         expect(!isFusedGroup("acme::MergeSortFilter<float>")) << "a user type containing the word is still one block";
         expect(!isFusedGroup("acme::Merge<float>")) << "and so is one that shares the alias name without being the framework type";
 
+        // The one input that actually matters: the type name a real merged unit records. Everything
+        // above is a string literal written by hand, which cannot tell us that `MergeByIndex` is what
+        // `typeName()` truly produces -- only building one can.
+        using Fused = gr::Merge<gr::testing::Copy<float>, "out", gr::testing::Copy<float>, "in">;
+        gr::trace::reset();
+        gr::trace::setCategories(categoryMask(Category::workExact));
+        {
+            gr::Graph graph;
+            auto&     src   = graph.emplaceBlock<gr::testing::ConstantSource<float>>({{"name", std::string("src")}, {"n_samples_max", gr::Size_t{256U}}});
+            auto&     fused = graph.emplaceBlock<Fused>({{"name", std::string("fused")}});
+            auto&     snk   = graph.emplaceBlock<gr::testing::NullSink<float>>({{"name", std::string("snk")}});
+            std::ignore     = graph.connect<"out", "in">(src, fused);
+            std::ignore     = graph.connect<"out", "in">(fused, snk);
+
+            TestScheduler scheduler;
+            expect(scheduler.exchange(std::move(graph)).has_value() >> fatal);
+            expect(scheduler.changeStateTo(gr::lifecycle::State::INITIALISED).has_value() >> fatal);
+
+            // Found by type rather than by the name given above, because a merged unit **ignores the
+            // `name` setting**: it reports its own type as its name. Worth knowing before trying to
+            // pick one out of a capture.
+            std::string recordedTypeName;
+            std::string recordedUniqueName;
+            std::string recordedName;
+            for (const auto& block : scheduler.graph().blocks()) {
+                if (std::string(block->typeName()).find("MergeByIndex") != std::string::npos) {
+                    recordedTypeName   = std::string(block->typeName());
+                    recordedUniqueName = std::string(block->uniqueName());
+                    recordedName       = std::string(block->name());
+                }
+            }
+            expect(!recordedTypeName.empty() >> fatal) << "the merged unit must appear in the block list";
+            expect(isFusedGroup(recordedTypeName)) << "a real Merge<> must be recognised from what typeName() actually produces: " << recordedTypeName;
+            expect(eq(recordedName, recordedTypeName)) << "a merged unit reports its type as its name, so the `name` setting given to emplaceBlock does not stick";
+            // The unique name is spelled differently again -- no `gr::`, ports as `:0` -- and it is
+            // what `gr4-trace` matches a chain against, so the two must not be assumed identical.
+            expect(recordedUniqueName.find("MergeByIndex<") != std::string::npos) << "the unique name must still be recognisable: " << recordedUniqueName;
+            expect(neq(recordedUniqueName, recordedTypeName)) << "unique name and type name use different spellings for the same unit";
+            std::ignore = scheduler.changeStateTo(gr::lifecycle::State::STOPPED);
+        }
+        gr::trace::setCategories(0U);
+
         // And the key reaches the report, keyed off what a capture actually records.
         const std::vector<Event>        events{exactRecord(EntityId{1U}, 100U, 100U, 0U), invocationOf(EntityId{1U}, 100U, 500U)};
         const std::vector<LoadedEntity> fused{LoadedEntity{.id = EntityId{1U}, .uniqueName = "merged#1", .typeName = "gr::MergeByIndex<A, 0, B, 0>"}};
         const gr::property_map          reportMap = timingReport(events, fused);
 
-        const auto             blocksIt    = reportMap.find("blocks");
+        const auto blocksIt = reportMap.find("blocks");
         expect((blocksIt != reportMap.end()) >> fatal);
         const gr::pmt::Value   blocksValue = (*blocksIt).second;
         const gr::property_map blocks      = blocksValue.value_or(gr::property_map{});

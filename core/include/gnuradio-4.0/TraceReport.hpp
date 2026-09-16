@@ -15,6 +15,7 @@
 #include <format>
 #include <functional>
 #include <limits>
+#include <numeric>
 #include <ranges>
 #include <utility>
 
@@ -299,9 +300,16 @@ inline constexpr double      kMaxFitResidual = 0.25; /// a fit that does not des
  */
 struct RatioEstimate {
     bool        stable      = false;
-    double      outPerIn    = 0.0;
+    double      outPerIn    = 0.0; /// for reporting only -- never for the coordinate walk, see below
     std::size_t invocations = 0UZ;
     std::string reason; /// why it was refused; empty when stable
+
+    /// The same ratio as an exact fraction, reduced. The walk in `chainLinks` **must** use these
+    /// rather than `outPerIn`: a sink coordinate normally lands exactly on a source batch boundary,
+    /// and a double division by a non-dyadic ratio lands a fraction of a sample *below* it, which
+    /// silently matches the previous batch and reports a latency a whole batch period out.
+    std::uint64_t outTotal = 0UL;
+    std::uint64_t inTotal  = 0UL;
 };
 
 /// Productive `workExact` records for one block, in the order they were emitted.
@@ -372,8 +380,11 @@ inline constexpr double kRatioTolerance = 1e-9; /// the counts are integers, so 
         }
     }
 
-    estimate.stable   = true;
-    estimate.outPerIn = ratio;
+    const std::uint64_t divisor = std::gcd(totalIn, totalOut);
+    estimate.stable             = true;
+    estimate.outPerIn           = ratio;
+    estimate.outTotal           = divisor == 0UL ? totalOut : totalOut / divisor;
+    estimate.inTotal            = divisor == 0UL ? totalIn : totalIn / divisor;
     return estimate;
 }
 
@@ -391,11 +402,11 @@ inline constexpr double kRatioTolerance = 1e-9; /// the counts are integers, so 
  */
 /// One sink invocation matched to the source batch that produced the samples it read.
 struct LatencyLink {
-    std::uint64_t producedAt = 0UL; /// when the source batch finished
-    std::uint64_t consumedAt = 0UL; /// when the sink invocation that read it finished
-    std::uint64_t latencyNs  = 0UL;
-    EntityId      producer   = kNoEntity;
-    EntityId      consumer   = kNoEntity;
+    std::uint64_t producedAt     = 0UL; /// when the source batch finished
+    std::uint64_t consumedAt     = 0UL; /// when the sink invocation that read it finished
+    std::uint64_t latencyNs      = 0UL;
+    EntityId      producer       = kNoEntity;
+    EntityId      consumer       = kNoEntity;
     std::uint8_t  producerWorker = 0U;
     std::uint8_t  consumerWorker = 0U;
 };
@@ -422,15 +433,45 @@ struct ChainLatency {
         return result;
     }
 
-    // Every hop's ratio first, so a refusal names the ratio rather than a downstream symptom.
-    std::vector<double> ratios;
-    for (std::size_t hop = 0UZ; hop + 1UZ < chain.size(); ++hop) {
-        const RatioEstimate estimate = ratioOf(events, chain[hop + 1UZ]);
-        if (!estimate.stable && hop + 2UZ < chain.size()) {
-            result.reason = std::format("entity {} has no stable ratio: {}", chain[hop + 1UZ], estimate.reason);
+    // Every intermediate hop's ratio, composed into one exact fraction. Walking a sink coordinate
+    // back to the source means multiplying by `in/out` at each hop, and the product of those is a
+    // single rational -- so it is accumulated as one, reduced at each step to keep it small.
+    //
+    // The **intermediate** blocks only: `chain.front()` is the source, whose ratio describes nothing
+    // upstream of it, and `chain.back()` is the sink, whose output nobody downstream reads.
+    std::uint64_t inFactor  = 1UL; // numerator of the composed in/out
+    std::uint64_t outFactor = 1UL;
+    for (std::size_t hop = 1UZ; hop + 1UZ < chain.size(); ++hop) {
+        const RatioEstimate estimate = ratioOf(events, chain[hop]);
+        if (!estimate.stable) {
+            result.reason = std::format("entity {} has no stable ratio: {}", chain[hop], estimate.reason);
             return result;
         }
-        ratios.push_back(estimate.stable ? estimate.outPerIn : 1.0);
+        if (estimate.outTotal == 0UL) {
+            result.reason = std::format("entity {} consumes without producing, so the chain does not carry data through", chain[hop]);
+            return result;
+        }
+        // Checked *before* multiplying, not after: a product that has already wrapped tells you
+        // nothing about what it should have been.
+        const std::uint64_t ceiling = std::numeric_limits<std::uint64_t>::max();
+        if (estimate.inTotal > ceiling / inFactor || estimate.outTotal > ceiling / outFactor) {
+            result.reason = "the chain's composed ratio overflows an exact fraction";
+            return result;
+        }
+        inFactor *= estimate.inTotal;
+        outFactor *= estimate.outTotal;
+        const std::uint64_t divisor = std::gcd(inFactor, outFactor);
+        if (divisor > 1UL) {
+            inFactor /= divisor;
+            outFactor /= divisor;
+        }
+        // Positions are 32-bit, so `position * inFactor` must stay inside 64 bits for the walk below
+        // to be exact. A chain whose composed numerator threatens that is refused rather than walked
+        // in floating point, which is the thing this fraction exists to avoid.
+        if (inFactor > (ceiling >> 32U)) {
+            result.reason = "the chain's composed ratio is too large to walk exactly";
+            return result;
+        }
     }
 
     const std::vector<Event> sourceRecords = exactRecordsFor(events, chain.front());
@@ -463,35 +504,36 @@ struct ChainLatency {
         //
         // The **intermediate** blocks only. The sink's own ratio describes what it would emit, which
         // no one downstream reads, and the source's describes nothing upstream of it.
-        double coordinate = static_cast<double>(sinkRecord.payload2);
-        for (std::size_t hop = ratios.size() - 1UZ; hop-- > 0UZ;) {
-            if (ratios[hop] <= 0.0) {
-                result.reason = "a hop consumes without producing, so the chain does not carry data through";
-                return result;
-            }
-            coordinate /= ratios[hop];
-        }
+        // Exact, in integers. `inFactor / outFactor` is the composed in-per-out of every block
+        // between the ends, so this is the source output coordinate the sink's first sample came
+        // from. Floating point here is what put the answer a whole batch out.
+        const std::uint64_t coordinate = (static_cast<std::uint64_t>(sinkRecord.payload2) * inFactor) / outFactor;
 
         // The last batch that began at or before this coordinate is the only one that can contain
         // it, because the batches are contiguous and ordered.
-        const auto after = std::ranges::partition_point(sourceRecords, [coordinate](const Event& candidate) { return static_cast<double>(candidate.payload2) <= coordinate; });
+        const auto after = std::ranges::partition_point(sourceRecords, [coordinate](const Event& candidate) { return static_cast<std::uint64_t>(candidate.payload2) <= coordinate; });
         if (after == sourceRecords.begin()) {
             continue; // produced before the capture opened; not an error, just unmatched
         }
-        const Event& candidate = *std::prev(after);
-        const double begin     = static_cast<double>(candidate.payload2);
-        if (coordinate >= begin + static_cast<double>(candidate.payload1)) {
+        const Event&        candidate = *std::prev(after);
+        const std::uint64_t begin     = candidate.payload2;
+        if (coordinate >= begin + candidate.payload1) {
             continue; // falls in a gap between batches, so nothing in this capture produced it
         }
-        const Event* producer = &candidate;
+        const Event*        producer   = &candidate;
         const std::uint64_t producedAt = producer->startNs + producer->durationNs;
         const std::uint64_t consumedAt = sinkRecord.startNs + sinkRecord.durationNs;
         if (consumedAt < producedAt) {
             result.reason = "a sample was consumed before it was produced: the capture's clock or its positions are inconsistent";
             return result;
         }
-        result.links.push_back(LatencyLink{.producedAt = producedAt, .consumedAt = consumedAt, .latencyNs = consumedAt - producedAt, //
-            .producer = producer->entity, .consumer = sinkRecord.entity, .producerWorker = producer->workerId, .consumerWorker = sinkRecord.workerId});
+        result.links.push_back(LatencyLink{.producedAt = producedAt,
+            .consumedAt                                = consumedAt,
+            .latencyNs                                 = consumedAt - producedAt, //
+            .producer                                  = producer->entity,
+            .consumer                                  = sinkRecord.entity,
+            .producerWorker                            = producer->workerId,
+            .consumerWorker                            = sinkRecord.workerId});
     }
 
     if (result.links.empty()) {
@@ -614,9 +656,9 @@ struct ChainLatency {
         // resampling block -- `performed_work` is one number under an affine map, `(in, out)` is two
         // exact ones -- so a reader comparing two reports has no way to know they used the same rule
         // unless each says so.
-        const RatioEstimate ratio  = ratioOf(events, entity);
+        const RatioEstimate ratio    = ratioOf(events, entity);
         const bool          hasExact = ratio.invocations > 0UZ;
-        block["sample_source"]     = std::string(hasExact ? "block-side" : "scheduler-side");
+        block["sample_source"]       = std::string(hasExact ? "block-side" : "scheduler-side");
         if (hasExact) {
             block["exact_invocations"] = static_cast<std::uint64_t>(ratio.invocations);
             block["ratio_stable"]      = ratio.stable;
