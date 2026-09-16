@@ -515,6 +515,14 @@ std::expected<Capture, gr::Error> load(std::string_view path) {
     if (header.headerBytes < sizeof(FileHeader)) {
         return std::unexpected(gr::Error(std::format("gr::trace::load: '{}' declares a {}-byte header, shorter than the {} this build requires", filePath, header.headerBytes, sizeof(FileHeader))));
     }
+    // Bounded from **both** sides. Only the lower bound was checked at first, and the subtraction
+    // below is unsigned: a 5 KiB file declaring a 1 GiB header made `afterHeader` 1.8e19, walked
+    // through the identity-count guard that exists to stop exactly this, and left an
+    // attacker-chosen `eventCount` to be handed to `resize()`. A header cannot be larger than the
+    // file that contains it, and saying so is the whole fix.
+    if (header.headerBytes > fileBytes) {
+        return std::unexpected(gr::Error(std::format("gr::trace::load: '{}' declares a {}-byte header but is only {} bytes long", filePath, header.headerBytes, fileBytes)));
+    }
 
     // A longer header is a *later* version that kept this one's prefix, which is what `headerBytes`
     // exists to make survivable. Skip the excess rather than misread the section after it.
@@ -542,7 +550,14 @@ std::expected<Capture, gr::Error> load(std::string_view path) {
         capture.entities.push_back(std::move(entity));
     }
 
-    const auto          eventSectionStart = static_cast<std::uint64_t>(in.tellg());
+    // `tellg()` returns -1 on a stream that has failed, which as an unsigned value is enormous and
+    // makes the subtraction below wrap in the same way. Both operands are checked before either is
+    // used, so no file offset arithmetic in this function can underflow.
+    const auto position = in.tellg();
+    if (position < 0 || static_cast<std::uint64_t>(position) > fileBytes) {
+        return std::unexpected(gr::Error(std::format("gr::trace::load: '{}' places its record section outside the file", filePath)));
+    }
+    const auto          eventSectionStart = static_cast<std::uint64_t>(position);
     const std::uint64_t remaining         = fileBytes - eventSectionStart;
     if (header.eventCount != remaining / sizeof(Event) || remaining % sizeof(Event) != 0UL) {
         // Exact, not "at least". The event section is the last thing in the file, so its length is

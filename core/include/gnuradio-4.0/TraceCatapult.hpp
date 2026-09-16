@@ -6,9 +6,11 @@
 #include <format>
 #include <map>
 #include <ranges>
+#include <set>
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include <gnuradio-4.0/Trace.hpp>
@@ -130,6 +132,17 @@ namespace detail {
     const auto          micros = [origin](std::uint64_t ns) { return static_cast<double>(ns - origin) / 1000.0; };
     const std::uint64_t pid    = capture.header.processId;
 
+    // A `workEnd` span already covers its invocation -- `startNs` *is* the entry instant -- so a
+    // `workBegin` beside it is a redundant tick at the head of every span. The one worth keeping is
+    // the **unmatched** one: a `work()` that entered and never returned leaves nothing else behind,
+    // and is the hang the begin/end pair exists to expose.
+    std::set<std::pair<EntityId, std::uint64_t>> completed;
+    for (const Event& event : capture.events) {
+        if (event.kind == Kind::workEnd) {
+            completed.emplace(event.entity, event.startNs);
+        }
+    }
+
     std::string out   = "{\"traceEvents\":[";
     bool        first = true;
     const auto  comma = [&] {
@@ -154,9 +167,13 @@ namespace detail {
     out += std::format(R"({{"name":"process_name","ph":"M","pid":{},"tid":0,"args":{{"name":"gnuradio4 trace"}}}})", pid);
 
     for (const Event& event : capture.events) {
+        if (event.kind == Kind::workBegin && completed.contains({event.entity, event.startNs})) {
+            continue; // the span that follows says everything this would
+        }
         const std::string label = event.entity != kNoEntity && names.contains(event.entity) //
                                       ? std::format("{} · {}", detail::kindName(event.kind), names.at(event.entity))
                                       : std::string(detail::kindName(event.kind));
+        const std::string shown = event.kind == Kind::workBegin ? std::format("UNRETURNED {}", label) : label;
 
         // Every record carries its payloads: a timeline whose tooltips say nothing but the name is a
         // picture, not a trace. `args` is where the numbers this layer exists to record actually live.
@@ -166,13 +183,13 @@ namespace detail {
         comma();
         if (detail::isComplete(event.kind)) {
             out += std::format(R"({{"name":"{}","cat":"{}","ph":"X","ts":{:.3f},"dur":{:.3f},"pid":{},"tid":{},"args":{}}})", //
-                detail::escape(label), detail::kindName(event.kind), micros(event.startNs), static_cast<double>(event.durationNs) / 1000.0, pid, event.workerId, args);
+                detail::escape(shown), detail::kindName(event.kind), micros(event.startNs), static_cast<double>(event.durationNs) / 1000.0, pid, event.workerId, args);
         } else if (event.kind == Kind::workProbe) {
             out += std::format(R"({{"name":"{}","cat":"workProbe","ph":"C","ts":{:.3f},"pid":{},"tid":{},"args":{{"probes":{},"ns":{}}}}})", //
-                detail::escape(label), micros(event.startNs), pid, event.workerId, event.payload0, event.payload1);
+                detail::escape(shown), micros(event.startNs), pid, event.workerId, event.payload0, event.payload1);
         } else {
             out += std::format(R"({{"name":"{}","cat":"{}","ph":"i","ts":{:.3f},"pid":{},"tid":{},"s":"t","args":{}}})", //
-                detail::escape(label), detail::kindName(event.kind), micros(event.startNs), pid, event.workerId, args);
+                detail::escape(shown), detail::kindName(event.kind), micros(event.startNs), pid, event.workerId, args);
         }
     }
 

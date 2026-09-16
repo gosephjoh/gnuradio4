@@ -985,6 +985,18 @@ const boost::ut::suite<"Trace"> traceTests = [] {
             {"header shorter than required", [&](std::vector<char>& b) { patch32(b, offsetof(FileHeader, headerBytes), 64U); }, "shorter than"},
             {"truncated mid-record", [](std::vector<char>& b) { b.resize(b.size() - 8UZ); }, "records"},
             {"impossible identity count", [&](std::vector<char>& b) { patch64(b, offsetof(FileHeader, entityCount), 1UL << 40U); }, "identities"},
+            // A header larger than the file it is in. Only the lower bound was checked at first, and
+            // the difference is computed on unsigned offsets: this made `fileBytes - headerBytes`
+            // wrap to 1.8e19, walked past the identity-count guard written to stop exactly this, and
+            // left an attacker-chosen record count to reach `resize()`.
+            {"header larger than the file", [&](std::vector<char>& b) { patch32(b, offsetof(FileHeader, headerBytes), 1U << 30U); }, "only"},
+            {"header larger than the file, with no identities to trip over", //
+                [&](std::vector<char>& b) {
+                    patch32(b, offsetof(FileHeader, headerBytes), 1U << 30U);
+                    patch64(b, offsetof(FileHeader, entityCount), 0UL);
+                    patch64(b, offsetof(FileHeader, eventCount), 1UL << 35U);
+                },
+                "only"},
         };
 
         for (const Damage& damage : damages) {

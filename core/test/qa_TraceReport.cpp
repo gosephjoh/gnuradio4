@@ -382,6 +382,51 @@ const boost::ut::suite<"TraceReport"> reportTests = [] {
         expect(eq(std::ranges::count(json, '{'), std::ranges::count(json, '}'))) << "braces must balance, or the document is not JSON at all";
     };
 
+    "a matched work start is folded into its span; an unreturned one survives"_test = [] {
+        // A `work` span already covers its invocation, so a `workBegin` beside it is a redundant tick
+        // at the head of every span. The unmatched one is the whole reason the marker exists: a
+        // `work()` that entered and never returned leaves nothing else behind.
+        Capture capture;
+        capture.events.push_back(Event{.startNs = 1000UL, .payload0 = 64U, .entity = 1U, .kind = Kind::workBegin});
+        capture.events.push_back(Event{.startNs = 1000UL, .durationNs = 500U, .payload0 = 64U, .payload1 = 64U, .entity = 1U, .kind = Kind::workEnd});
+        capture.events.push_back(Event{.startNs = 9000UL, .payload0 = 64U, .entity = 1U, .kind = Kind::workBegin}); // never returned
+
+        const std::string json   = catapultJson(capture);
+        std::size_t       begins = 0UZ;
+        for (std::size_t at = json.find("\"cat\":\"workBegin\""); at != std::string::npos; at = json.find("\"cat\":\"workBegin\"", at + 1UZ)) {
+            ++begins;
+        }
+        expect(eq(begins, 1UZ)) << "exactly one work start survives: the one with no span to speak for it";
+        expect(json.contains("UNRETURNED")) << "and it must be named so a reader knows what they are looking at";
+        expect(json.contains("\"cat\":\"work\",\"ph\":\"X\"")) << "the completed invocation is still a span";
+    };
+
+    "a zero-work invocation informs the fit rather than refusing it"_test = [] {
+        // An all-asynchronous-input block returns OK having consumed nothing, so a genuine zero-work
+        // sample exists and is the most direct observation of the intercept there is. Its centroid is
+        // zero, and a ratio against zero is not a narrow span -- it is no span. Letting it set the
+        // span ratio refused the whole block's fit on the strength of one sample.
+        TimingAccumulator accumulator;
+        accumulator.fold(invocation(1U, 0U, 800U)); // OK, consumed nothing: pure invocation cost
+        for (const Event& event : fromCostModel(1U, 800UL, 3.0, {64U, 256U, 1024U, 4096U, 16384U})) {
+            accumulator.fold(event);
+        }
+        const Fit fit = fitCost(accumulator.blocks.at(1U));
+
+        expect(fit.identifiable >> fatal) << "one zero-work sample must not refuse an otherwise clean fit: " << fit.reason;
+        expect(lt(std::abs(fit.slopeNsPerItem - 3.0), 0.05)) << "and the slope must be unharmed by it";
+        expect(gt(fit.spanRatio, kMinFitSpan)) << "the span is measured over the buckets that have one";
+    };
+
+    "a block with only zero-work samples has no span to fit over"_test = [] {
+        TimingAccumulator accumulator;
+        for (std::size_t r = 0UZ; r < 8UZ; ++r) {
+            accumulator.fold(invocation(1U, 0U, 800U + static_cast<std::uint32_t>(r)));
+        }
+        const Fit fit = fitCost(accumulator.blocks.at(1U));
+        expect(!fit.identifiable) << "no work count varied, so nothing can be said about cost per item";
+    };
+
     "timestamps are rebased, so a capture opens where its records are"_test = [] {
         // `startNs` is steady_clock since an arbitrary epoch. Emitted raw, every event lands tens of
         // thousands of years along the axis and the viewer opens on empty space.

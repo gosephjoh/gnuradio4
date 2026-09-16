@@ -216,8 +216,24 @@ inline constexpr double      kMaxFitResidual = 0.25; /// a fit that does not des
         return fit;
     }
 
-    const auto [smallest, largest] = std::ranges::minmax(points | std::views::transform([](const auto& p) { return p.first; }));
-    fit.spanRatio                  = smallest > 0.0 ? largest / smallest : 0.0;
+    // Over **positive** centroids only. A zero-work invocation is a real and valuable observation --
+    // it measures the intercept with no slope to subtract, and an all-asynchronous-input block
+    // produces one by returning OK having consumed nothing -- but its centroid is zero, and a ratio
+    // against zero is not a narrow span, it is no span at all. Letting it set `spanRatio` to zero
+    // refused the entire block's fit on the strength of one sample. The point itself stays in the
+    // regression below, where it belongs.
+    std::vector<double> positiveCentroids;
+    for (const auto& [centroid, cost] : points) {
+        if (centroid > 0.0) {
+            positiveCentroids.push_back(centroid);
+        }
+    }
+    if (positiveCentroids.size() < 2UZ) {
+        fit.reason = std::format("only {} bucket(s) with a non-zero work count; a slope needs at least two to span", positiveCentroids.size());
+        return fit;
+    }
+    const auto [smallest, largest] = std::ranges::minmax(positiveCentroids);
+    fit.spanRatio                  = largest / smallest;
     if (fit.spanRatio < kMinFitSpan) {
         fit.reason = std::format("work counts span only {:.2f}x, below the {:.0f}x a slope can be separated from the intercept over", fit.spanRatio, kMinFitSpan);
         return fit;
