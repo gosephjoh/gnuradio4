@@ -474,6 +474,90 @@ void writeEntity(EntityId id, const EntityDescription& description, void* user) 
 
 } // namespace
 
+namespace {
+
+/// Reads one trivially-copyable value, reporting a short read rather than leaving it half-filled.
+template<typename T>
+[[nodiscard]] bool readRaw(std::istream& in, T& value) {
+    static_assert(std::is_trivially_copyable_v<T>);
+    return static_cast<bool>(in.read(reinterpret_cast<char*>(std::addressof(value)), static_cast<std::streamsize>(sizeof(T))));
+}
+
+} // namespace
+
+std::expected<Capture, gr::Error> load(std::string_view path) {
+    const std::string filePath(path);
+    std::ifstream     in(filePath, std::ios::binary | std::ios::ate);
+    if (!in.is_open()) {
+        return std::unexpected(gr::Error(std::format("gr::trace::load: cannot open '{}' for reading", filePath)));
+    }
+    const auto fileBytes = static_cast<std::uint64_t>(in.tellg());
+    in.seekg(0, std::ios::beg);
+
+    Capture capture;
+    if (fileBytes < sizeof(FileHeader) || !readRaw(in, capture.header)) {
+        return std::unexpected(gr::Error(std::format("gr::trace::load: '{}' is {} bytes, too short to hold a {}-byte header", filePath, fileBytes, sizeof(FileHeader))));
+    }
+    const FileHeader& header = capture.header;
+
+    if (header.magic != kFileMagic) {
+        return std::unexpected(gr::Error(std::format("gr::trace::load: '{}' is not a .gr4trace file", filePath)));
+    }
+    if (header.endianMarker != kEndianMarker) {
+        return std::unexpected(gr::Error(std::format("gr::trace::load: '{}' was written on a machine of the other byte order; this reader refuses rather than reinterprets", filePath)));
+    }
+    if (header.formatVersion != kFormatVersion) {
+        return std::unexpected(gr::Error(std::format("gr::trace::load: '{}' is format version {}, this build knows {}", filePath, header.formatVersion, kFormatVersion)));
+    }
+    if (header.eventBytes != sizeof(Event)) {
+        return std::unexpected(gr::Error(std::format("gr::trace::load: '{}' has {}-byte records, this build's Event is {} -- the layout changed", filePath, header.eventBytes, sizeof(Event))));
+    }
+    if (header.headerBytes < sizeof(FileHeader)) {
+        return std::unexpected(gr::Error(std::format("gr::trace::load: '{}' declares a {}-byte header, shorter than the {} this build requires", filePath, header.headerBytes, sizeof(FileHeader))));
+    }
+
+    // A longer header is a *later* version that kept this one's prefix, which is what `headerBytes`
+    // exists to make survivable. Skip the excess rather than misread the section after it.
+    if (header.headerBytes > sizeof(FileHeader)) {
+        in.seekg(static_cast<std::streamoff>(header.headerBytes), std::ios::beg);
+    }
+
+    // Checked before reserving anything. The counts come from the file, so a corrupt or hostile one
+    // could otherwise ask for an allocation of arbitrary size before a single byte is validated.
+    const std::uint64_t afterHeader = fileBytes - header.headerBytes;
+    if (header.entityCount > afterHeader / sizeof(EntityRecord)) {
+        return std::unexpected(gr::Error(std::format("gr::trace::load: '{}' claims {} identities, more than its {} remaining bytes can hold", filePath, header.entityCount, afterHeader)));
+    }
+
+    capture.entities.reserve(static_cast<std::size_t>(header.entityCount));
+    for (std::uint64_t index = 0UL; index < header.entityCount; ++index) {
+        EntityRecord record{};
+        if (!readRaw(in, record)) {
+            return std::unexpected(gr::Error(std::format("gr::trace::load: '{}' ends inside identity {} of {}", filePath, index, header.entityCount)));
+        }
+        LoadedEntity entity{.id = record.id, .workerId = record.workerId, .nInputPorts = record.nInputPorts, .nOutputPorts = record.nOutputPorts, .uniqueName = std::string(record.uniqueNameBytes, '\0'), .typeName = std::string(record.typeNameBytes, '\0')};
+        if (!in.read(entity.uniqueName.data(), static_cast<std::streamsize>(record.uniqueNameBytes)) || !in.read(entity.typeName.data(), static_cast<std::streamsize>(record.typeNameBytes))) {
+            return std::unexpected(gr::Error(std::format("gr::trace::load: '{}' ends inside the names of identity {}", filePath, index)));
+        }
+        capture.entities.push_back(std::move(entity));
+    }
+
+    const auto          eventSectionStart = static_cast<std::uint64_t>(in.tellg());
+    const std::uint64_t remaining         = fileBytes - eventSectionStart;
+    if (header.eventCount != remaining / sizeof(Event) || remaining % sizeof(Event) != 0UL) {
+        // Exact, not "at least". The event section is the last thing in the file, so its length is
+        // fully determined -- and a mismatch means the file was truncated or the header lies, either
+        // of which makes every figure drawn from it suspect.
+        return std::unexpected(gr::Error(std::format("gr::trace::load: '{}' claims {} records but its last section is {} bytes, which is {} of them", filePath, header.eventCount, remaining, remaining / sizeof(Event))));
+    }
+
+    capture.events.resize(static_cast<std::size_t>(header.eventCount));
+    if (header.eventCount > 0UL && !in.read(reinterpret_cast<char*>(capture.events.data()), static_cast<std::streamsize>(remaining))) {
+        return std::unexpected(gr::Error(std::format("gr::trace::load: '{}' ends inside its record section", filePath)));
+    }
+    return capture;
+}
+
 std::expected<std::size_t, gr::Error> dump(std::string_view path) {
     const std::string filePath(path);
     std::ofstream     out(filePath, std::ios::binary | std::ios::trunc);

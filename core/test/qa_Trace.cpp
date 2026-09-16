@@ -12,9 +12,11 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <functional>
 #include <initializer_list>
 #include <limits>
 #include <new>
+#include <ranges>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -306,6 +308,16 @@ const boost::ut::suite<"Trace"> traceTests = [] {
             expect(eq(header.ringCount, 0UL));
             expect(eq(header.lostCount, 0UL)) << "nothing was captured, so nothing was lost -- the two must not be conflated";
             expect(eq(header.eventBytes, static_cast<std::uint32_t>(sizeof(Event)))) << "the layout must still be declared, so a reader can reject a mismatched build";
+
+            // `load()` is compiled into this build too, and `gr4-trace` will be built from it. A
+            // reader tested only where tracing is enabled is a reader untested for half the binaries
+            // that contain it.
+            const auto loaded = load(file.string());
+            expect(loaded.has_value() >> fatal) << "the reader must work in a build that captures nothing";
+            expect(eq(loaded->events.size(), 0UZ));
+            expect(eq(loaded->header.eventBytes, static_cast<std::uint32_t>(sizeof(Event))));
+
+            expect(!load((file.string() + ".does-not-exist")).has_value()) << "and must refuse a path that is not there";
 
             std::filesystem::remove(file);
         };
@@ -883,6 +895,145 @@ const boost::ut::suite<"Trace"> traceTests = [] {
 
         std::filesystem::remove(first);
         std::filesystem::remove(second);
+    };
+
+    "a capture survives a round trip through the file"_test = [] {
+        reset();
+        setCategories(categoryMask(Category::work));
+        std::ignore = intern(reinterpret_cast<const void*>(0xB10C10UL), EntityDescription{.uniqueName = "roundtrip", .typeName = "gr::testing::Copy<float>", .workerId = 2U, .nInputPorts = 1U, .nOutputPorts = 1U});
+        for (std::uint32_t i = 0U; i < 5U; ++i) {
+            emit(Event{.startNs = 1000UL + i, .durationNs = 10U + i, .payload0 = i, .kind = Kind::workEnd, .workerId = 2U, .status = -1});
+        }
+        const std::vector<Event> captured = collect();
+
+        const std::filesystem::path file = std::filesystem::temp_directory_path() / std::format("qa_Trace_load_{}.gr4trace", ::getpid());
+        expect(dump(file.string()).has_value() >> fatal);
+
+        const auto loaded = load(file.string());
+        expect(loaded.has_value() >> fatal) << "a file this process just wrote must be readable by this process";
+        expect(eq(loaded->events.size(), captured.size()) >> fatal) << "every record written must come back";
+        for (std::size_t i = 0UZ; i < captured.size(); ++i) {
+            expect(eq(loaded->events[i].startNs, captured[i].startNs));
+            expect(eq(loaded->events[i].payload0, captured[i].payload0));
+            expect(eq(std::to_underlying(loaded->events[i].kind), std::to_underlying(captured[i].kind)));
+            expect(eq(loaded->events[i].status, captured[i].status)) << "status is what the fit filters on, so it must survive the file";
+        }
+
+        const auto entity = std::ranges::find_if(loaded->entities, [](const LoadedEntity& e) { return e.uniqueName == "roundtrip"; });
+        expect((entity != loaded->entities.end()) >> fatal) << "the identity table must survive too, or records name nothing";
+        expect(eq(entity->typeName, std::string("gr::testing::Copy<float>"))) << "including both names, which are length-prefixed rather than terminated";
+        expect(eq(std::uint32_t{entity->workerId}, 2U));
+        expect(eq(entity->nInputPorts, std::uint16_t{1U}));
+
+        std::filesystem::remove(file);
+        setCategories(0U);
+        reset();
+    };
+
+    "an empty capture round-trips as an empty capture"_test = [] {
+        reset();
+        const std::filesystem::path file = std::filesystem::temp_directory_path() / std::format("qa_Trace_loadempty_{}.gr4trace", ::getpid());
+        expect(dump(file.string()).has_value() >> fatal);
+
+        const auto loaded = load(file.string());
+        expect(loaded.has_value() >> fatal) << "nothing captured is a valid capture, not a corrupt one";
+        expect(eq(loaded->events.size(), 0UZ));
+        expect(eq(loaded->entities.size(), 0UZ));
+        expect(eq(std::string_view(loaded->header.magic.data(), 8UZ), std::string_view("GR4TRACE")));
+
+        std::filesystem::remove(file);
+    };
+
+    "a damaged file is refused, and the refusal names the damage"_test = [] {
+        // Each of these is a rule the container was designed around; a reader that recovered from any
+        // of them would be reinterpreting bytes whose meaning it cannot know.
+        reset();
+        setCategories(categoryMask(Category::work));
+        emit(Event{.payload0 = 1U, .kind = Kind::workEnd});
+        const std::filesystem::path good = std::filesystem::temp_directory_path() / std::format("qa_Trace_good_{}.gr4trace", ::getpid());
+        expect(dump(good.string()).has_value() >> fatal);
+        setCategories(0U);
+
+        std::vector<char> original;
+        {
+            std::ifstream in(good, std::ios::binary);
+            original.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+        }
+
+        const auto writeDamaged = [&](const std::function<void(std::vector<char>&)>& damage) {
+            std::vector<char> bytes = original;
+            damage(bytes);
+            const std::filesystem::path bad = std::filesystem::temp_directory_path() / std::format("qa_Trace_bad_{}.gr4trace", ::getpid());
+            std::ofstream               out(bad, std::ios::binary | std::ios::trunc);
+            out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+            out.close();
+            return bad;
+        };
+        const auto patch32 = [](std::vector<char>& bytes, std::size_t offset, std::uint32_t value) { std::memcpy(bytes.data() + offset, &value, sizeof(value)); };
+        const auto patch64 = [](std::vector<char>& bytes, std::size_t offset, std::uint64_t value) { std::memcpy(bytes.data() + offset, &value, sizeof(value)); };
+
+        struct Damage {
+            const char*                             what;
+            std::function<void(std::vector<char>&)> apply;
+            const char*                             mustSay;
+        };
+        const std::vector<Damage> damages{
+            {"wrong magic", [](std::vector<char>& b) { b[0] = 'X'; }, "not a .gr4trace"},
+            {"other byte order", [&](std::vector<char>& b) { patch32(b, offsetof(FileHeader, endianMarker), 0x04030201U); }, "byte order"},
+            {"unknown version", [&](std::vector<char>& b) { patch32(b, offsetof(FileHeader, formatVersion), 99U); }, "format version"},
+            {"different Event size", [&](std::vector<char>& b) { patch32(b, offsetof(FileHeader, eventBytes), 64U); }, "layout changed"},
+            {"header shorter than required", [&](std::vector<char>& b) { patch32(b, offsetof(FileHeader, headerBytes), 64U); }, "shorter than"},
+            {"truncated mid-record", [](std::vector<char>& b) { b.resize(b.size() - 8UZ); }, "records"},
+            {"impossible identity count", [&](std::vector<char>& b) { patch64(b, offsetof(FileHeader, entityCount), 1UL << 40U); }, "identities"},
+        };
+
+        for (const Damage& damage : damages) {
+            const std::filesystem::path bad    = writeDamaged(damage.apply);
+            const auto                  result = load(bad.string());
+            expect(!result.has_value()) << std::format("a file with {} must be refused", damage.what);
+            if (!result.has_value()) {
+                expect(std::string(result.error().message).contains(damage.mustSay)) << std::format("the refusal for {} must name it, and said instead: {}", damage.what, result.error().message);
+            }
+            std::filesystem::remove(bad);
+        }
+
+        // The undamaged original must still load, or the loop above proves only that load() refuses.
+        expect(load(good.string()).has_value()) << "the file the damages were derived from must itself be readable";
+        std::filesystem::remove(good);
+        reset();
+    };
+
+    "a longer header from a later version is skipped, not misread"_test = [] {
+        // `headerBytes` exists precisely so a later version can grow the preamble without every older
+        // reader silently parsing its extension as the identity table.
+        reset();
+        setCategories(categoryMask(Category::work));
+        emit(Event{.payload0 = 42U, .kind = Kind::workEnd});
+        const std::filesystem::path file = std::filesystem::temp_directory_path() / std::format("qa_Trace_future_{}.gr4trace", ::getpid());
+        expect(dump(file.string()).has_value() >> fatal);
+        setCategories(0U);
+
+        std::vector<char> bytes;
+        {
+            std::ifstream in(file, std::ios::binary);
+            bytes.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+        }
+        constexpr std::uint32_t kPadding = 32U;
+        const std::uint32_t     grown    = static_cast<std::uint32_t>(sizeof(FileHeader)) + kPadding;
+        std::memcpy(bytes.data() + offsetof(FileHeader, headerBytes), &grown, sizeof(grown));
+        bytes.insert(bytes.begin() + static_cast<std::ptrdiff_t>(sizeof(FileHeader)), kPadding, '\0');
+        {
+            std::ofstream out(file, std::ios::binary | std::ios::trunc);
+            out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+        }
+
+        const auto loaded = load(file.string());
+        expect(loaded.has_value() >> fatal) << "a longer header is a later version, not a corrupt file: " << (loaded.has_value() ? std::string{} : std::string(loaded.error().message));
+        expect(eq(loaded->events.size(), 1UZ)) << "and the records after it must still be found";
+        expect(eq(loaded->events.front().payload0, 42U));
+
+        std::filesystem::remove(file);
+        reset();
     };
 
     "the build flag reaches the header"_test = [] {

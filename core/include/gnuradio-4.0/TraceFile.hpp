@@ -4,8 +4,10 @@
 #include <array>
 #include <cstdint>
 #include <expected>
+#include <string>
 #include <string_view>
 #include <type_traits>
+#include <vector>
 
 #include <gnuradio-4.0/Logger.hpp>
 #include <gnuradio-4.0/Trace.hpp>
@@ -117,6 +119,43 @@ static_assert(std::is_standard_layout_v<EntityRecord>);
  * library code, and the project's error handling is exception-free.
  */
 [[nodiscard]] std::expected<std::size_t, gr::Error> dump(std::string_view path);
+
+/// One identity as it was written, with its names owned rather than viewed: the block they came from
+/// is long gone by the time anything reads the file.
+struct LoadedEntity {
+    EntityId      id{};
+    std::uint8_t  workerId{};
+    std::uint16_t nInputPorts{};
+    std::uint16_t nOutputPorts{};
+    std::string   uniqueName;
+    std::string   typeName;
+};
+
+/// A capture, read back whole.
+struct Capture {
+    FileHeader                header{};
+    std::vector<LoadedEntity> entities;
+    std::vector<Event>        events;
+};
+
+/**
+ * Reads a `.gr4trace` written by `dump()`.
+ *
+ * The reading counterpart the format always described but never had: until now the only reader was
+ * whatever each test wrote inline, which is how a container acquires several subtly different
+ * opinions about its own layout. One reader, shared by the report, the converter and the tests.
+ *
+ * **It refuses rather than reinterprets**, which is the rule the header was designed around. A
+ * different byte order, an `Event` of a different size, a `formatVersion` it does not know, a header
+ * shorter than it should be, a truncated section, or counts the file is too small to contain: each
+ * is an error naming what was wrong, never a partial `Capture`. A half-read trace that looks whole is
+ * the failure this format spent a `headerBytes` field and an endian marker to avoid.
+ *
+ * A header longer than this build's `FileHeader` is *not* an error — that is what `headerBytes` is
+ * for. The extra is skipped, so a file from a later version whose `formatVersion` is still
+ * recognised remains readable.
+ */
+[[nodiscard]] std::expected<Capture, gr::Error> load(std::string_view path);
 
 } // namespace gr::trace
 
