@@ -139,8 +139,8 @@ void exportTimeline([[maybe_unused]] std::string_view name) {
 
 /// Drives an `externalStep` EDF scheduler over `src -> mid -> snk` to completion, with an optional
 /// settings override applied before it starts. Returns nothing: the assertion material is the trace.
-template<typename TConfigure>
-void runEdfChain(gr::Size_t samples, TConfigure&& configure) {
+template<typename TPolicy, typename TConfigure>
+void runChain(gr::Size_t samples, TConfigure&& configure) {
     gr::Graph graph;
     auto&     source = graph.emplaceBlock<gr::testing::ConstantSource<float>>({{"name", std::string("src")}, {"n_samples_max", samples}});
     auto&     copy   = graph.emplaceBlock<gr::testing::Copy<float>>({{"name", std::string("mid")}});
@@ -148,7 +148,7 @@ void runEdfChain(gr::Size_t samples, TConfigure&& configure) {
     std::ignore      = graph.connect<"out", "in">(source, copy);
     std::ignore      = graph.connect<"out", "in">(copy, sink);
 
-    gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::externalStep, gr::profiling::null::Profiler, gr::scheduler::EdfPolicy> scheduler;
+    gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::externalStep, gr::profiling::null::Profiler, TPolicy> scheduler;
     expect(scheduler.exchange(std::move(graph)).has_value() >> fatal);
     configure(scheduler);
     expect(scheduler.changeStateTo(gr::lifecycle::State::INITIALISED).has_value() >> fatal);
@@ -159,6 +159,11 @@ void runEdfChain(gr::Size_t samples, TConfigure&& configure) {
         }
     }
     std::ignore = scheduler.changeStateTo(gr::lifecycle::State::STOPPED);
+}
+
+template<typename TConfigure>
+void runEdfChain(gr::Size_t samples, TConfigure&& configure) {
+    runChain<gr::scheduler::EdfPolicy>(samples, std::forward<TConfigure>(configure));
 }
 
 /// The post-release queue depth, unpacked from the flag byte's high six bits.
@@ -656,6 +661,122 @@ const boost::ut::suite<"TraceSchedulingPolicy"> policyMarkerTests = [] {
         expect(gt(ofKind(Kind::select).size(), 0UZ) >> fatal) << "selections must be recorded when their category is live";
         expect(eq(ofKind(Kind::workBegin).size(), 0UZ)) << "and the work category, being off, must contribute nothing";
         expect(eq(ofKind(Kind::jobRelease).size(), 0UZ)) << "nor the release category";
+
+        setCategories(0U);
+        reset();
+    };
+
+    "hitting the per-pass selection bound is recorded, with the bound that bound"_test = [] {
+        // RT section 8.3 lists the default multiplier of four as an unprofiled default. Whether it
+        // ever binds could not be asked of a running graph before this record existed.
+        reset();
+        setCategories(categoryMask(Category::select));
+
+        constexpr gr::Size_t kTinyBound = 2U;
+        runEdfChain(8192U, [kTinyBound](auto& scheduler) {
+            expect(scheduler.settings().set({{"max_selections_per_pass", kTinyBound}, {"max_work_items", gr::Size_t{256U}}}).empty() >> fatal);
+            std::ignore = scheduler.settings().activateContext();
+            std::ignore = scheduler.settings().applyStagedParameters();
+        });
+
+        const std::vector<Event> hits = ofKind(Kind::selectionBoundHit);
+        expect(gt(hits.size(), 0UZ) >> fatal) << "a bound of two against a graph with more work than that must bind";
+        expect(eq(hits.front().payload0, static_cast<std::uint32_t>(kTinyBound))) << "the record carries the bound that bound, not the default";
+        expect(eq(hits.front().payload1, 3U)) << "and how many blocks the pass was choosing among";
+
+        setCategories(0U);
+        reset();
+    };
+
+    "the heap selection loop is bounded too, and says so"_test = [] {
+        // The bound exists on all three selection loops, and a mutation deleting it from the heap
+        // path survived every scenario that drove the default linear scan. Strategy is a setting, so
+        // a marker tested through only one of its values is a marker half tested.
+        reset();
+        setCategories(categoryMask(Category::select));
+
+        constexpr gr::Size_t kTinyBound = 2U;
+        runEdfChain(8192U, [kTinyBound](auto& scheduler) {
+            scheduler.selection_strategy = gr::scheduler::SelectionStrategy::readyHeap;
+            expect(scheduler.settings().set({{"max_selections_per_pass", kTinyBound}, {"max_work_items", gr::Size_t{256U}}}).empty() >> fatal);
+            std::ignore = scheduler.settings().activateContext();
+            std::ignore = scheduler.settings().applyStagedParameters();
+        });
+
+        const auto viaHeap = std::ranges::count_if(collect(), [](const Event& e) { return e.kind == Kind::select && (e.flags & flag::kViaHeap) != 0U; });
+        expect(gt(viaHeap, 0) >> fatal) << "the heap path must be the one running, or this tests the scan again";
+
+        const std::vector<Event> hits = ofKind(Kind::selectionBoundHit);
+        expect(gt(hits.size(), 0UZ) >> fatal) << "the heap loop stops at the same bound and must record it";
+        expect(eq(hits.front().payload0, static_cast<std::uint32_t>(kTinyBound)));
+
+        setCategories(0U);
+        reset();
+    };
+
+    "a generous bound does not bind, so the marker is not merely always-on"_test = [] {
+        reset();
+        setCategories(categoryMask(Category::select));
+
+        runEdfChain(2048U, [](auto& scheduler) {
+            expect(scheduler.settings().set({{"max_selections_per_pass", gr::Size_t{4096U}}}).empty() >> fatal);
+            std::ignore = scheduler.settings().activateContext();
+            std::ignore = scheduler.settings().applyStagedParameters();
+        });
+
+        expect(eq(ofKind(Kind::selectionBoundHit).size(), 0UZ)) << "a bound nothing reaches must produce no records, or the marker says nothing when it fires";
+        expect(gt(ofKind(Kind::select).size(), 0UZ)) << "and the run must still have selected, so this is not vacuous";
+
+        setCategories(0U);
+        reset();
+    };
+
+    "the bound is recorded under fixed priority too, where no selection records accompany it"_test = [] {
+        // The distinctive claim of the design note: this marker is gated on selecting by priority,
+        // not on release tracking, because the fixed-priority loop's strict restart makes hitting the
+        // bound *more* likely, not less. A reader seeing bound hits with no `select` beside them is
+        // looking at a fixed-priority run, and the report has to say so rather than call it a gap.
+        reset();
+        setCategories(categoryMask(Category::select));
+
+        runChain<gr::scheduler::FixedPriorityPolicy>(8192U, [](auto& scheduler) {
+            expect(scheduler.settings().set({{"max_selections_per_pass", gr::Size_t{2U}}, {"max_work_items", gr::Size_t{256U}}}).empty() >> fatal);
+            std::ignore = scheduler.settings().activateContext();
+            std::ignore = scheduler.settings().applyStagedParameters();
+        });
+
+        expect(gt(ofKind(Kind::selectionBoundHit).size(), 0UZ) >> fatal) << "the fixed-priority loop is bounded too, and its restart makes the bound easier to reach";
+        expect(eq(ofKind(Kind::select).size(), 0UZ)) << "that loop makes no job-driven selections, so a bound hit stands alone";
+        expect(eq(ofKind(Kind::jobRelease).size(), 0UZ)) << "and fixed priority has no release tracking at all";
+
+        setCategories(0U);
+        reset();
+    };
+
+    "a sized ready-heap never silently reverts to the linear scan"_test = [] {
+        // RT defect B3: requesting the ready heap reverts to the scan when the scratch is too small,
+        // and says nothing. The marker exists to make that loud. Measured here rather than assumed:
+        // on this path it **never fires**, because `buildReleaseStorage` sizes the scratch to the
+        // block count on every rebuild, and the pool worker rebuilds on the same house-keeping pass
+        // that adoption grows the list on. See the design note for what that means for B3.
+        //
+        // The assertion is therefore "must not fire", which is a real claim in both directions: a
+        // marker that fired spuriously would be a false alarm about a defect, and that is what this
+        // catches. Nothing here can catch a marker that never fires, because no reachable state
+        // makes it fire -- stated rather than papered over.
+        reset();
+        setCategories(categoryMask(Category::select));
+
+        runEdfChain(8192U, [](auto& scheduler) {
+            scheduler.selection_strategy = gr::scheduler::SelectionStrategy::readyHeap;
+            expect(scheduler.settings().set({{"max_work_items", gr::Size_t{256U}}}).empty() >> fatal);
+            std::ignore = scheduler.settings().activateContext();
+            std::ignore = scheduler.settings().applyStagedParameters();
+        });
+
+        const auto heapSelections = std::ranges::count_if(collect(), [](const Event& e) { return e.kind == Kind::select && (e.flags & flag::kViaHeap) != 0U; });
+        expect(gt(heapSelections, 0) >> fatal) << "the heap must actually have been used, or asserting that it did not fall back proves nothing";
+        expect(eq(ofKind(Kind::heapFallback).size(), 0UZ)) << "the scratch is sized to the block count on every rebuild, so a request for the heap must be honoured";
 
         setCategories(0U);
         reset();

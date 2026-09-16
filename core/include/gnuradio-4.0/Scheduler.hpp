@@ -1050,6 +1050,20 @@ protected:
             }
         };
 
+        // The per-pass selection bound exists to keep a worker responsive: house-keeping, messages,
+        // adoption and lifecycle checks all live between passes. Whether the default multiplier of
+        // four ever actually binds is an unprofiled question (RT section 8.3), and this is the record
+        // that answers it. Round robin has no bound and never calls this, so it compiles nothing.
+        [[maybe_unused]] const auto traceSelectionBoundHit = [&](std::size_t boundValue, std::size_t blockCount) {
+            if constexpr (gr::trace::kEnabled) {
+                gr::trace::emit(gr::trace::Event{.startNs = gr::trace::now(),
+                    .payload0                             = gr::trace::saturate(boundValue),
+                    .payload1                             = gr::trace::saturate(blockCount), //
+                    .kind                                 = gr::trace::Kind::selectionBoundHit,
+                    .workerId                             = traceWorkerId});
+            }
+        };
+
         // Releases, and answers whether it did. The queue length is the only honest witness: a
         // release can happen with the ring already non-empty, so "was empty, now is not" would
         // undercount. Compiled away entirely when tracing is out, which is why the call is written
@@ -1178,6 +1192,12 @@ protected:
                     ++index; // not eligible right now; try the next-highest priority
                 }
             }
+            if (selections >= bound) {
+                // The strict restart makes this *more* likely here than on the job-driven paths, not
+                // less, which is why the marker is gated on `selectsByPriority` rather than on
+                // release tracking. A bound hit here comes with no `select` records beside it.
+                traceSelectionBoundHit(bound, nBlocks);
+            }
         } else {
             // Job-driven selection for policies whose key is a property of the *job* -- the key
             // changes as jobs are released and retired, so the list cannot be pre-sorted and the
@@ -1195,12 +1215,26 @@ protected:
             // eligible" over a pre-sorted list; taking the minimum outright reconsiders every block
             // on each iteration by construction, so a restart would only repeat work.
             const TPolicy     policy{};
-            const std::size_t nBlocks    = std::min(blocks.size(), states.size());
-            const std::size_t bound      = max_selections_per_pass == 0U ? kDefaultSelectionMultiplier * blocks.size() : static_cast<std::size_t>(max_selections_per_pass);
-            const bool        useHeap    = selection_strategy == SelectionStrategy::readyHeap && readyHeap.size() >= nBlocks;
-            std::size_t       selections = 0UZ;
-            std::size_t       heapSize   = 0UZ;
-            std::size_t       running    = nBlocks;
+            const std::size_t nBlocks = std::min(blocks.size(), states.size());
+            const std::size_t bound   = max_selections_per_pass == 0U ? kDefaultSelectionMultiplier * blocks.size() : static_cast<std::size_t>(max_selections_per_pass);
+            const bool        useHeap = selection_strategy == SelectionStrategy::readyHeap && readyHeap.size() >= nBlocks;
+            if constexpr (gr::trace::kEnabled) {
+                // RT defect B3: a readyHeap request silently reverts to the linear scan when the
+                // scratch is too small, and nothing says so. Level-triggered rather than latched --
+                // the scratch is resized on the same house-keeping pass that grows the block list, so
+                // the condition is transient at worst on the pool path and a *repeated* record is
+                // itself the finding rather than noise to suppress.
+                if (selection_strategy == SelectionStrategy::readyHeap && !useHeap) {
+                    gr::trace::emit(gr::trace::Event{.startNs = gr::trace::now(),
+                        .payload0                             = gr::trace::saturate(nBlocks),
+                        .payload1                             = gr::trace::saturate(readyHeap.size()), //
+                        .kind                                 = gr::trace::Kind::heapFallback,
+                        .workerId                             = traceWorkerId});
+                }
+            }
+            std::size_t selections = 0UZ;
+            std::size_t heapSize   = 0UZ;
+            std::size_t running    = nBlocks;
 
             const auto eligible = [&](std::size_t i) { return !states[i].finished && !states[i].jobs.empty(); };
 
@@ -1349,7 +1383,9 @@ protected:
                     }
                 }
                 if (heapSize == 0UZ && selections < bound) {
-                    traceSelectEmpty(); // exhausted rather than bounded -- the bound is T2d's marker
+                    traceSelectEmpty(); // exhausted rather than bounded: the two exits are different findings
+                } else if (selections >= bound) {
+                    traceSelectionBoundHit(bound, nBlocks);
                 }
                 markUnfinished();
             } else {
@@ -1377,6 +1413,9 @@ protected:
                     if (const std::optional<work::Result> failure = runOne(chosen); failure.has_value()) {
                         return *failure;
                     }
+                }
+                if (selections >= bound) {
+                    traceSelectionBoundHit(bound, nBlocks);
                 }
                 markUnfinished();
             }
