@@ -178,6 +178,30 @@ void runEdfChain(gr::Size_t samples, TConfigure&& configure, float relativeDeadl
     runChain<gr::scheduler::EdfPolicy>(samples, std::forward<TConfigure>(configure), relativeDeadline);
 }
 
+/// Two independent chains on one worker, with different relative deadlines per branch.
+///
+/// The point is **contention**. A linear chain never offers the selector a choice -- the consumer of
+/// the block that just ran is the only thing newly eligible -- so an ordering claim checked against
+/// one confirms that the single candidate was chosen and proves nothing (DEVLOG section 12.2). Two
+/// sources are both eligible on every sweep, so two or more blocks hold jobs at once and the
+/// deadlines actually decide the order.
+struct ContendedGraph {
+    gr::Graph                    graph;
+    std::vector<gr::BlockModel*> registrationOrder;
+
+    ContendedGraph(float deadlineA, float deadlineB) {
+        const auto branch = [this](const std::string& suffix, float deadline) {
+            auto& source = graph.emplaceBlock<gr::testing::ConstantSource<float>>({{"name", "src" + suffix}, {"n_samples_max", gr::Size_t{4096U}}, {"relative_deadline", deadline}});
+            auto& copy   = graph.emplaceBlock<gr::testing::Copy<float>>({{"name", "mid" + suffix}, {"relative_deadline", deadline}});
+            auto& sink   = graph.emplaceBlock<gr::testing::NullSink<float>>({{"name", "snk" + suffix}, {"relative_deadline", deadline}});
+            std::ignore  = graph.connect<"out", "in">(source, copy);
+            std::ignore  = graph.connect<"out", "in">(copy, sink);
+        };
+        branch("A", deadlineA);
+        branch("B", deadlineB);
+    }
+};
+
 /// The post-release queue depth, unpacked from the flag byte's high six bits.
 [[nodiscard]] std::uint32_t packedDepthOf(const gr::trace::Event& event) noexcept { return static_cast<std::uint32_t>(event.flags >> 2U); }
 
@@ -925,6 +949,138 @@ const boost::ut::suite<"TraceSchedulingPolicy"> policyMarkerTests = [] {
         expect(eq(ofKind(Kind::jobRelease).size(), 0UZ)) << "nor the release category, which reconstruction would have required";
 
         setCategories(0U);
+        reset();
+    };
+
+    "two independent chains put the selector under genuine contention"_test = [] {
+        // Oracle premise 0. Everything the replay oracle will claim about ordering is vacuous unless
+        // the selector actually had something to choose between, so this is asserted before any
+        // ordering claim is built on it rather than assumed by it.
+        reset();
+        setCategories(categoryMask(Category::select, Category::release, Category::work, Category::deadline));
+
+        ContendedGraph                                                                                                               fixture{0.010f, 0.020f};
+        gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::externalStep, gr::profiling::null::Profiler, gr::scheduler::EdfPolicy> scheduler;
+        expect(scheduler.exchange(std::move(fixture.graph)).has_value() >> fatal);
+        expect(scheduler.settings().set({{"max_work_items", gr::Size_t{256U}}}).empty() >> fatal);
+        std::ignore = scheduler.settings().activateContext();
+        std::ignore = scheduler.settings().applyStagedParameters();
+        expect(scheduler.changeStateTo(gr::lifecycle::State::INITIALISED).has_value() >> fatal);
+        expect(scheduler.changeStateTo(gr::lifecycle::State::RUNNING).has_value() >> fatal);
+        for (std::size_t pass = 0UZ; pass < 64UZ; ++pass) {
+            if (scheduler.step().status == gr::work::Status::DONE) {
+                break;
+            }
+        }
+
+        const std::vector<Event> selections = ofKind(Kind::select);
+        expect(gt(selections.size(), 0UZ) >> fatal);
+        const std::uint32_t widest    = std::ranges::max(selections | std::views::transform([](const Event& e) { return e.payload0; }));
+        const std::size_t   contended = static_cast<std::size_t>(std::ranges::count_if(selections, [](const Event& e) { return e.payload0 > 1U; }));
+
+        expect(gt(widest, 1U) >> fatal) << "the ready set never held more than one block, so this graph cannot test an ordering claim either";
+        expect(gt(contended, 0UZ)) << "at least one selection must have been a real choice";
+
+        // Both branches must actually have run, or the "contention" is one chain starving the other.
+        std::set<EntityId> chosen;
+        for (const Event& e : selections) {
+            chosen.insert(e.entity);
+        }
+        expect(ge(chosen.size(), 4UZ)) << "both chains must contribute selections, or only one was ever eligible";
+
+        exportTimeline("t2f-contention");
+
+        std::ignore = scheduler.changeStateTo(gr::lifecycle::State::STOPPED);
+        setCategories(0U);
+        reset();
+    };
+
+    "entity ids follow registration order, which is what the tie-break assumes"_test = [] {
+        // Oracle premise 1. Both selectors break ties on the *registration index*, but records carry
+        // the entity id. The oracle can only reproduce the tie-break if id order matches index order,
+        // and that holds for EDF specifically because `applyStaticOrder` is a no-op for a non-static
+        // key -- under a fixed-task policy the list is permuted after the ids were handed out.
+        reset();
+        setCategories(0U);
+
+        ContendedGraph                                                                                                               fixture{0.010f, 0.020f};
+        gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::externalStep, gr::profiling::null::Profiler, gr::scheduler::EdfPolicy> scheduler;
+        expect(scheduler.exchange(std::move(fixture.graph)).has_value() >> fatal);
+        expect(scheduler.changeStateTo(gr::lifecycle::State::INITIALISED).has_value() >> fatal);
+
+        std::vector<EntityId> ids;
+        for (const auto& block : scheduler.graph().blocks()) {
+            const EntityId id = internedId(static_cast<const void*>(block.get()));
+            expect(neq(id, kNoEntity) >> fatal) << "every block on the worker must have an identity before the oracle indexes by it";
+            ids.push_back(id);
+        }
+        expect(std::ranges::is_sorted(ids)) << "ids must ascend with block-list position, or comparing entity ids is not comparing registration order";
+        expect(eq(std::set<EntityId>(ids.begin(), ids.end()).size(), ids.size())) << "and no two blocks may share one";
+
+        std::ignore = scheduler.changeStateTo(gr::lifecycle::State::STOPPED);
+        reset();
+    };
+
+    "each block belongs to one worker, so the oracle can partition before it compares"_test = [] {
+        // Oracle premise 2. A ready set is per worker. An oracle pooling records across workers would
+        // see a more urgent job on another thread and report an ordering violation that never
+        // happened. Partitioning is only sound if a block's records all carry one worker id.
+        reset();
+        setCategories(categoryMask(Category::select, Category::release, Category::work));
+
+        ContendedGraph                                                                                                                fixture{0.010f, 0.020f};
+        gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multiThreaded, gr::profiling::null::Profiler, gr::scheduler::EdfPolicy> scheduler;
+        expect(scheduler.exchange(std::move(fixture.graph)).has_value() >> fatal);
+        expect(scheduler.runAndWait().has_value() >> fatal);
+
+        std::map<EntityId, std::set<std::uint32_t>> workersPerEntity;
+        std::size_t                                 overflowed = 0UZ;
+        for (const Event& event : collect()) {
+            if (event.entity == kNoEntity) {
+                continue; // worker-scoped records name no block by design
+            }
+            workersPerEntity[event.entity].insert(event.workerId);
+            overflowed += event.workerId == kWorkerOverflow ? 1UZ : 0UZ;
+        }
+
+        expect(gt(workersPerEntity.size(), 0UZ) >> fatal) << "the run must have attributed records to blocks";
+        for (const auto& [entity, workers] : workersPerEntity) {
+            expect(eq(workers.size(), 1UZ)) << std::format("entity {} was recorded under {} different workers; partitioning by worker would split its history", entity, workers.size());
+        }
+        expect(eq(overflowed, 0UZ)) << "an overflowed worker id is not a worker; the oracle must treat such a record as unusable rather than as worker 255";
+
+        // "One worker per block" is also satisfied by every record claiming worker 0, which would be
+        // a partition of one and no partition at all. Two independent chains are two jobs, so the run
+        // must show two workers for the premise to mean anything.
+        std::set<std::uint32_t> distinctWorkers;
+        for (const auto& [entity, workers] : workersPerEntity) {
+            distinctWorkers.insert(*workers.begin());
+        }
+        expect(ge(distinctWorkers.size(), 2UZ)) << "two independent chains must run on two workers, or partitioning by worker is untested";
+
+        setCategories(0U);
+        reset();
+    };
+
+    "a lossy capture is detectable, which is what lets the oracle refuse one"_test = [] {
+        // Oracle premise 3. If records were evicted, an earlier release may be missing and its block
+        // looks like it was never ready -- so the oracle must refuse the capture rather than report a
+        // violation it cannot substantiate. That refusal is only possible if loss is observable.
+        reset();
+        expect(eq(setRingCapacity(16UZ), 16UZ) >> fatal);
+        setCategories(kAllCategories);
+
+        ContendedGraph                                                                                                                fixture{0.010f, 0.020f};
+        gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multiThreaded, gr::profiling::null::Profiler, gr::scheduler::EdfPolicy> scheduler;
+        expect(scheduler.exchange(std::move(fixture.graph)).has_value() >> fatal);
+        expect(scheduler.runAndWait().has_value() >> fatal);
+
+        const RingStats stats = ringStats();
+        expect(gt(stats.lost, 0UL) >> fatal) << "a sixteen-record ring cannot hold this run; if it did, the premise is untested";
+        expect(le(stats.recorded, stats.rings * 16UZ)) << "no ring may hold more than its capacity";
+
+        setCategories(0U);
+        std::ignore = setRingCapacity(kDefaultRingCapacity);
         reset();
     };
 
