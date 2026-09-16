@@ -9,8 +9,15 @@
 #include <string>
 #include <vector>
 
+#include <array>
+#include <bit>
+#include <cmath>
+#include <limits>
+
 #include <gnuradio-4.0/Tag.hpp> // property_map
 #include <gnuradio-4.0/Trace.hpp>
+#include <gnuradio-4.0/TraceFile.hpp> // LoadedEntity, for names
+#include <gnuradio-4.0/WorkStatus.hpp>
 
 namespace gr::trace {
 
@@ -33,6 +40,108 @@ namespace gr::trace {
  * failure this is written to avoid.
  */
 
+/// `bit_width(0) = 0` through `bit_width(0xFFFFFFFD) = 32`. Sized for the whole payload range rather
+/// than for a plausible one: `max_work_items` defaults to `SIZE_MAX`, so a block may legitimately
+/// report billions of items in a single invocation, and a shorter table would fold every large batch
+/// into its top bucket -- collapsing the very span the fit needs and turning a well-conditioned
+/// measurement into a refused one, silently.
+inline constexpr std::size_t kWorkBuckets = 33UZ;
+
+/**
+ * One log-spaced bucket of invocation costs.
+ *
+ * The **minimum** is the clean cost estimate: least polluted by preemption and page faults, which is
+ * why RT §3.8.3 specifies it. It is also biased low, increasingly so as `count` falls -- the minimum
+ * of three samples is a worse estimate of a floor than the minimum of three thousand -- so `count`
+ * travels with it and a consumer can see which centroids are thinly supported. No bias correction is
+ * attempted: that needs distributional assumptions this layer has no business making.
+ *
+ * Mean and M2 are Welford, updated in O(1) and never storing a sample.
+ */
+struct Bucket {
+    std::uint64_t count   = 0UL;
+    std::uint64_t workSum = 0UL; /// for the centroid: the fit regresses cost against this, not the bucket edge
+    std::uint32_t minNs   = std::numeric_limits<std::uint32_t>::max();
+    std::uint32_t maxNs   = 0U;
+    double        mean    = 0.0;
+    double        m2      = 0.0;
+
+    void add(std::uint32_t durationNs, std::uint32_t performedWork) noexcept {
+        ++count;
+        workSum += performedWork;
+        minNs = std::min(minNs, durationNs);
+        maxNs = std::max(maxNs, durationNs);
+
+        const double sample = static_cast<double>(durationNs);
+        const double delta  = sample - mean;
+        mean += delta / static_cast<double>(count);
+        m2 += delta * (sample - mean);
+    }
+
+    [[nodiscard]] double stddev() const noexcept { return count > 1UL ? std::sqrt(m2 / static_cast<double>(count - 1UL)) : 0.0; }
+    [[nodiscard]] double centroid() const noexcept { return count > 0UL ? static_cast<double>(workSum) / static_cast<double>(count) : 0.0; }
+};
+
+/// Per block: the buckets, plus the same statistics over every admitted invocation.
+struct BlockTiming {
+    std::array<Bucket, kWorkBuckets> buckets{};
+    Bucket                           overall{};
+    std::uint32_t                    workMin = std::numeric_limits<std::uint32_t>::max();
+    std::uint32_t                    workMax = 0U;
+
+    [[nodiscard]] std::size_t populatedBuckets() const noexcept {
+        return static_cast<std::size_t>(std::ranges::count_if(buckets, [](const Bucket& b) { return b.count > 0UL; }));
+    }
+};
+
+/**
+ * Folds records into per-block timing, one record at a time.
+ *
+ * Deliberately a *fold*, not a loop over a span. In T3 the source is a capture already in memory; in
+ * streaming mode it will be a drain thread with no span to iterate. Writing the update per record
+ * means that change is a new caller rather than a new accumulator.
+ *
+ * **Two filters are correctness requirements, not refinements.** `computePerformedWork()` returns
+ * **0 for any status other than OK**, so a `DONE` record reports no work for an invocation that may
+ * have done a great deal; admitting it puts a `(0, large)` point into the regression, which is a
+ * direct attack on the intercept. And a saturated payload or duration is a sentinel, not a
+ * measurement -- reading one as a number is how a report invents data. Both rejections are counted,
+ * so a capture that is mostly rejected says so rather than reporting confidently on a tenth of itself.
+ */
+struct TimingAccumulator {
+    std::map<EntityId, BlockTiming> blocks;
+    std::uint64_t                   admitted          = 0UL;
+    std::uint64_t                   rejectedStatus    = 0UL;
+    std::uint64_t                   rejectedSaturated = 0UL;
+    std::uint64_t                   rejectedNoEntity  = 0UL;
+
+    void fold(const Event& event) {
+        if (event.kind != Kind::workEnd) {
+            return; // not a cost sample at all; silently skipped rather than counted as a rejection
+        }
+        if (event.status != static_cast<std::int8_t>(std::to_underlying(gr::work::Status::OK))) {
+            ++rejectedStatus;
+            return;
+        }
+        if (event.payload1 == kSaturated || event.durationNs == kSaturated) {
+            ++rejectedSaturated;
+            return;
+        }
+        if (event.entity == kNoEntity) {
+            ++rejectedNoEntity; // cannot be attributed, so cannot contribute to any block's cost
+            return;
+        }
+
+        BlockTiming& timing = blocks[event.entity];
+        const auto   index  = static_cast<std::size_t>(std::bit_width(event.payload1));
+        timing.buckets[index].add(event.durationNs, event.payload1);
+        timing.overall.add(event.durationNs, event.payload1);
+        timing.workMin = std::min(timing.workMin, event.payload1);
+        timing.workMax = std::max(timing.workMax, event.payload1);
+        ++admitted;
+    }
+};
+
 namespace detail {
 
 [[nodiscard]] inline std::uint64_t percentileOf(std::vector<std::uint64_t>& values, double fraction) {
@@ -51,6 +160,49 @@ namespace detail {
  * header's count for a file. It is not inferred, because a reader cannot tell a short capture from a
  * truncated one, and every figure below is unreliable once anything was evicted.
  */
+/// The name a report shows for a block, or a stable stand-in when the capture carries no table.
+[[nodiscard]] inline std::string entityLabel(EntityId id, std::span<const LoadedEntity> entities) {
+    const auto found = std::ranges::find_if(entities, [id](const LoadedEntity& e) { return e.id == id; });
+    return found != entities.end() ? found->uniqueName : std::format("entity {}", id);
+}
+
+/**
+ * Per-block execution cost: average, jitter and observed worst case.
+ *
+ * These need no regression and are **valid from a single batch size**, which matters because the
+ * `(I_v, Δ_v)` fit is not (§3.5 of the design note). Refusing a slope must not suppress the
+ * statistics that remain sound, so they are computed here and the fit is layered on separately.
+ */
+[[nodiscard]] inline property_map timingReport(std::span<const Event> events, std::span<const LoadedEntity> entities = {}) {
+    TimingAccumulator accumulator;
+    for (const Event& event : events) {
+        accumulator.fold(event);
+    }
+
+    property_map out;
+    out["invocations"]        = accumulator.admitted;
+    out["rejected_status"]    = accumulator.rejectedStatus;
+    out["rejected_saturated"] = accumulator.rejectedSaturated;
+    out["rejected_no_entity"] = accumulator.rejectedNoEntity;
+    out["blocks_seen"]        = accumulator.blocks.size();
+
+    property_map perBlock;
+    for (const auto& [entity, timing] : accumulator.blocks) {
+        property_map block;
+        block["invocations"]                    = timing.overall.count;
+        block["acet_ns"]                        = timing.overall.mean;
+        block["jitter_ns"]                      = timing.overall.stddev();
+        block["wcet_ns"]                        = static_cast<std::uint64_t>(timing.overall.maxNs);
+        block["fastest_ns"]                     = static_cast<std::uint64_t>(timing.overall.minNs);
+        block["work_min"]                       = static_cast<std::uint64_t>(timing.workMin);
+        block["work_max"]                       = static_cast<std::uint64_t>(timing.workMax);
+        block["buckets_populated"]              = timing.populatedBuckets();
+        perBlock[entityLabel(entity, entities)] = std::move(block);
+    }
+    out["blocks"] = std::move(perBlock);
+    return out;
+}
+
 [[nodiscard]] inline property_map report(std::span<const Event> events, std::uint64_t lostRecords) {
     property_map out;
     out["records"] = events.size();
