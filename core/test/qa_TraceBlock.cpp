@@ -14,6 +14,7 @@
 #include <gnuradio-4.0/Graph.hpp>
 #include <gnuradio-4.0/Scheduler.hpp>
 #include <gnuradio-4.0/Trace.hpp>
+#include <gnuradio-4.0/TraceReport.hpp>
 
 #include <gnuradio-4.0/testing/NullSources.hpp>
 
@@ -76,6 +77,7 @@ struct DecimatingRun {
     std::vector<gr::trace::Event> events;
     gr::trace::EntityId           decimator = gr::trace::kNoEntity;
     gr::trace::EntityId           source    = gr::trace::kNoEntity;
+    gr::trace::EntityId           sink      = gr::trace::kNoEntity;
 
     /// `batchCap` is not decoration: left unset, the whole stream moves in a *single* `work()` call
     /// and there is no second record to compare a position against. Capping it is what makes the
@@ -103,6 +105,9 @@ struct DecimatingRun {
             if (block->name() == "src") {
                 source = id;
             }
+            if (block->name() == "snk") {
+                sink = id;
+            }
         }
 
         expect(scheduler.changeStateTo(gr::lifecycle::State::RUNNING).has_value() >> fatal);
@@ -115,6 +120,13 @@ struct DecimatingRun {
         gr::trace::setCategories(0U);
     }
 };
+
+/// One hand-built `workExact` record. The refusal paths cannot be reached from a healthy graph --
+/// a real chain has a stable ratio and positions that match its counts -- so they are driven from
+/// constructed records, the same way `qa_TraceReport.cpp` drives its fit gates.
+[[nodiscard]] gr::trace::Event exactRecord(gr::trace::EntityId entity, std::uint32_t processedIn, std::uint32_t processedOut, std::uint32_t position, std::uint64_t startNs = 0UL) {
+    return gr::trace::Event{.startNs = startNs, .durationNs = 100U, .payload0 = processedIn, .payload1 = processedOut, .payload2 = position, .entity = entity, .kind = gr::trace::Kind::workExact};
+}
 
 } // namespace
 
@@ -399,6 +411,189 @@ const boost::ut::suite<"TraceBlock"> traceBlockTests = [] {
         expect(eq(ofKind(exactOnly.events, Kind::workPhase).size(), 0UZ)) << "workExact alone must not pay for the four phase scopes";
         expect(gt(ofKind(both.events, Kind::workPhase).size(), 0UZ));
         expect(eq(ofKind(exactOnly.events, Kind::workExact).size(), ofKind(both.events, Kind::workExact).size())) << "turning the phases on must not change how many invocations are recorded";
+    };
+
+    "a stable ratio is derived, an unstable one refused"_test = [] {
+        DecimatingRun run;
+        run.run(categoryMask(Category::workExact));
+
+        const RatioEstimate decimator = ratioOf(run.events, run.decimator);
+        expect(decimator.stable >> fatal) << "a 4:1 decimator driven at a fixed batch has a constant ratio: " << decimator.reason;
+        expect(eq(decimator.outPerIn, 0.25)) << "and it is exactly a quarter, not approximately";
+
+        // A source consumes nothing, so no ratio describes it. Refused with a reason rather than
+        // reported as zero, which a consumer would read as "produces nothing".
+        const RatioEstimate source = ratioOf(run.events, run.source);
+        expect(!source.stable) << "a source has no input to form a ratio against";
+        expect(!source.reason.empty()) << "a refusal must say why";
+
+        const RatioEstimate absent = ratioOf(run.events, EntityId{9999U});
+        expect(!absent.stable);
+        expect(!absent.reason.empty());
+    };
+
+    "the report names which side supplied the counts"_test = [] {
+        DecimatingRun withExact;
+        withExact.run(categoryMask(Category::work, Category::workExact));
+        const gr::property_map exactReport = timingReport(withExact.events);
+
+        DecimatingRun boundaryOnly;
+        boundaryOnly.run(categoryMask(Category::work));
+        const gr::property_map boundaryReport = timingReport(boundaryOnly.events);
+
+        // A nested map must be bound to a `Value` before it can be read: `find()` yields a view whose
+        // type has no map overload.
+        const auto sourcesIn = [](const gr::property_map& reportMap) {
+            std::set<std::string> found;
+            const auto            blocksIt = reportMap.find("blocks");
+            if (blocksIt == reportMap.end()) {
+                return found;
+            }
+            const gr::pmt::Value   blocksValue = (*blocksIt).second;
+            const gr::property_map blocks      = blocksValue.value_or(gr::property_map{});
+            for (const auto& entry : blocks) {
+                const gr::pmt::Value   blockValue = entry.second;
+                const gr::property_map block      = blockValue.value_or(gr::property_map{});
+                const auto             it         = block.find("sample_source");
+                if (it == block.end()) {
+                    continue;
+                }
+                found.insert((*it).second.value_or(std::string{}));
+            }
+            return found;
+        };
+
+        const std::set<std::string> withBlockSide = sourcesIn(exactReport);
+        expect(withBlockSide.contains("block-side") >> fatal) << "a capture carrying exact counts must say it used them";
+
+        const std::set<std::string> withoutBlockSide = sourcesIn(boundaryReport);
+        expect(!withoutBlockSide.contains("block-side")) << "a capture with no exact counts must not claim to have used them";
+        expect(withoutBlockSide.contains("scheduler-side")) << "and must name the side it fell back to";
+    };
+
+    "end-to-end latency matches a chain whose answer is known"_test = [] {
+        DecimatingRun run;
+        run.run(categoryMask(Category::workExact));
+
+        const std::vector<EntityId> chain{run.source, run.decimator, run.sink};
+        const ChainLatency          latency = chainLatency(run.events, chain);
+        expect(gt(latency.samples, 1UZ)) << "one matched sample cannot demonstrate a distribution";
+        expect(le(latency.minNs, latency.medianNs));
+        expect(le(latency.medianNs, latency.maxNs));
+
+        // The known answer, computed independently of the function under test. The chain is
+        // fixed-rate with a 512-sample cap, so source batch k covers output positions [512k, 512k+512)
+        // and produces sink input positions [128k, 128k+128) -- batch k pairs with batch k. Pairing
+        // the n-th records directly and comparing the resulting distribution is what pins the
+        // arithmetic; a bound like "no longer than the capture" is satisfied by a mapping that walks
+        // the wrong ratio entirely, which is how this was got wrong the first time.
+        const std::vector<Event> srcRecords  = exactRecordsFor(run.events, run.source);
+        const std::vector<Event> sinkRecords = exactRecordsFor(run.events, run.sink);
+        expect(eq(srcRecords.size(), sinkRecords.size()) >> fatal) << "a fixed-rate chain runs its ends the same number of times";
+
+        std::vector<std::uint64_t> expected;
+        for (std::size_t i = 0UZ; i < srcRecords.size(); ++i) {
+            expect(eq(static_cast<std::uint64_t>(srcRecords[i].payload2), static_cast<std::uint64_t>(sinkRecords[i].payload2) * 4UL)) << "batch k's source position must be four times its sink position at 4:1";
+            const std::uint64_t producedAt = srcRecords[i].startNs + srcRecords[i].durationNs;
+            const std::uint64_t consumedAt = sinkRecords[i].startNs + sinkRecords[i].durationNs;
+            expect(ge(consumedAt, producedAt) >> fatal);
+            expected.push_back(consumedAt - producedAt);
+        }
+        std::ranges::sort(expected);
+        expect(eq(latency.samples, expected.size())) << "every sink batch must be matched to the source batch that fed it";
+        expect(eq(latency.minNs, expected.front())) << "the shortest latency must be the one the pairing gives";
+        expect(eq(latency.maxNs, expected.back()));
+        expect(eq(latency.medianNs, expected[expected.size() / 2UZ]));
+    };
+
+    "a chain is refused rather than averaged when it cannot be reconstructed"_test = [] {
+        DecimatingRun run;
+        run.run(categoryMask(Category::workExact));
+
+        const std::vector<EntityId> tooShort{run.source};
+        expect(!chainLatency(run.events, tooShort).computed) << "a single block is not a chain";
+        expect(!chainLatency(run.events, tooShort).reason.empty());
+
+        // A block that left no records cannot anchor a hop, and the refusal must name it rather than
+        // quietly dropping that hop and reporting the rest.
+        const std::vector<EntityId> unknownMiddle{run.source, EntityId{9999U}, run.sink};
+        const ChainLatency          refused = chainLatency(run.events, unknownMiddle);
+        expect(!refused.computed) << "a hop with no records must not be skipped over";
+        expect(!refused.reason.empty()) << "and the refusal must say which";
+    };
+
+    "a stride is detected as positions outrunning the counts"_test = [] {
+        // A block with a stride consumes samples through `inputSkipBefore` that appear in no count
+        // field. Its positions stay correct; the counts stop accounting for them. Nothing in the
+        // record says "stride", so the only evidence is the divergence -- and a consumer that
+        // accumulated counts rather than reading positions would drift silently past it.
+        const std::vector<Event> strided{
+            exactRecord(EntityId{1U}, 100U, 100U, 0U),   //
+            exactRecord(EntityId{1U}, 100U, 100U, 150U), // 50 samples consumed and discarded
+            exactRecord(EntityId{1U}, 100U, 100U, 300U),
+        };
+        const RatioEstimate estimate = ratioOf(strided, EntityId{1U});
+        expect(!estimate.stable) << "positions advancing by 150 against a count of 100 must be refused";
+        expect(estimate.reason.find("stride") != std::string::npos) << "and the refusal must name what causes it: " << estimate.reason;
+
+        const std::vector<Event> contiguous{
+            exactRecord(EntityId{1U}, 100U, 100U, 0U),   //
+            exactRecord(EntityId{1U}, 100U, 100U, 100U), //
+            exactRecord(EntityId{1U}, 100U, 100U, 200U),
+        };
+        expect(ratioOf(contiguous, EntityId{1U}).stable) << "the same records without the gap must be accepted";
+    };
+
+    "an unstable ratio is refused rather than averaged"_test = [] {
+        // Two invocations at 1:1 and one at 2:1 average to something no invocation exhibited. The
+        // acceptance criterion is scoped to predictable ratios, so this is out of scope by
+        // construction -- and reporting the mean would be the failure the scoping exists to prevent.
+        const std::vector<Event> varying{
+            exactRecord(EntityId{2U}, 100U, 100U, 0U),   //
+            exactRecord(EntityId{2U}, 100U, 50U, 100U),  //
+            exactRecord(EntityId{2U}, 100U, 100U, 200U),
+        };
+        const RatioEstimate estimate = ratioOf(varying, EntityId{2U});
+        expect(!estimate.stable) << "a ratio that changes between invocations is not a ratio";
+        expect(estimate.reason.find("varies") != std::string::npos) << estimate.reason;
+
+        const std::vector<Event> steady{
+            exactRecord(EntityId{2U}, 100U, 50U, 0U),   //
+            exactRecord(EntityId{2U}, 100U, 50U, 100U), //
+            exactRecord(EntityId{2U}, 100U, 50U, 200U),
+        };
+        const RatioEstimate ok = ratioOf(steady, EntityId{2U});
+        expect(ok.stable >> fatal) << ok.reason;
+        expect(eq(ok.outPerIn, 0.5));
+    };
+
+    "a position that goes backwards is a discontinuity, not a negative latency"_test = [] {
+        // The payload holds the low 32 bits of a 64-bit position, so it wraps -- about 23 h at
+        // 50 kHz. A wrap and a genuine discontinuity are indistinguishable in one field, so the
+        // reconstruction refuses rather than choosing an interpretation.
+        const std::vector<Event> wrapped{
+            exactRecord(EntityId{3U}, 100U, 100U, 0xFFFFFF00U), //
+            exactRecord(EntityId{3U}, 100U, 100U, 0x00000064U),
+        };
+        const RatioEstimate estimate = ratioOf(wrapped, EntityId{3U});
+        expect(!estimate.stable) << "a backwards step must not be read as a huge forward jump";
+        expect(estimate.reason.find("backwards") != std::string::npos) << estimate.reason;
+    };
+
+    "a chain with an unstable hop is refused, not averaged"_test = [] {
+        // The middle block's ratio varies, so no coordinate maps through it. The whole chain is
+        // refused: a latency for the hops that happen to qualify is a number whose meaning depends
+        // on which blocks were silently excluded.
+        std::vector<Event> events{
+            exactRecord(EntityId{1U}, 0U, 400U, 0U, 1000UL),   //
+            exactRecord(EntityId{2U}, 400U, 100U, 0U, 2000UL), //
+            exactRecord(EntityId{2U}, 400U, 200U, 400U, 3000UL),
+            exactRecord(EntityId{3U}, 100U, 100U, 0U, 4000UL),
+        };
+        const std::vector<EntityId> chain{EntityId{1U}, EntityId{2U}, EntityId{3U}};
+        const ChainLatency          refused = chainLatency(events, chain);
+        expect(!refused.computed) << "an unstable middle hop must refuse the chain";
+        expect(refused.reason.find("stable") != std::string::npos) << refused.reason;
     };
 
     "the block-side markers do not change what a block does"_test = [] {

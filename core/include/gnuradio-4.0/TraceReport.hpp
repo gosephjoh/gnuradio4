@@ -284,6 +284,201 @@ inline constexpr double      kMaxFitResidual = 0.25; /// a fit that does not des
 }
 
 /// The name a report shows for a block, or a stable stand-in when the capture carries no table.
+/**
+ * @brief Per-block produce/consume ratio, derived from what a capture observed.
+ *
+ * The acceptance criterion is scoped to graphs with *predictable* ratios, so the ratio is the gate
+ * rather than an output: a block whose ratio is not constant across the capture is not predictable,
+ * and a latency derived from the average of something that is not constant is a fabrication.
+ *
+ * Derived from observation rather than from `input_chunk_size : output_chunk_size`, which is a
+ * declaration of intent. The declared value is not in a capture today -- `EntityRecord` carries
+ * names, worker and port counts and nothing else -- so the cross-check the design asks for is not
+ * available here; observation alone is the stricter of the two in any case, because a block can
+ * declare one ratio and exhibit another.
+ */
+struct RatioEstimate {
+    bool        stable      = false;
+    double      outPerIn    = 0.0;
+    std::size_t invocations = 0UZ;
+    std::string reason; /// why it was refused; empty when stable
+};
+
+/// Productive `workExact` records for one block, in the order they were emitted.
+[[nodiscard]] inline std::vector<Event> exactRecordsFor(std::span<const Event> events, EntityId entity) {
+    std::vector<Event> records;
+    for (const Event& event : events) {
+        if (event.kind == Kind::workExact && event.entity == entity && (event.payload0 != 0U || event.payload1 != 0U)) {
+            records.push_back(event);
+        }
+    }
+    std::ranges::stable_sort(records, {}, &Event::startNs);
+    return records;
+}
+
+inline constexpr double kRatioTolerance = 1e-9; /// the counts are integers, so a stable ratio is exact
+
+[[nodiscard]] inline RatioEstimate ratioOf(std::span<const Event> events, EntityId entity) {
+    const std::vector<Event> records = exactRecordsFor(events, entity);
+    RatioEstimate            estimate{.invocations = records.size()};
+    if (records.empty()) {
+        estimate.reason = "no productive block-side records";
+        return estimate;
+    }
+
+    std::uint64_t totalIn  = 0UL;
+    std::uint64_t totalOut = 0UL;
+    for (const Event& record : records) {
+        totalIn += record.payload0;
+        totalOut += record.payload1;
+        if (record.payload0 == kSaturated || record.payload1 == kSaturated) {
+            estimate.reason = "a count saturated, so the ratio cannot be recovered";
+            return estimate;
+        }
+    }
+    if (totalIn == 0UL) {
+        estimate.reason = "no input consumed: a source has no ratio to derive";
+        return estimate;
+    }
+
+    // The **continuity check**, and the reason it is here rather than in the latency function: a
+    // block with a stride consumes samples through `inputSkipBefore` that appear in no count field,
+    // so its positions advance by more than it reports processing. Positions stay correct; counts
+    // stop accounting for them. A consumer that accumulated counts instead of reading positions
+    // would drift silently, so a capture showing the divergence is refused outright.
+    for (std::size_t i = 1UZ; i < records.size(); ++i) {
+        const std::uint32_t previous = records[i - 1UZ].payload2;
+        const std::uint32_t current  = records[i].payload2;
+        if (current < previous) {
+            estimate.reason = "stream position went backwards: a 32-bit wrap or a discontinuity, and the two are indistinguishable";
+            return estimate;
+        }
+        if (current - previous != records[i - 1UZ].payload0) {
+            estimate.reason = "positions advance by more than the counts report: samples were consumed outside them, which is what a stride does";
+            return estimate;
+        }
+    }
+
+    const double ratio = static_cast<double>(totalOut) / static_cast<double>(totalIn);
+    for (const Event& record : records) {
+        if (record.payload0 == 0U) {
+            estimate.reason = "an invocation produced output from no input, so no ratio describes it";
+            return estimate;
+        }
+        const double perInvocation = static_cast<double>(record.payload1) / static_cast<double>(record.payload0);
+        if (std::abs(perInvocation - ratio) > kRatioTolerance * std::max(1.0, ratio)) {
+            estimate.reason = std::format("ratio varies across the capture ({:.6g} against {:.6g} overall)", perInvocation, ratio);
+            return estimate;
+        }
+    }
+
+    estimate.stable   = true;
+    estimate.outPerIn = ratio;
+    return estimate;
+}
+
+/**
+ * @brief Source-to-sink latency for one chain, by data provenance.
+ *
+ * The chain is supplied rather than discovered: **a capture carries no topology**. `EntityRecord`
+ * has no edge list and no record kind describes one, so nothing in a `.gr4trace` file says which
+ * block feeds which. Inferring it from names or port counts would be a guess dressed as a
+ * measurement.
+ *
+ * Every hop must have a stable ratio, and the whole chain is refused if any hop does not. Partial
+ * latency for the hops that happen to qualify would be a number whose meaning depends on which
+ * blocks were excluded.
+ */
+struct ChainLatency {
+    bool          computed = false;
+    std::string   reason;
+    std::uint64_t medianNs = 0UL;
+    std::uint64_t minNs    = 0UL;
+    std::uint64_t maxNs    = 0UL;
+    std::size_t   samples  = 0UZ;
+};
+
+[[nodiscard]] inline ChainLatency chainLatency(std::span<const Event> events, std::span<const EntityId> chain) {
+    ChainLatency latency;
+    if (chain.size() < 2UZ) {
+        latency.reason = "a chain needs at least a source and a sink";
+        return latency;
+    }
+
+    // Every hop's ratio first, so a refusal names the ratio rather than a downstream symptom.
+    std::vector<double> ratios;
+    for (std::size_t hop = 0UZ; hop + 1UZ < chain.size(); ++hop) {
+        const RatioEstimate estimate = ratioOf(events, chain[hop + 1UZ]);
+        if (!estimate.stable && hop + 2UZ < chain.size()) {
+            latency.reason = std::format("entity {} has no stable ratio: {}", chain[hop + 1UZ], estimate.reason);
+            return latency;
+        }
+        ratios.push_back(estimate.stable ? estimate.outPerIn : 1.0);
+    }
+
+    const std::vector<Event> sourceRecords = exactRecordsFor(events, chain.front());
+    const std::vector<Event> sinkRecords   = exactRecordsFor(events, chain.back());
+    if (sourceRecords.empty() || sinkRecords.empty()) {
+        latency.reason = "the chain's ends left no productive records";
+        return latency;
+    }
+
+    // Walk the sink's invocations back to the source sample each one's first input came from. A
+    // middle block records only its *input* position, so its output coordinate is that position
+    // scaled by its ratio -- exact for a fixed-rate hop, which is what the stability gate above
+    // guarantees is the only kind present.
+    std::vector<std::uint64_t> latencies;
+    for (const Event& sinkRecord : sinkRecords) {
+        // The sink's recorded position is its *input* coordinate, which is the preceding block's
+        // output coordinate. Dividing by each intermediate block's ratio walks that coordinate back
+        // to the source's output coordinate: a block producing `r` per input means output position
+        // `p` came from input position `p / r`.
+        //
+        // The **intermediate** blocks only. The sink's own ratio describes what it would emit, which
+        // no one downstream reads, and the source's describes nothing upstream of it.
+        double coordinate = static_cast<double>(sinkRecord.payload2);
+        for (std::size_t hop = ratios.size() - 1UZ; hop-- > 0UZ;) {
+            if (ratios[hop] <= 0.0) {
+                latency.reason = "a hop consumes without producing, so the chain does not carry data through";
+                return latency;
+            }
+            coordinate /= ratios[hop];
+        }
+
+        // The source invocation that produced that output coordinate.
+        const Event* producer = nullptr;
+        for (const Event& candidate : sourceRecords) {
+            const double begin = static_cast<double>(candidate.payload2);
+            if (coordinate >= begin && coordinate < begin + static_cast<double>(candidate.payload1)) {
+                producer = &candidate;
+                break;
+            }
+        }
+        if (producer == nullptr) {
+            continue; // the producing batch is outside the capture; not an error, just unmatched
+        }
+        const std::uint64_t producedAt = producer->startNs + producer->durationNs;
+        const std::uint64_t consumedAt = sinkRecord.startNs + sinkRecord.durationNs;
+        if (consumedAt < producedAt) {
+            latency.reason = "a sample was consumed before it was produced: the capture's clock or its positions are inconsistent";
+            return latency;
+        }
+        latencies.push_back(consumedAt - producedAt);
+    }
+
+    if (latencies.empty()) {
+        latency.reason = "no sink invocation could be matched to a source batch within the capture";
+        return latency;
+    }
+    std::ranges::sort(latencies);
+    latency.computed = true;
+    latency.samples  = latencies.size();
+    latency.minNs    = latencies.front();
+    latency.maxNs    = latencies.back();
+    latency.medianNs = latencies[latencies.size() / 2UZ];
+    return latency;
+}
+
 [[nodiscard]] inline std::string entityLabel(EntityId id, std::span<const LoadedEntity> entities) {
     const auto found = std::ranges::find_if(entities, [id](const LoadedEntity& e) { return e.id == id; });
     return found != entities.end() ? found->uniqueName : std::format("entity {}", id);
@@ -339,6 +534,23 @@ inline constexpr double      kMaxFitResidual = 0.25; /// a fit that does not des
             block["wcet_estimate_s"]    = static_cast<double>(timing.overall.maxNs) * 1e-9;
         } else {
             block["fit_reason"] = fit.reason;
+        }
+
+        // Which side of the boundary the counts came from, always stated. The two disagree for a
+        // resampling block -- `performed_work` is one number under an affine map, `(in, out)` is two
+        // exact ones -- so a reader comparing two reports has no way to know they used the same rule
+        // unless each says so.
+        const RatioEstimate ratio  = ratioOf(events, entity);
+        const bool          hasExact = ratio.invocations > 0UZ;
+        block["sample_source"]     = std::string(hasExact ? "block-side" : "scheduler-side");
+        if (hasExact) {
+            block["exact_invocations"] = static_cast<std::uint64_t>(ratio.invocations);
+            block["ratio_stable"]      = ratio.stable;
+            if (ratio.stable) {
+                block["ratio_out_per_in"] = ratio.outPerIn;
+            } else {
+                block["ratio_reason"] = ratio.reason;
+            }
         }
 
         perBlock[entityLabel(entity, entities)] = std::move(block);
