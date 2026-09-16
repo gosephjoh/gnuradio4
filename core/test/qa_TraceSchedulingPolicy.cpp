@@ -139,14 +139,26 @@ void exportTimeline([[maybe_unused]] std::string_view name) {
 
 /// Drives an `externalStep` EDF scheduler over `src -> mid -> snk` to completion, with an optional
 /// settings override applied before it starts. Returns nothing: the assertion material is the trace.
+/// `relativeDeadline` of 0 leaves the deadline unset, which is a distinct case from a generous one:
+/// an unset deadline sorts last and can never be missed, where a generous one can in principle.
 template<typename TPolicy, typename TConfigure>
-void runChain(gr::Size_t samples, TConfigure&& configure) {
-    gr::Graph graph;
-    auto&     source = graph.emplaceBlock<gr::testing::ConstantSource<float>>({{"name", std::string("src")}, {"n_samples_max", samples}});
-    auto&     copy   = graph.emplaceBlock<gr::testing::Copy<float>>({{"name", std::string("mid")}});
-    auto&     sink   = graph.emplaceBlock<gr::testing::NullSink<float>>({{"name", std::string("snk")}});
-    std::ignore      = graph.connect<"out", "in">(source, copy);
-    std::ignore      = graph.connect<"out", "in">(copy, sink);
+void runChain(gr::Size_t samples, TConfigure&& configure, float relativeDeadline = 0.0f) {
+    gr::Graph        graph;
+    gr::property_map deadline;
+    if (relativeDeadline > 0.0f) {
+        deadline["relative_deadline"] = relativeDeadline;
+    }
+    const auto with = [&deadline](gr::property_map base) {
+        for (const auto& [key, value] : deadline) {
+            base[key] = value;
+        }
+        return base;
+    };
+    auto& source = graph.emplaceBlock<gr::testing::ConstantSource<float>>(with({{"name", std::string("src")}, {"n_samples_max", samples}}));
+    auto& copy   = graph.emplaceBlock<gr::testing::Copy<float>>(with({{"name", std::string("mid")}}));
+    auto& sink   = graph.emplaceBlock<gr::testing::NullSink<float>>(with({{"name", std::string("snk")}}));
+    std::ignore  = graph.connect<"out", "in">(source, copy);
+    std::ignore  = graph.connect<"out", "in">(copy, sink);
 
     gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::externalStep, gr::profiling::null::Profiler, TPolicy> scheduler;
     expect(scheduler.exchange(std::move(graph)).has_value() >> fatal);
@@ -162,8 +174,8 @@ void runChain(gr::Size_t samples, TConfigure&& configure) {
 }
 
 template<typename TConfigure>
-void runEdfChain(gr::Size_t samples, TConfigure&& configure) {
-    runChain<gr::scheduler::EdfPolicy>(samples, std::forward<TConfigure>(configure));
+void runEdfChain(gr::Size_t samples, TConfigure&& configure, float relativeDeadline = 0.0f) {
+    runChain<gr::scheduler::EdfPolicy>(samples, std::forward<TConfigure>(configure), relativeDeadline);
 }
 
 /// The post-release queue depth, unpacked from the flag byte's high six bits.
@@ -478,7 +490,7 @@ const boost::ut::suite<"TraceSchedulingPolicy"> policyMarkerTests = [] {
         // This is also the scenario the documentation figure is rendered from, which is why it runs
         // with work, release and scheduler-loop markers together rather than release alone.
         reset();
-        setCategories(categoryMask(Category::work, Category::release, Category::select, Category::schedulerLoop));
+        setCategories(categoryMask(Category::work, Category::release, Category::select, Category::deadline, Category::schedulerLoop));
 
         gr::Graph graph;
         auto&     source = graph.emplaceBlock<gr::testing::ConstantSource<float>>({{"name", std::string("src")}, {"n_samples_max", gr::Size_t{4096U}}});
@@ -777,6 +789,140 @@ const boost::ut::suite<"TraceSchedulingPolicy"> policyMarkerTests = [] {
         const auto heapSelections = std::ranges::count_if(collect(), [](const Event& e) { return e.kind == Kind::select && (e.flags & flag::kViaHeap) != 0U; });
         expect(gt(heapSelections, 0) >> fatal) << "the heap must actually have been used, or asserting that it did not fall back proves nothing";
         expect(eq(ofKind(Kind::heapFallback).size(), 0UZ)) << "the scratch is sized to the block count on every rebuild, so a request for the heap must be honoured";
+
+        setCategories(0U);
+        reset();
+    };
+
+    "a job that finishes late is recorded, with its lateness and what it waited"_test = [] {
+        // A one-microsecond deadline against a 4096-sample batch: the work alone outlasts it, so
+        // every completed job is late and the marker's presence is deterministic. Deliberately *not*
+        // one nanosecond -- `relative_deadline` is a float, 1e-9f lands just below 1e-9, and the
+        // conversion to integer nanoseconds truncates it to zero. The deadline would then coincide
+        // with the release instant and lateness would equal response time, which happens to satisfy a
+        // careless assertion while meaning the deadline was never really there.
+        constexpr std::uint32_t kDeadlineNs = 1000U;
+        reset();
+        setCategories(categoryMask(Category::deadline));
+
+        runEdfChain(
+            4096U,
+            [](auto& scheduler) {
+                expect(scheduler.settings().set({{"max_work_items", gr::Size_t{4096U}}}).empty() >> fatal);
+                std::ignore = scheduler.settings().activateContext();
+                std::ignore = scheduler.settings().applyStagedParameters();
+            },
+            1.0e-6f);
+
+        const std::vector<Event> misses = ofKind(Kind::deadlineMiss);
+        expect(gt(misses.size(), 0UZ) >> fatal) << "a microsecond deadline cannot be met by a 4096-sample batch, so misses must be recorded";
+        for (const Event& miss : misses) {
+            expect(eq(miss.flags & flag::kDeadlineMissed, flag::kDeadlineMissed)) << "a real miss must say so";
+            expect(eq(miss.flags & flag::kDeadlineSuspect, std::uint8_t{0U})) << "and a representable deadline is not suspect";
+            expect(gt(miss.payload0, 0U)) << "lateness must be positive, or the job was not actually late";
+            // Exact, not merely ordered. Lateness is measured from the deadline and response time
+            // from the release that precedes it by exactly the relative deadline, so their difference
+            // *is* that deadline -- one nanosecond here. An ordering check alone would be satisfied by
+            // a lateness accidentally computed from the release instant, which is the likeliest way to
+            // get this wrong.
+            // The difference *is* the relative deadline, so it must be identical across every miss.
+            // Bounded rather than equated to exactly 1000: `relative_deadline` is a float, 1e-6f
+            // lands fractionally below 1e-6, and the conversion to integer nanoseconds floors it to
+            // 999. Hard-coding 999 would encode one platform's float rounding as a requirement.
+            expect(ge(miss.payload1 - miss.payload0, kDeadlineNs - 1U) and le(miss.payload1 - miss.payload0, kDeadlineNs)) //
+                << "response time must exceed lateness by the relative deadline; a lateness measured from the release instant would make the difference zero";
+            expect(eq(miss.payload1 - miss.payload0, misses.front().payload1 - misses.front().payload0)) << "and by the same amount every time, since it is the same deadline";
+            expect(gt(miss.payload2, 0U)) << "and the record carries the batch that ran";
+        }
+
+        setCategories(0U);
+        reset();
+    };
+
+    "a deadline that is met leaves no record at all"_test = [] {
+        // The marker must be silent in the common case, or a capture of a healthy graph costs one
+        // record per invocation to say nothing happened.
+        reset();
+        setCategories(categoryMask(Category::deadline, Category::work));
+
+        runEdfChain(
+            4096U,
+            [](auto& scheduler) {
+                expect(scheduler.settings().set({{"max_work_items", gr::Size_t{256U}}}).empty() >> fatal);
+                std::ignore = scheduler.settings().activateContext();
+                std::ignore = scheduler.settings().applyStagedParameters();
+            },
+            10.0f);
+
+        expect(gt(ofKind(Kind::workEnd).size(), 0UZ) >> fatal) << "the graph must have run, or silence proves nothing";
+        expect(eq(ofKind(Kind::deadlineMiss).size(), 0UZ)) << "a ten-second deadline on a millisecond graph is met every time";
+
+        setCategories(0U);
+        reset();
+    };
+
+    "an unset deadline can never be missed"_test = [] {
+        reset();
+        setCategories(categoryMask(Category::deadline, Category::work));
+        runEdfChain(4096U, [](auto&) {}); // no relative_deadline at all
+
+        expect(gt(ofKind(Kind::workEnd).size(), 0UZ) >> fatal);
+        expect(eq(ofKind(Kind::deadlineMiss).size(), 0UZ)) << "a job with no deadline sorts last; it does not have one to miss";
+
+        setCategories(0U);
+        reset();
+    };
+
+    "an unrepresentable deadline is flagged, never turned into a tardiness figure"_test = [] {
+        // RT defect B2. A relative deadline beyond the clock's range makes the absolute deadline the
+        // result of an out-of-range double-to-integer conversion -- undefined behaviour, not
+        // wrap-around -- so any lateness computed from it is meaningless while looking entirely
+        // plausible. T2 does not fix that; it stops the trace from laundering it.
+        //
+        // N.B. this scenario deliberately drives the scheduler through that conversion, because that
+        // is the only way to reach the guard. It should be revisited if this suite is ever built with
+        // UBSan, and it disappears entirely once RT B2 is fixed by clamping at the release site.
+        reset();
+        setCategories(categoryMask(Category::deadline));
+
+        runEdfChain(
+            2048U,
+            [](auto& scheduler) {
+                expect(scheduler.settings().set({{"max_work_items", gr::Size_t{256U}}}).empty() >> fatal);
+                std::ignore = scheduler.settings().activateContext();
+                std::ignore = scheduler.settings().applyStagedParameters();
+            },
+            1.0e30f);
+
+        const std::vector<Event> records = ofKind(Kind::deadlineMiss);
+        expect(gt(records.size(), 0UZ) >> fatal) << "a deadline that cannot be represented must be surfaced, not silently tolerated";
+        for (const Event& record : records) {
+            expect(eq(record.flags & flag::kDeadlineSuspect, flag::kDeadlineSuspect)) << "the record must mark itself untrustworthy";
+            expect(eq(record.flags & flag::kDeadlineMissed, std::uint8_t{0U})) << "and must not claim a miss it cannot have established";
+            expect(eq(record.payload0, kSaturated)) << "no lateness figure may be reported from an undefined computation";
+        }
+
+        setCategories(0U);
+        reset();
+    };
+
+    "the deadline category is usable on its own"_test = [] {
+        // The argument for a live marker rather than offline reconstruction rests entirely on this:
+        // miss accounting must be affordable with the high-rate categories switched off.
+        reset();
+        setCategories(categoryMask(Category::deadline));
+        runEdfChain(
+            2048U,
+            [](auto& scheduler) {
+                expect(scheduler.settings().set({{"max_work_items", gr::Size_t{256U}}}).empty() >> fatal);
+                std::ignore = scheduler.settings().activateContext();
+                std::ignore = scheduler.settings().applyStagedParameters();
+            },
+            1.0e-9f);
+
+        expect(gt(ofKind(Kind::deadlineMiss).size(), 0UZ) >> fatal) << "misses must be recorded with only their own category live";
+        expect(eq(ofKind(Kind::workEnd).size(), 0UZ)) << "and nothing from the work category";
+        expect(eq(ofKind(Kind::jobRelease).size(), 0UZ)) << "nor the release category, which reconstruction would have required";
 
         setCategories(0U);
         reset();

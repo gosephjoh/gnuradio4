@@ -1295,6 +1295,47 @@ protected:
                 }
             };
 
+            // Checked between the call and the retire, because the job that ran *is* the front job
+            // and is still there: no matching, no FIFO reconstruction, no way to pair a completion
+            // with the wrong release. It reads the clock itself rather than borrowing the one
+            // `traceLeave` takes, because the whole point of a separate deadline category is that it
+            // can be captured with `work` switched off.
+            //
+            // A met deadline leaves no record. Response time for those is reconstructed offline from
+            // release and work records, which is why the report prefers reconstruction wherever the
+            // capture supports it and cross-checks the two where it has both.
+            [[maybe_unused]] const auto traceDeadline = [&](std::size_t chosen) {
+                if constexpr (gr::trace::kEnabled) {
+                    if (!gr::trace::categoryEnabled(gr::trace::Category::deadline) || states[chosen].jobs.empty()) {
+                        return;
+                    }
+                    const Job&                                  job        = states[chosen].jobs.front();
+                    const std::chrono::steady_clock::time_point completion = std::chrono::steady_clock::now();
+
+                    // Recomputed here rather than carried on the job: a relative deadline larger than
+                    // the clock's range makes `absoluteDeadline` the result of an out-of-range
+                    // double-to-integer conversion, which is undefined behaviour and not a value any
+                    // comparison against it can be trusted to have produced.
+                    const bool suspect = states[chosen].relativeDeadlineSeconds > kMaxRepresentableDeadlineSeconds;
+                    const bool unset   = job.absoluteDeadline == std::chrono::steady_clock::time_point::max();
+                    if (!suspect && (unset || completion <= job.absoluteDeadline)) {
+                        return;
+                    }
+
+                    const std::uint64_t responseNs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(completion - job.releaseTime).count());
+                    gr::trace::emit(gr::trace::Event{.startNs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(completion.time_since_epoch()).count()),
+                        // A suspect deadline yields no lateness figure at all. Reporting one computed
+                        // from undefined behaviour is exactly the laundering this flag exists to stop.
+                        .payload0 = suspect ? gr::trace::kSaturated : gr::trace::saturate(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(completion - job.absoluteDeadline).count())), //
+                        .payload1 = gr::trace::saturate(responseNs),
+                        .payload2 = gr::trace::saturate(job.batch), //
+                        .entity   = states[chosen].entityId,
+                        .kind     = gr::trace::Kind::deadlineMiss,
+                        .workerId = traceWorkerId, //
+                        .flags    = suspect ? gr::trace::flag::kDeadlineSuspect : gr::trace::flag::kDeadlineMissed});
+                }
+            };
+
             const auto runOne = [&](std::size_t chosen) -> std::optional<work::Result> {
                 running                                             = chosen;
                 const std::size_t   batch                           = states[chosen].jobs.front().batch;
@@ -1304,6 +1345,7 @@ protected:
                 performedWorkAllBlocks += performed_work;
                 ++selections; // every iteration consumed a released job, successful or not
 
+                traceDeadline(chosen); // while the job that ran is still the front one
                 gr::scheduler::retireFrontJob(states[chosen]);
 
                 // Unconditional, and ahead of the DONE branch. `performed_work` cannot be used as the
