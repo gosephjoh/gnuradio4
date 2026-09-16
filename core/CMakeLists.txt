@@ -114,6 +114,7 @@ install(
 install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 
 add_subdirectory(src)
+add_subdirectory(tools/gr4-trace)
 
 if(ENABLE_TESTING)
   add_subdirectory(test)
