@@ -330,7 +330,19 @@ struct Readiness {
 /// minimum separation between consecutive releases. `now` is the detection instant and becomes the
 /// job's release time -- no nominal instant is ever invented, because a release is *defined* as the
 /// detection of eligibility and a nominal one asserts an eligibility that may never have occurred.
-inline void releaseIfEligible(BlockModel& block, SchedState& state, std::chrono::steady_clock::time_point now) {
+/// Largest relative deadline whose conversion to `steady_clock::duration` stays inside the integer
+/// range. Beyond it `duration_cast` performs an out-of-range `double` -> `int64` conversion, which is
+/// undefined behaviour rather than wrap-around -- so the check has to precede the conversion, and a
+/// deadline computed past this point cannot be tested after the fact because there is no defined
+/// "after". This detects the condition; clamping it would change which block the scheduler runs and
+/// belongs to the scheduling thrust, not to instrumentation.
+inline constexpr double kMaxRepresentableDeadlineSeconds = static_cast<double>(std::numeric_limits<std::chrono::steady_clock::rep>::max()) * static_cast<double>(std::chrono::steady_clock::period::num) / static_cast<double>(std::chrono::steady_clock::period::den);
+
+/// `traceFlags` carries what only the caller knows: which detection path this is. Clear means the
+/// per-sweep backstop, `gr::trace::flag::kViaSuccessorWalk` the event-driven walk. Defaulted because
+/// the backstop is the neutral answer and the unit tests that drive this function directly are not
+/// testing the detection path; the two scheduler call sites both pass it explicitly.
+inline void releaseIfEligible(BlockModel& block, SchedState& state, std::chrono::steady_clock::time_point now, [[maybe_unused]] std::uint8_t traceFlags = 0U) {
     if (state.finished) {
         return;
     }
@@ -387,10 +399,59 @@ inline void releaseIfEligible(BlockModel& block, SchedState& state, std::chrono:
 
     if (!state.jobs.push(Job{.batch = batch, .releaseTime = now, .absoluteDeadline = deadline})) {
         ++state.overruns;
+        if constexpr (gr::trace::kEnabled) {
+            if (gr::trace::categoryEnabled(gr::trace::Category::release)) {
+                // The samples stay unassigned and are offered again later, so this is backlog rather
+                // than an error -- and it is the only place the `max_outstanding_jobs` clamp becomes
+                // visible, which is what makes its default profileable at all.
+                gr::trace::emit(gr::trace::Event{.startNs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count()), //
+                    .payload0                             = gr::trace::saturate(batch),
+                    .payload1                             = gr::trace::saturate(state.jobs.capacity()),
+                    .payload2                             = gr::trace::saturate(state.overruns), //
+                    .entity                               = state.entityId,
+                    .kind                                 = gr::trace::Kind::jobReleaseDropped,
+                    .workerId                             = state.workerId,
+                    .flags                                = traceFlags});
+            }
+        }
         return;
     }
     state.assignedSamples += batch;
     state.lastRelease = now;
+
+    if constexpr (gr::trace::kEnabled) {
+        if (gr::trace::categoryEnabled(gr::trace::Category::release)) {
+            // `startNs` *is* the release instant, in the same clock domain as every other marker and
+            // as `Job::releaseTime` itself -- which is what lets a report subtract a completion from
+            // it without a conversion step that could disagree.
+            const bool suspectDeadline = deadlineSeconds > kMaxRepresentableDeadlineSeconds;
+
+            // A suspect deadline is reported as saturated rather than as its own flag: `jobRelease`
+            // has no spare bit (0 is the detection path, 1 the waiver, [2,8) the queue depth), and
+            // `kSaturated` already means "the real value exceeded the payload", which is exactly the
+            // case. The miss site recomputes the suspicion from `SchedState`, so nothing has to be
+            // carried through `Job` to reach it.
+            const std::uint32_t relativeDeadlineNs = suspectDeadline ? gr::trace::kSaturated                                      //
+                                                     : deadlineSeconds > 0.0                                                      //
+                                                         ? gr::trace::saturate(static_cast<std::uint64_t>(deadlineSeconds * 1e9)) //
+                                                         : gr::trace::kUnsetDeadline;
+
+            // Saturating at 63 rather than masking: the queue depth shares a byte with two flags and
+            // gets six bits, while `max_outstanding_jobs` defaults to 64 -- so masking would wrap a
+            // full queue to 0 and report "empty" for "completely full". Read together with
+            // `jobReleaseDropped`, which carries the true capacity, 63 is unambiguous.
+            const std::uint8_t packedDepth = static_cast<std::uint8_t>(std::min(state.jobs.size, 63UZ) << 2U);
+
+            gr::trace::emit(gr::trace::Event{.startNs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count()), //
+                .payload0                             = gr::trace::saturate(batch),
+                .payload1                             = relativeDeadlineNs,
+                .payload2                             = gr::trace::saturate(unassigned), //
+                .entity                               = state.entityId,
+                .kind                                 = gr::trace::Kind::jobRelease,
+                .workerId                             = state.workerId, //
+                .flags                                = static_cast<std::uint8_t>(traceFlags | (draining ? gr::trace::flag::kEosWaived : 0U) | packedDepth)});
+        }
+    }
 }
 
 /// Retires the job at the head of the queue, returning its whole assignment to the unassigned pool.

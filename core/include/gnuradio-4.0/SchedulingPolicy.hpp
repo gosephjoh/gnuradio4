@@ -138,6 +138,11 @@ struct SchedState {
     /// survives `applyStaticOrder`'s permutation -- which a position-derived one would not.
     gr::trace::EntityId entityId = gr::trace::kNoEntity;
 
+    /// Which worker owns this state, for markers emitted from code that has the state but not the
+    /// worker -- `releaseIfEligible()` is a free function and would otherwise attribute every release
+    /// to worker 0. Assigned beside `entityId` in `syncSchedStates()`, which already receives it.
+    std::uint8_t workerId = 0U;
+
     /// Per-invocation batch ceiling, resolved once during setup and handed to `work()` as its
     /// requested work. Ceiling only: a batch *floor* has no enforcement path at this layer, since
     /// `work()` takes an upper bound and clamps it up to the block's release threshold.

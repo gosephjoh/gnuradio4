@@ -395,7 +395,7 @@ public:
                     gr::trace::EntityDescription{.uniqueName = blocks[i]->uniqueName(), .typeName = blocks[i]->typeName(), .workerId = workerId, .nInputPorts = static_cast<std::uint16_t>(blocks[i]->dynamicInputPortsSize()), .nOutputPorts = static_cast<std::uint16_t>(blocks[i]->dynamicOutputPortsSize())});
             }
 
-            states[i] = SchedState{.index = i, .entityId = entityId, .batchCeiling = ceiling, .priority = priority, .userPriority = userPriority};
+            states[i] = SchedState{.index = i, .entityId = entityId, .workerId = workerId, .batchCeiling = ceiling, .priority = priority, .userPriority = userPriority};
 
             if constexpr (needsReleaseTracking(TPolicy::kPriorityClass)) {
                 // The gates' inputs. A block the analysis does not know keeps period and deadline at
@@ -1058,7 +1058,7 @@ protected:
         if constexpr (needsReleaseTracking(TPolicy::kPriorityClass)) {
             const std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
             for (std::size_t i = 0UZ; i < std::min(blocks.size(), states.size()); ++i) {
-                gr::scheduler::releaseIfEligible(*blocks[i], states[i], now);
+                gr::scheduler::releaseIfEligible(*blocks[i], states[i], now, 0U /* backstop */);
             }
         }
 
@@ -1075,7 +1075,7 @@ protected:
                     // The empty-to-non-empty transition is what a heap selector needs to hear about:
                     // a block already holding a job is already in the heap.
                     const bool wasEmpty = states[successor].jobs.empty();
-                    gr::scheduler::releaseIfEligible(*blocks[successor], states[successor], now);
+                    gr::scheduler::releaseIfEligible(*blocks[successor], states[successor], now, gr::trace::flag::kViaSuccessorWalk);
                     if (wasEmpty && !states[successor].jobs.empty()) {
                         onNewlyReady(successor);
                     }
