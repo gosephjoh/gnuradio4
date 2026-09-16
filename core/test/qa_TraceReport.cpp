@@ -10,6 +10,7 @@
 #include <vector>
 
 #include <gnuradio-4.0/Trace.hpp>
+#include <gnuradio-4.0/TraceCatapult.hpp>
 #include <gnuradio-4.0/TraceFile.hpp>
 #include <gnuradio-4.0/TraceReport.hpp>
 
@@ -333,6 +334,90 @@ const boost::ut::suite<"TraceReport"> reportTests = [] {
 
         expect(gt(fieldOr<std::uint64_t>(blockOf(timingReport(events, entities), "fir_filter"), "invocations", 0UL), 0UL)) << "a named capture must report the name";
         expect(gt(fieldOr<std::uint64_t>(blockOf(timingReport(events), "entity 7"), "invocations", 0UL), 0UL)) << "and one without a table must still be readable, by id";
+    };
+
+    "every record kind survives the conversion, under its own name and phase"_test = [] {
+        // The failure this guards is a converter that drops or mislabels a field and still renders:
+        // the timeline looks fine, and whatever went wrong is simply absent without anyone being told.
+        //
+        // Names and phases are spelled out **here** rather than obtained from the converter. An
+        // earlier version built the names by calling `kindName()`, which made the check tautological
+        // -- a mutation swapping two names swapped the expectation with it and passed. A test that
+        // asks the code under test what the right answer is has no opinion of its own.
+        //
+        // The phase matters as much as the name: a record exported as an instant instead of a
+        // duration loses its duration outright, and the timeline shows a tick where a span belongs.
+        struct Expected {
+            Kind             kind;
+            std::string_view name;
+            char             phase; // 'X' complete, 'i' instant, 'C' counter
+        };
+        const std::vector<Expected> expected{{Kind::workBegin, "workBegin", 'i'}, {Kind::workEnd, "work", 'X'}, {Kind::workProbe, "workProbe", 'C'}, {Kind::workerStart, "workerStart", 'i'}, {Kind::workerStop, "workerStop", 'i'}, {Kind::sweep, "sweep", 'X'}, {Kind::messagePhase, "messagePhase", 'X'}, {Kind::houseKeeping, "houseKeeping", 'X'}, {Kind::stateSync, "stateSync", 'X'}, {Kind::adopt, "adopt", 'X'}, {Kind::zombieReap, "zombieReap", 'X'}, {Kind::quiescenceWait, "quiescenceWait", 'X'}, {Kind::idle, "idle", 'X'}, {Kind::jobRelease, "jobRelease", 'i'}, {Kind::jobReleaseDropped, "jobReleaseDropped", 'i'}, {Kind::releaseScan, "releaseScan", 'X'}, {Kind::select, "select", 'i'}, {Kind::selectEmpty, "selectEmpty", 'i'}, {Kind::selectionBoundHit, "selectionBoundHit", 'i'}, {Kind::heapFallback, "heapFallback", 'i'}, {Kind::deadlineMiss, "deadlineMiss", 'i'}, {Kind::blockCounter, "blockCounter", 'i'}, {Kind::workerCounter, "workerCounter", 'i'}, {Kind::blockStateChange, "blockStateChange", 'i'}, {Kind::entityRetired, "entityRetired", 'i'}, {Kind::workExact, "workExact", 'X'}, {Kind::workPhase, "workPhase", 'X'}};
+
+        // Every enumerator must appear, so adding one without extending the converter fails here
+        // rather than producing a record that exports as "unknown".
+        expect(eq(expected.size(), static_cast<std::size_t>(kKindCount))) << "the table must cover every Kind the layer declares";
+
+        Capture capture;
+        capture.header.processId = 4242UL;
+        capture.entities.push_back(LoadedEntity{.id = 1U, .workerId = 0U, .nInputPorts = 1U, .nOutputPorts = 1U, .uniqueName = "mid", .typeName = "gr::testing::Copy<float>"});
+        std::uint64_t instant = 1'000'000UL;
+        for (const Expected& item : expected) {
+            capture.events.push_back(Event{.startNs = instant, .durationNs = 500U, .payload0 = 1U, .payload1 = 2U, .payload2 = 3U, .entity = 1U, .kind = item.kind, .workerId = 0U});
+            instant += 1000UL;
+        }
+
+        const std::string json = catapultJson(capture);
+        for (const Expected& item : expected) {
+            const std::string needle = std::format("\"cat\":\"{}\",\"ph\":\"{}\"", item.name, item.phase);
+            expect(json.contains(needle)) << std::format("{} must export as phase {}, and did not", item.name, item.phase);
+        }
+
+        // A duration record without its duration is the silent half of that failure.
+        for (const Expected& item : expected) {
+            if (item.phase == 'X') {
+                expect(json.contains(std::format("\"cat\":\"{}\",\"ph\":\"X\",\"ts\":", item.name))) << item.name;
+            }
+        }
+        expect(eq(std::ranges::count(json, '{'), std::ranges::count(json, '}'))) << "braces must balance, or the document is not JSON at all";
+    };
+
+    "timestamps are rebased, so a capture opens where its records are"_test = [] {
+        // `startNs` is steady_clock since an arbitrary epoch. Emitted raw, every event lands tens of
+        // thousands of years along the axis and the viewer opens on empty space.
+        Capture capture;
+        capture.events.push_back(Event{.startNs = 5'000'000'000'000UL, .durationNs = 1000U, .entity = kNoEntity, .kind = Kind::sweep});
+        capture.events.push_back(Event{.startNs = 5'000'000'002'000UL, .durationNs = 1000U, .entity = kNoEntity, .kind = Kind::sweep});
+
+        const std::string json = catapultJson(capture);
+        expect(json.contains("\"ts\":0.000")) << "the first record must sit at the origin";
+        expect(json.contains("\"ts\":2.000")) << "and the second two microseconds along, not five thousand seconds";
+        expect(!json.contains("5000000")) << "no raw epoch value may survive into the output";
+    };
+
+    "a name carrying JSON metacharacters cannot break the document"_test = [] {
+        // Block type names are full C++ template spellings, and a name containing a quote or a
+        // backslash would otherwise end the JSON string early and produce a document that parses as
+        // something else -- or not at all.
+        const std::string odd = std::string("od\"d") + '\\' + "name" + '\n' + '\t';
+
+        Capture capture;
+        capture.entities.push_back(LoadedEntity{.id = 1U, .uniqueName = odd, .typeName = "gr::Block<T>"});
+        capture.events.push_back(Event{.startNs = 1000UL, .durationNs = 10U, .entity = 1U, .kind = Kind::workEnd});
+
+        const std::string json = catapultJson(capture);
+        expect(json.contains(std::string("od") + '\\' + '"' + "d" + '\\' + '\\' + "name")) << "quote and backslash must be escaped, not passed through";
+        expect(json.contains("\\n")) << "a newline must be escaped rather than ending the line";
+        expect(json.contains("\\t")) << "and a tab likewise";
+        expect(!json.contains(odd)) << "the raw, unescaped name must not appear anywhere in the output";
+        expect(eq(std::ranges::count(json, '{'), std::ranges::count(json, '}'))) << "and the document must still balance";
+    };
+
+    "an empty capture converts to an empty but valid document"_test = [] {
+        const std::string json = catapultJson(Capture{});
+        expect(json.starts_with("{\"traceEvents\":[")) << "a capture with nothing in it is still a document";
+        expect(json.ends_with("}"));
+        expect(eq(std::ranges::count(json, '{'), std::ranges::count(json, '}')));
     };
 
     "the report counts what it rejected, so a mostly-rejected capture says so"_test = [] {
