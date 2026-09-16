@@ -77,7 +77,11 @@ enum class Category : std::uint32_t {
     release       = 1U << 4, /// job release, drop, detection scans
     select        = 1U << 5, /// selection decisions and their diagnostics
     deadline      = 1U << 6, /// misses and tardiness
-    workPhases    = 1U << 7  /// the finer-grained markers inside one `work()`
+    workPhases    = 1U << 7, /// the four-way split of one `work()` into its phases
+    /// Exact per-invocation sample counts from inside `work()`. Appended rather than slotted next to
+    /// `workPhases`, because `categoryMask` is written into the `.gr4trace` header: renumbering a bit
+    /// would silently change what an already-written capture's mask means, with no version to signal it.
+    workExact     = 1U << 8
 };
 
 /// One past the last `Kind`, so a test can walk every enumerator. `categoryOf`'s own completeness is
@@ -129,7 +133,8 @@ static_assert(std::to_underlying(Kind::workPhase) + 1U == kKindCount, "a Kind wa
     case Kind::blockCounter:
     case Kind::workerCounter: return Category::counters;
 
-    case Kind::workExact:
+    case Kind::workExact: return Category::workExact;
+
     case Kind::workPhase: return Category::workPhases;
     }
     return Category::lifecycle; // unreachable for a declared Kind; -Wswitch guarantees the cases are complete
@@ -143,10 +148,11 @@ template<std::same_as<Category>... TCategories>
     return (std::uint32_t{0} | ... | std::to_underlying(categories));
 }
 
-/// Derived from the enumerators rather than written out, so adding a category cannot leave this
-/// behind — which would silently make `setCategories(kAllCategories)` stop meaning "all".
+/// Listed by hand, so adding a category means adding it here too — otherwise
+/// `setCategories(kAllCategories)` silently stops meaning "all". `qa_Trace.cpp` asserts the popcount
+/// and the mask value against the enumerator count, which is what turns that omission into a failure.
 inline constexpr std::uint32_t kAllCategories = categoryMask(Category::lifecycle, Category::counters, Category::work, Category::schedulerLoop, //
-    Category::release, Category::select, Category::deadline, Category::workPhases);
+    Category::release, Category::select, Category::deadline, Category::workPhases, Category::workExact);
 
 /// Interned block or phase identity, assigned once per `BlockModel*` and cached in `SchedState`.
 /// Narrow on purpose: the record has three payload words to spend and 65534 blocks is well beyond

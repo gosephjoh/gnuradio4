@@ -20,6 +20,7 @@
 #include <gnuradio-4.0/Port.hpp>
 #include <gnuradio-4.0/Sequence.hpp>
 #include <gnuradio-4.0/Tag.hpp>
+#include <gnuradio-4.0/Trace.hpp>
 #include <gnuradio-4.0/WorkStatus.hpp>
 #include <gnuradio-4.0/thread/thread_pool.hpp>
 
@@ -789,6 +790,12 @@ public:
     property_map _pendingOutputTag{};
     bool         _computeDomainIsDevice = false; // cached on settings apply: compute_domain selects a device backend
     bool         _deviceFallbackWarned  = false; // warn-once when a device compute_domain falls back to the CPU path
+
+    // Pushed down by the scheduler on its house-keeping cadence, because a marker inside work() cannot
+    // name itself: identities are interned against the BlockModel address, and BlockWrapper *contains*
+    // its block, so `this` here is not that address. Two bytes, kept unconditionally rather than behind
+    // a conditional member, which would put a std::conditional_t in the framework's most-read struct.
+    gr::trace::EntityId _traceEntityId = gr::trace::kNoEntity;
 
     // intermediate non-real-time<->real-time setting states
     CtxSettings<Derived> _settings;
@@ -2034,7 +2041,34 @@ public:
         using enum gr::work::Status;
         using TInputTypes = traits::block::stream_input_port_types<Derived>;
 
+        // Exact per-invocation counts, which the scheduler-side marker cannot give: `performed_work`
+        // is `processedIn` for a non-source and `processedOut` for a source, so it collapses the two
+        // and cannot cross a resampling edge.
+        //
+        // RAII over all four exits. Three of them are early returns, and a paired begin/end would
+        // record none of those. The payload is filled by an `on_scope_exit` declared *after* the
+        // scope, so it destructs *before* it -- every path emits a complete record without a line
+        // before each return that could drift out of step with the others.
+        [[maybe_unused]] gr::trace::Scope exactScope{gr::trace::Event{.entity = _traceEntityId, .kind = gr::trace::Kind::workExact}};
+        [[maybe_unused]] std::size_t      tracedIn       = 0UZ;
+        [[maybe_unused]] std::size_t      tracedOut      = 0UZ;
+        [[maybe_unused]] std::size_t      tracedPosition = 0UZ;
+        [[maybe_unused]] work::Status     tracedStatus   = OK;
+        [[maybe_unused]] on_scope_exit    fillExactScope = [&] {
+            if constexpr (gr::trace::kEnabled) {
+                exactScope.event().payload0 = gr::trace::saturate(tracedIn);
+                exactScope.event().payload1 = gr::trace::saturate(tracedOut);
+                // Low 32 bits of a 64-bit position, so it wraps -- about every 23 h at 50 kHz, 71 min
+                // at 1 MHz. A reader must treat positions as modular and report a backwards step as a
+                // discontinuity rather than a negative latency. Meaningful only where a count is
+                // non-zero: an invocation that exited early anchors no data.
+                exactScope.event().payload2 = static_cast<std::uint32_t>(tracedPosition & 0xFFFFFFFFUZ);
+                exactScope.event().status   = static_cast<std::int8_t>(tracedStatus);
+            }
+        };
+
         if (std::optional<work::Result> earlyOut = checkLifecycle(requestedWork)) {
+            tracedStatus = earlyOut->status;
             return *earlyOut;
         }
 
@@ -2074,6 +2108,7 @@ public:
             emitErrorMessageIfAny("workInternal(): EOS tag arrived -> REQUESTED_STOP", this->changeStateTo(lifecycle::State::REQUESTED_STOP));
             publishEoS();
             this->setAndNotifyState(lifecycle::State::STOPPED);
+            tracedStatus = DONE;
             return {requestedWork, 0UZ, DONE};
         }
 
@@ -2081,6 +2116,7 @@ public:
             if (pendingForwardParams && !pendingForwardParams->empty()) {
                 std::ignore = settings().setStaged(*pendingForwardParams); // re-stage for next work call
             }
+            tracedStatus = limits.resampledStatus;
             return {requestedWork, 0UZ, limits.resampledStatus};
         }
 
@@ -2089,6 +2125,38 @@ public:
 
         auto inputSpans  = prepareStreams(inputPorts<PortType::STREAM>(&self()), processedIn);
         auto outputSpans = prepareStreams(outputPorts<PortType::STREAM>(&self()), processedOut);
+
+        if constexpr (gr::trace::kEnabled) {
+            // Input position for a non-source, output for a source -- the convention
+            // `computePerformedWork()` already uses, so the two agree by construction rather than by
+            // coincidence. `streamIndex` is latched at span construction, so reading it here or after
+            // `finaliseIO` gives the same answer: the position this invocation *started* at.
+            //
+            // Limitation, deliberate: the first stream port only. Ports of a multi-input block share
+            // a position in a fixed-rate chain, but need not where rates differ per port or a port is
+            // asynchronous, and one 32-bit payload field cannot hold the others. A consumer must
+            // therefore refuse such a block rather than read port 0 as speaking for all of them.
+            [[maybe_unused]] bool firstSpan = true;
+            if constexpr (TInputTypes::size.value == 0) {
+                for_each_writer_span(
+                    [&](auto& span) {
+                        if (firstSpan) {
+                            tracedPosition = span.streamIndex;
+                            firstSpan      = false;
+                        }
+                    },
+                    outputSpans);
+            } else {
+                for_each_reader_span(
+                    [&](auto& span) {
+                        if (firstSpan) {
+                            tracedPosition = span.streamIndex;
+                            firstSpan      = false;
+                        }
+                    },
+                    inputSpans);
+            }
+        }
 
         applyChangedSettings(); // publishes any additional external settings changes via port fallback
         applyInputTagsAndSettings(inputSpans, processedIn, limits.hasAnyTag);
@@ -2164,6 +2232,10 @@ public:
         }
         work::sanitiseProcessStatus(userReturnStatus, processedIn, processedOut);
         finaliseIO(inputSpans, outputSpans, userReturnStatus, processedIn, processedOut, limits.resampledIn);
+
+        tracedIn     = processedIn;
+        tracedOut    = processedOut;
+        tracedStatus = userReturnStatus;
 
         constexpr bool kIsSourceBlock = TInputTypes::size.value == 0;
         std::size_t    performedWork  = work::computePerformedWork(userReturnStatus, processedIn, processedOut, kIsSourceBlock);

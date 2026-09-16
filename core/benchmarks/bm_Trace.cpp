@@ -264,6 +264,13 @@ int main() {
         const RunResult release    = bestOf(categoryMask(Category::release), batchCeiling);
         const RunResult deadline   = bestOf(categoryMask(Category::release, Category::deadline), batchCeiling);
         const RunResult everything = bestOf(categoryMask(Category::release, Category::select, Category::deadline), batchCeiling);
+        // T4: the block-side markers. `work` alone is the scheduler-boundary baseline they sit
+        // inside, so the difference between these two rows is `workExact`'s own cost and nothing
+        // else. `workPhases` is expected to be the expensive one -- four scopes against one -- and
+        // the point of printing it is that the figure is stated rather than discovered later.
+        const RunResult boundary  = bestOf(categoryMask(Category::work), batchCeiling);
+        const RunResult exact     = bestOf(categoryMask(Category::work, Category::workExact), batchCeiling);
+        const RunResult phases    = bestOf(categoryMask(Category::work, Category::workExact, Category::workPhases), batchCeiling);
 
         std::print("\n{}\n", title);
         std::print("{:<32} {:>9} {:>10} {:>10} {:>11}\n", "configuration", "ms", "vs mask 0", "records", "ns/record");
@@ -275,7 +282,10 @@ int main() {
         row("release", release);
         row("release | deadline", deadline);
         row("release | select | deadline", everything);
-        if (baseline.lost + release.lost + deadline.lost + everything.lost > 0UL) {
+        row("work", boundary);
+        row("work | workExact", exact);
+        row("work | workExact | workPhases", phases);
+        if (baseline.lost + release.lost + deadline.lost + everything.lost + boundary.lost + exact.lost + phases.lost > 0UL) {
             std::print("WARNING: records were lost, so a ring wrapped and eviction is inside these figures\n");
         }
     };

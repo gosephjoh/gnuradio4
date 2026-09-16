@@ -162,8 +162,10 @@ const boost::ut::suite<"Trace"> traceTests = [] {
         expect(eq(categoryMask(Category::work), 1U << 2));
         expect(eq(categoryMask(Category::work, Category::schedulerLoop), (1U << 2) | (1U << 3)));
         expect(eq(categoryMask(Category::work, Category::work), 1U << 2)) << "folding is idempotent";
-        expect(eq(kAllCategories, 0xFFU)) << "eight categories, contiguous from bit 0";
-        expect(eq(std::popcount(kAllCategories), 8)) << "every enumerator occupies a distinct bit";
+        expect(eq(kAllCategories, 0x1FFU)) << "nine categories, contiguous from bit 0";
+        expect(eq(std::popcount(kAllCategories), 9)) << "every enumerator occupies a distinct bit";
+        expect(eq(categoryMask(Category::workPhases), 1U << 7)) << "workPhases keeps bit 7: the mask is written into the .gr4trace header, so renumbering would change what an existing capture means";
+        expect(eq(categoryMask(Category::workExact), 1U << 8)) << "workExact was appended rather than slotted in";
     };
 
     "entity ids leave room for the no-entity sentinel"_test = [] {
@@ -272,6 +274,10 @@ const boost::ut::suite<"Trace"> traceTests = [] {
         expect(eq(std::to_underlying(categoryOf(Kind::workEnd)), std::to_underlying(Category::work)));
         expect(eq(std::to_underlying(categoryOf(Kind::deadlineMiss)), std::to_underlying(Category::deadline)));
         expect(eq(std::to_underlying(categoryOf(Kind::heapFallback)), std::to_underlying(Category::select)));
+        // The T4 split: the acceptance criterion costs one scope, not five, only if these differ.
+        expect(eq(std::to_underlying(categoryOf(Kind::workExact)), std::to_underlying(Category::workExact)));
+        expect(eq(std::to_underlying(categoryOf(Kind::workPhase)), std::to_underlying(Category::workPhases)));
+        expect(neq(std::to_underlying(categoryOf(Kind::workExact)), std::to_underlying(categoryOf(Kind::workPhase)))) << "enabling exact counts must not drag in the four phase scopes";
     };
 
     "durations never wrap when the clock pair comes back out of order"_test = [] {
