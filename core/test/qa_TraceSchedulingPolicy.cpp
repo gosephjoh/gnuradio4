@@ -7,10 +7,13 @@
 #include <cstdlib>
 #include <format>
 #include <map>
+#include <optional>
+#include <ranges>
 #include <set>
 #include <span>
 #include <string>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 #include <gnuradio-4.0/Graph.hpp>
@@ -132,6 +135,30 @@ void exportTimeline([[maybe_unused]] std::string_view name) {
         }
         std::ignore = gr::trace::dump(std::format("{}/{}.gr4trace", directory, name));
     }
+}
+
+/// Drives an `externalStep` EDF scheduler over `src -> mid -> snk` to completion, with an optional
+/// settings override applied before it starts. Returns nothing: the assertion material is the trace.
+template<typename TConfigure>
+void runEdfChain(gr::Size_t samples, TConfigure&& configure) {
+    gr::Graph graph;
+    auto&     source = graph.emplaceBlock<gr::testing::ConstantSource<float>>({{"name", std::string("src")}, {"n_samples_max", samples}});
+    auto&     copy   = graph.emplaceBlock<gr::testing::Copy<float>>({{"name", std::string("mid")}});
+    auto&     sink   = graph.emplaceBlock<gr::testing::NullSink<float>>({{"name", std::string("snk")}});
+    std::ignore      = graph.connect<"out", "in">(source, copy);
+    std::ignore      = graph.connect<"out", "in">(copy, sink);
+
+    gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::externalStep, gr::profiling::null::Profiler, gr::scheduler::EdfPolicy> scheduler;
+    expect(scheduler.exchange(std::move(graph)).has_value() >> fatal);
+    configure(scheduler);
+    expect(scheduler.changeStateTo(gr::lifecycle::State::INITIALISED).has_value() >> fatal);
+    expect(scheduler.changeStateTo(gr::lifecycle::State::RUNNING).has_value() >> fatal);
+    for (std::size_t pass = 0UZ; pass < 64UZ; ++pass) {
+        if (scheduler.step().status == gr::work::Status::DONE) {
+            break;
+        }
+    }
+    std::ignore = scheduler.changeStateTo(gr::lifecycle::State::STOPPED);
 }
 
 /// The post-release queue depth, unpacked from the flag byte's high six bits.
@@ -446,7 +473,7 @@ const boost::ut::suite<"TraceSchedulingPolicy"> policyMarkerTests = [] {
         // This is also the scenario the documentation figure is rendered from, which is why it runs
         // with work, release and scheduler-loop markers together rather than release alone.
         reset();
-        setCategories(categoryMask(Category::work, Category::release, Category::schedulerLoop));
+        setCategories(categoryMask(Category::work, Category::release, Category::select, Category::schedulerLoop));
 
         gr::Graph graph;
         auto&     source = graph.emplaceBlock<gr::testing::ConstantSource<float>>({{"name", std::string("src")}, {"n_samples_max", gr::Size_t{4096U}}});
@@ -493,10 +520,143 @@ const boost::ut::suite<"TraceSchedulingPolicy"> policyMarkerTests = [] {
 
         expect(gt(jobBackedRuns, 0UZ) >> fatal) << "an EDF run must execute job-backed work, or this asserts nothing";
         expect(eq(unbacked, 0UZ)) << "a job-backed execution with no release before it means the trace cannot attribute response times";
+        expect(eq(ofKind(Kind::select).size(), jobBackedRuns)) << "one selection authorises one job-backed call, so the counts must agree exactly";
 
         exportTimeline("t2-release-to-execution");
 
         std::ignore = scheduler.changeStateTo(gr::lifecycle::State::STOPPED);
+        setCategories(0U);
+        reset();
+    };
+
+    "a selection names the block that runs, and the ready set it came from"_test = [] {
+        reset();
+        setCategories(categoryMask(Category::work, Category::select));
+
+        runEdfChain(4096U, [](auto& scheduler) {
+            expect(scheduler.settings().set({{"max_work_items", gr::Size_t{512U}}}).empty() >> fatal);
+            std::ignore = scheduler.settings().activateContext();
+            std::ignore = scheduler.settings().applyStagedParameters();
+        });
+
+        // A selection authorises exactly one call, so the record must sit immediately before the
+        // workBegin it authorised and must name the same block. Anything else means the oracle would
+        // line a decision up against the wrong execution.
+        // The ordinal counts selections *within a pass* and restarts at zero on the next one, since
+        // the bound it is measured against is per pass. So the invariant is not that it rises
+        // globally but that it advances by one or restarts -- a skipped value would mean a selection
+        // happened that nothing recorded.
+        std::size_t                     selections = 0UZ, matched = 0UZ;
+        std::optional<gr::trace::Event> pendingSelect;
+        std::uint32_t                   previousOrdinal   = 0U;
+        bool                            ordinalContiguous = true;
+        for (const Event& event : collect()) {
+            if (event.kind == Kind::select) {
+                ordinalContiguous = ordinalContiguous && (selections == 0UZ ? event.payload1 == 0U : (event.payload1 == previousOrdinal + 1U || event.payload1 == 0U));
+                previousOrdinal   = event.payload1;
+                ++selections;
+                expect(ge(event.payload0, 1U)) << "a selection was made, so at least one block was ready";
+                pendingSelect = event;
+            } else if (event.kind == Kind::workBegin && pendingSelect.has_value()) {
+                matched += pendingSelect->entity == event.entity ? 1UZ : 0UZ;
+                pendingSelect.reset();
+            }
+        }
+
+        expect(gt(selections, 0UZ) >> fatal) << "a job-driven run must record its selections";
+        expect(eq(matched, selections)) << "every selection must be followed by the execution it authorised, on the same block";
+        expect(ordinalContiguous) << "ordinals must run 0,1,2... within a pass and restart on the next -- a skipped value means a selection nothing recorded";
+
+        // Contiguity alone is satisfied by an ordinal hard-coded to zero, since a restart is legal
+        // anywhere. Requiring that some pass made a second selection is what gives it teeth.
+        expect(gt(previousOrdinal + (selections > 0UZ ? 1U : 0U), 1U) or std::ranges::any_of(collect(), [](const Event& e) { return e.kind == Kind::select && e.payload1 > 0U; })) //
+            << "no pass ever recorded a second selection, so the ordinal is not being counted at all";
+
+        setCategories(0U);
+        reset();
+    };
+
+    "the two selection strategies are distinguishable in the trace"_test = [] {
+        // A report that mixed a heap run with a scan run would be comparing two different algorithms
+        // as though they were one. The strategies must be told apart from the records alone.
+        const auto pathFlagsSeenWith = [](gr::scheduler::SelectionStrategy strategy) {
+            reset();
+            setCategories(categoryMask(Category::select));
+            runEdfChain(4096U, [strategy](auto& scheduler) {
+                scheduler.selection_strategy = strategy; // the reflected form wants an enum *string*; the field is the direct route
+                expect(scheduler.settings().set({{"max_work_items", gr::Size_t{512U}}}).empty() >> fatal);
+                std::ignore = scheduler.settings().activateContext();
+                std::ignore = scheduler.settings().applyStagedParameters();
+            });
+            std::size_t viaHeap = 0UZ, viaScan = 0UZ;
+            for (const Event& event : ofKind(Kind::select)) {
+                (((event.flags & flag::kViaHeap) != 0U) ? viaHeap : viaScan)++;
+            }
+            setCategories(0U);
+            return std::pair{viaHeap, viaScan};
+        };
+
+        const auto [heapHeap, heapScan] = pathFlagsSeenWith(gr::scheduler::SelectionStrategy::readyHeap);
+        expect(gt(heapHeap, 0UZ)) << "a readyHeap run must record selections made through the heap";
+        expect(eq(heapScan, 0UZ)) << "and none through the scan";
+
+        const auto [scanHeap, scanScan] = pathFlagsSeenWith(gr::scheduler::SelectionStrategy::linearScan);
+        expect(gt(scanScan, 0UZ)) << "a linearScan run must record selections made by scanning";
+        expect(eq(scanHeap, 0UZ)) << "and none through the heap";
+
+        reset();
+    };
+
+    "a pass with nothing released records that it found nothing"_test = [] {
+        // M3 section 20.7 item 6: a worker whose blocks are all waiting loops on readiness probes,
+        // and round robin spins when idle too, so parity was argued rather than measured. This is the
+        // measurement. A finished graph is the cleanest way to reach the state deterministically.
+        reset();
+        setCategories(categoryMask(Category::select));
+
+        gr::Graph graph;
+        auto&     source = graph.emplaceBlock<gr::testing::ConstantSource<float>>({{"name", std::string("src")}, {"n_samples_max", gr::Size_t{512U}}});
+        auto&     copy   = graph.emplaceBlock<gr::testing::Copy<float>>({{"name", std::string("mid")}});
+        auto&     sink   = graph.emplaceBlock<gr::testing::NullSink<float>>({{"name", std::string("snk")}});
+        std::ignore      = graph.connect<"out", "in">(source, copy);
+        std::ignore      = graph.connect<"out", "in">(copy, sink);
+
+        gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::externalStep, gr::profiling::null::Profiler, gr::scheduler::EdfPolicy> scheduler;
+        expect(scheduler.exchange(std::move(graph)).has_value() >> fatal);
+        expect(scheduler.changeStateTo(gr::lifecycle::State::INITIALISED).has_value() >> fatal);
+        expect(scheduler.changeStateTo(gr::lifecycle::State::RUNNING).has_value() >> fatal);
+
+        for (std::size_t pass = 0UZ; pass < 16UZ; ++pass) {
+            if (scheduler.step().status == gr::work::Status::DONE) {
+                break;
+            }
+        }
+        const std::size_t beforeIdling = ofKind(Kind::selectEmpty).size();
+        for (std::size_t pass = 0UZ; pass < 4UZ; ++pass) {
+            std::ignore = scheduler.step(); // every block finished: nothing can be selected
+        }
+
+        const std::vector<Event> empties = ofKind(Kind::selectEmpty);
+        expect(gt(empties.size(), beforeIdling) >> fatal) << "a pass over an exhausted graph selects nothing, and must say so";
+        expect(eq(empties.back().payload0, 3U)) << "the record carries how many blocks were looked at";
+        expect(eq(empties.back().payload1, 0U)) << "and that no selection was made in the pass that found nothing";
+
+        std::ignore = scheduler.changeStateTo(gr::lifecycle::State::STOPPED);
+        setCategories(0U);
+        reset();
+    };
+
+    "the selection category is independent of the work category"_test = [] {
+        // select doubles the per-invocation record count, which is why it is its own category and off
+        // by default. That separation is only real if enabling one does not drag in the other.
+        reset();
+        setCategories(categoryMask(Category::select));
+        runEdfChain(2048U, [](auto&) {});
+
+        expect(gt(ofKind(Kind::select).size(), 0UZ) >> fatal) << "selections must be recorded when their category is live";
+        expect(eq(ofKind(Kind::workBegin).size(), 0UZ)) << "and the work category, being off, must contribute nothing";
+        expect(eq(ofKind(Kind::jobRelease).size(), 0UZ)) << "nor the release category";
+
         setCategories(0U);
         reset();
     };

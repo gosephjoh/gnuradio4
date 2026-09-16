@@ -1226,6 +1226,41 @@ protected:
                 }
             };
 
+            // One record per selection decision, emitted *before* the call it authorises, so a
+            // reader sees release -> select -> workBegin -> workEnd in that order and the replay
+            // oracle can line a decision up against the ready set that produced it.
+            //
+            // `readySetSize` is what the selector itself believed was ready: the heap's population
+            // for the heap path, the eligible count for the scan. Those are not quite the same
+            // quantity -- a heap may hold an entry whose job has since been retired -- which is
+            // exactly why a skipped stale entry is flagged rather than silently corrected.
+            [[maybe_unused]] bool       staleSkipped = false;
+            [[maybe_unused]] const auto traceSelect  = [&](std::size_t chosen, std::size_t readySetSize, std::size_t heapPopulation, std::uint8_t pathFlag) {
+                if constexpr (gr::trace::kEnabled) {
+                    gr::trace::emit(gr::trace::Event{.startNs = gr::trace::now(),
+                         .payload0                             = gr::trace::saturate(readySetSize),
+                         .payload1                             = gr::trace::saturate(selections),
+                         .payload2                             = gr::trace::saturate(heapPopulation), //
+                         .entity                               = states[chosen].entityId,
+                         .kind                                 = gr::trace::Kind::select,
+                         .workerId                             = traceWorkerId, //
+                         .flags                                = static_cast<std::uint8_t>(pathFlag | (staleSkipped ? gr::trace::flag::kStaleEntrySkipped : 0U))});
+                    staleSkipped = false;
+                }
+            };
+
+            // Nothing was ready. Round robin spins when idle too, so the claim that a job-driven
+            // worker is at parity with it is an argument until this is counted.
+            [[maybe_unused]] const auto traceSelectEmpty = [&] {
+                if constexpr (gr::trace::kEnabled) {
+                    gr::trace::emit(gr::trace::Event{.startNs = gr::trace::now(),
+                        .payload0                             = gr::trace::saturate(nBlocks),
+                        .payload1                             = gr::trace::saturate(selections), //
+                        .kind                                 = gr::trace::Kind::selectEmpty,
+                        .workerId                             = traceWorkerId});
+                }
+            };
+
             const auto runOne = [&](std::size_t chosen) -> std::optional<work::Result> {
                 running                                             = chosen;
                 const std::size_t   batch                           = states[chosen].jobs.front().batch;
@@ -1299,9 +1334,13 @@ protected:
                     // `jobs.front()` of an emptied ring. Validating here makes the loop correct
                     // however an entry came to be there.
                     if (!eligible(chosen)) {
+                        if constexpr (gr::trace::kEnabled) {
+                            staleSkipped = true;
+                        }
                         continue;
                     }
 
+                    traceSelect(chosen, heapSize + 1UZ, heapSize, gr::trace::flag::kViaHeap);
                     if (const std::optional<work::Result> failure = runOne(chosen); failure.has_value()) {
                         return *failure;
                     }
@@ -1309,13 +1348,20 @@ protected:
                         pushReady(chosen); // re-keyed to whatever job is now at its head
                     }
                 }
+                if (heapSize == 0UZ && selections < bound) {
+                    traceSelectEmpty(); // exhausted rather than bounded -- the bound is T2d's marker
+                }
                 markUnfinished();
             } else {
                 while (selections < bound) {
-                    std::size_t chosen = nBlocks;
+                    std::size_t                  chosen     = nBlocks;
+                    [[maybe_unused]] std::size_t readyCount = 0UZ;
                     for (std::size_t i = 0UZ; i < nBlocks; ++i) {
                         if (!eligible(i)) {
                             continue;
+                        }
+                        if constexpr (gr::trace::kEnabled) {
+                            ++readyCount;
                         }
                         if (chosen == nBlocks || gr::scheduler::selectsBefore(policy, *blocks[i], states[i], *blocks[chosen], states[chosen])) {
                             chosen = i;
@@ -1323,9 +1369,11 @@ protected:
                     }
 
                     if (chosen == nBlocks) {
+                        traceSelectEmpty();
                         break; // nothing released this pass
                     }
 
+                    traceSelect(chosen, readyCount, 0UZ, 0U /* linear scan */);
                     if (const std::optional<work::Result> failure = runOne(chosen); failure.has_value()) {
                         return *failure;
                     }
