@@ -133,7 +133,7 @@ namespace detail {
  * cannot be reconstructed produces **no arrows at all** rather than partial ones: a timeline showing
  * some links and not others reads as "these are the slow paths" rather than "this was refused".
  */
-[[nodiscard]] inline std::string catapultJson(const Capture& capture, std::span<const EntityId> chain = {}) {
+[[nodiscard]] inline std::string catapultJson(const Capture& capture, std::span<const EntityId> chain = {}, LatencyMode mode = LatencyMode::streamPosition) {
     std::map<EntityId, std::string> names;
     for (const LoadedEntity& entity : capture.entities) {
         names[entity.id] = entity.uniqueName;
@@ -208,7 +208,7 @@ namespace detail {
     // lands inside, so they must follow the spans they attach to.
     std::size_t arrows = 0UZ;
     if (!chain.empty()) {
-        const ChainLinks matched = chainLinks(capture.events, chain);
+        const ChainLinks matched = chainLinks(capture.events, chain, mode);
         for (const LatencyLink& link : matched.links) {
             const std::string flowName = std::format("latency {} ns", link.latencyNs);
             comma();

@@ -411,25 +411,96 @@ struct LatencyLink {
     std::uint8_t  consumerWorker = 0U;
 };
 
+/**
+ * @brief How a sink invocation is matched to the source batch that fed it.
+ *
+ * `streamPosition` is the default and assumes nothing: it walks recorded stream coordinates back
+ * through each intermediate block's observed ratio, and refuses any chain it cannot reconstruct
+ * exactly (§ `ratioOf`).
+ *
+ * `invocationLockstep` assumes instead that **one invocation of a block causes exactly one
+ * invocation of each of its successors**, so the n-th productive invocation of the source is the one
+ * whose data the n-th productive invocation of the sink read. Flowgraphs are sometimes configured
+ * that way deliberately, because it tightens analytical end-to-end latency bounds at no runtime
+ * cost, and where that holds the latency is a subtraction between two records found by counting.
+ *
+ * Note this is **not** a claim about sample rates. A 4:1 decimator is in lockstep with its source
+ * whenever each of its invocations consumes exactly one produced batch; the sample ratio is 4:1 and
+ * the invocation ratio is 1:1. Naming it for the invocations is deliberate.
+ *
+ * What it buys: it reads no positions and needs no ratios, so it reconstructs chains the default
+ * mode must decline — a block with a stride, an unstable ratio, or per-port rates that one position
+ * field cannot describe. What it costs: the assumption is the user's, not the capture's, so it is
+ * never the default and is checked as far as a capture allows (see `chainLinks`).
+ */
+enum class LatencyMode { streamPosition, invocationLockstep };
+
 struct ChainLinks {
     bool                     computed = false;
     std::string              reason;
     std::vector<LatencyLink> links;
+    /// Invocations the capture could not pair, and so could not time. The end it is missing differs
+    /// by mode -- lockstep leaves a *tail* of source batches the sink had not yet read, the position
+    /// walk leaves a *head* of sink invocations whose producer predates the capture -- but in both
+    /// the actionable fact is the same: this many invocations are absent from the distribution.
+    std::size_t unmatched = 0UZ;
 };
 
 struct ChainLatency {
     bool          computed = false;
     std::string   reason;
-    std::uint64_t medianNs = 0UL;
-    std::uint64_t minNs    = 0UL;
-    std::uint64_t maxNs    = 0UL;
-    std::size_t   samples  = 0UZ;
+    std::uint64_t medianNs  = 0UL;
+    std::uint64_t minNs     = 0UL;
+    std::uint64_t maxNs     = 0UL;
+    std::size_t   samples   = 0UZ;
+    std::size_t   unmatched = 0UZ; /// invocations that could not be paired, and so are absent below
 };
 
-[[nodiscard]] inline ChainLinks chainLinks(std::span<const Event> events, std::span<const EntityId> chain) {
+[[nodiscard]] inline ChainLinks chainLinks(std::span<const Event> events, std::span<const EntityId> chain, LatencyMode mode = LatencyMode::streamPosition) {
     ChainLinks result;
     if (chain.size() < 2UZ) {
         result.reason = "a chain needs at least a source and a sink";
+        return result;
+    }
+
+    if (mode == LatencyMode::invocationLockstep) {
+        const std::vector<Event> sourceInvocations = exactRecordsFor(events, chain.front());
+        const std::vector<Event> sinkInvocations   = exactRecordsFor(events, chain.back());
+        if (sourceInvocations.empty() || sinkInvocations.empty()) {
+            result.reason = "the chain's ends left no productive records";
+            return result;
+        }
+
+        // The assumption is the caller's, but it is not beyond checking. Under lockstep the sink
+        // cannot run productively more often than the source did: it would be consuming batches that
+        // were never produced. A capture showing that is describing a graph the caller has
+        // misunderstood, and pairing anyway would yield confident nonsense.
+        if (sinkInvocations.size() > sourceInvocations.size()) {
+            result.reason = std::format("not in lockstep: the sink ran {} productive invocations against the source's {}", sinkInvocations.size(), sourceInvocations.size());
+            return result;
+        }
+
+        // Only the ends matter. The intermediate blocks are what the assumption is *about*, so
+        // reading their records would be assuming and verifying the same thing.
+        for (std::size_t i = 0UZ; i < sinkInvocations.size(); ++i) {
+            const std::uint64_t producedAt = sourceInvocations[i].startNs + sourceInvocations[i].durationNs;
+            const std::uint64_t consumedAt = sinkInvocations[i].startNs + sinkInvocations[i].durationNs;
+            if (consumedAt < producedAt) {
+                result.reason = std::format("not in lockstep: sink invocation {} completed before the source invocation it would be paired with", i);
+                return result;
+            }
+            result.links.push_back(LatencyLink{.producedAt = producedAt,
+                .consumedAt                                = consumedAt,
+                .latencyNs                                 = consumedAt - producedAt, //
+                .producer                                  = sourceInvocations[i].entity,
+                .consumer                                  = sinkInvocations[i].entity, //
+                .producerWorker                            = sourceInvocations[i].workerId,
+                .consumerWorker                            = sinkInvocations[i].workerId});
+        }
+        // A tail is expected rather than wrong: a capture that stops while batches are in flight
+        // leaves source invocations with no sink invocation yet. Reported, not hidden.
+        result.unmatched = sourceInvocations.size() - sinkInvocations.size();
+        result.computed  = true;
         return result;
     }
 
@@ -513,12 +584,14 @@ struct ChainLatency {
         // it, because the batches are contiguous and ordered.
         const auto after = std::ranges::partition_point(sourceRecords, [coordinate](const Event& candidate) { return static_cast<std::uint64_t>(candidate.payload2) <= coordinate; });
         if (after == sourceRecords.begin()) {
-            continue; // produced before the capture opened; not an error, just unmatched
+            ++result.unmatched; // produced before the capture opened; not an error, but not hidden either
+            continue;
         }
         const Event&        candidate = *std::prev(after);
         const std::uint64_t begin     = candidate.payload2;
         if (coordinate >= begin + candidate.payload1) {
-            continue; // falls in a gap between batches, so nothing in this capture produced it
+            ++result.unmatched; // falls in a gap between batches, so nothing in this capture produced it
+            continue;
         }
         const Event*        producer   = &candidate;
         const std::uint64_t producedAt = producer->startNs + producer->durationNs;
@@ -556,8 +629,8 @@ struct ChainLatency {
  * latency for the hops that happen to qualify would be a number whose meaning depends on which
  * blocks were excluded.
  */
-[[nodiscard]] inline ChainLatency chainLatency(std::span<const Event> events, std::span<const EntityId> chain) {
-    const ChainLinks matched = chainLinks(events, chain);
+[[nodiscard]] inline ChainLatency chainLatency(std::span<const Event> events, std::span<const EntityId> chain, LatencyMode mode = LatencyMode::streamPosition) {
+    const ChainLinks matched = chainLinks(events, chain, mode);
     ChainLatency     latency{.computed = matched.computed, .reason = matched.reason};
     if (!matched.computed) {
         return latency;
@@ -568,10 +641,11 @@ struct ChainLatency {
         values.push_back(link.latencyNs);
     }
     std::ranges::sort(values);
-    latency.samples  = values.size();
-    latency.minNs    = values.front();
-    latency.maxNs    = values.back();
-    latency.medianNs = values[values.size() / 2UZ];
+    latency.samples   = values.size();
+    latency.unmatched = matched.unmatched;
+    latency.minNs     = values.front();
+    latency.maxNs     = values.back();
+    latency.medianNs  = values[values.size() / 2UZ];
     return latency;
 }
 

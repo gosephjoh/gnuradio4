@@ -1,9 +1,9 @@
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
-#include <print>
 #include <optional>
-#include <algorithm>
+#include <print>
 #include <span>
 #include <string>
 #include <string_view>
@@ -70,6 +70,8 @@ int usage() {
     std::println(stderr, "  report    <capture>            per-block cost, jitter and marginal-cost fit");
     std::println(stderr, "  catapult  <capture> <out.json> [block ...] Chrome trace JSON, for ui.perfetto.dev");
     std::println(stderr, "            naming a source-to-sink chain adds latency flow arrows");
+    std::println(stderr, "            --lockstep  assume one invocation per successor invocation,");
+    std::println(stderr, "                        instead of walking recorded stream positions");
     std::println(stderr, "  summary   <capture>            header fields and a record census");
     return 2;
 }
@@ -183,19 +185,22 @@ int commandReport(const Capture& capture) {
     return chain;
 }
 
-int commandCatapult(const Capture& capture, const std::string& outputPath, std::span<const EntityId> chain) {
+int commandCatapult(const Capture& capture, const std::string& outputPath, std::span<const EntityId> chain, LatencyMode mode) {
     std::ofstream out(outputPath, std::ios::binary | std::ios::trunc);
     if (!out.is_open()) {
         std::println(stderr, "gr4-trace: cannot open '{}' for writing", outputPath);
         return 1;
     }
-    const std::string json = catapultJson(capture, chain);
+    const std::string json = catapultJson(capture, chain, mode);
     if (!chain.empty()) {
         // Said out loud, because a chain that could not be reconstructed produces a timeline that
         // looks exactly like one that was never asked for.
-        const ChainLatency latency = chainLatency(capture.events, chain);
+        const ChainLatency latency = chainLatency(capture.events, chain, mode);
         if (latency.computed) {
-            std::println("latency over {} samples: min {} ns, median {} ns, max {} ns", latency.samples, latency.minNs, latency.medianNs, latency.maxNs);
+            std::println("latency over {} samples ({}): min {} ns, median {} ns, max {} ns", latency.samples, mode == LatencyMode::invocationLockstep ? "assuming invocation lockstep" : "from stream positions", latency.minNs, latency.medianNs, latency.maxNs);
+            if (latency.unmatched > 0UZ) {
+                std::println("note: {} invocations could not be paired and are absent from these figures", latency.unmatched);
+            }
         } else {
             std::println("no flow arrows: {}", latency.reason);
         }
@@ -242,16 +247,29 @@ int main(int argc, char** argv) {
             std::println(stderr, "gr4-trace catapult needs an output path");
             return usage();
         }
+        // `--lockstep` selects the assumption; without it the position walk is used, which assumes
+        // nothing and refuses what it cannot reconstruct.
+        std::vector<std::string_view> rest(args.begin() + 4, args.end());
+        LatencyMode                   mode = LatencyMode::streamPosition;
+        if (const auto flag = std::ranges::find(rest, std::string_view{"--lockstep"}); flag != rest.end()) {
+            mode = LatencyMode::invocationLockstep;
+            rest.erase(flag);
+        }
+
         std::vector<EntityId> chain;
-        if (args.size() > 4UZ) {
-            const std::vector<std::string_view> names(args.begin() + 4, args.end());
-            const auto                          resolved = resolveChain(*capture, names);
+        if (!rest.empty()) {
+            const auto resolved = resolveChain(*capture, rest);
             if (!resolved.has_value()) {
                 return 1;
             }
             chain = *resolved;
+        } else if (mode == LatencyMode::invocationLockstep) {
+            // Selecting how to reconstruct a chain, without naming one, reconstructs nothing. Silence
+            // here would look identical to a successful run.
+            std::println(stderr, "gr4-trace: --lockstep selects how a chain is reconstructed, but no chain was named");
+            return usage();
         }
-        return commandCatapult(*capture, std::string(args[3]), chain);
+        return commandCatapult(*capture, std::string(args[3]), chain, mode);
     }
     std::println(stderr, "gr4-trace: unknown command '{}'", command);
     return usage();

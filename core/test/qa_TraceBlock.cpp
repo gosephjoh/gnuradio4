@@ -584,6 +584,105 @@ const boost::ut::suite<"TraceBlock"> traceBlockTests = [] {
         expect(eq(latency.medianNs, expected[expected.size() / 2UZ]));
     };
 
+    "lockstep and the position walk agree where both apply"_test = [] {
+        // The strongest check available for the lockstep option: on a chain that satisfies both
+        // assumptions, two independent routes to one number must produce the same number. Same shape
+        // as the live-versus-reconstructed cross-check T2 used, and for the same reason -- a
+        // disagreement is evidence, not noise.
+        DecimatingRun run;
+        run.run(categoryMask(Category::workExact));
+
+        const std::vector<EntityId> chain{run.source, run.decimator, run.sink};
+        const ChainLatency          byPosition = chainLatency(run.events, chain, LatencyMode::streamPosition);
+        const ChainLatency          byLockstep = chainLatency(run.events, chain, LatencyMode::invocationLockstep);
+        expect(byPosition.computed >> fatal) << byPosition.reason;
+        expect(byLockstep.computed >> fatal) << byLockstep.reason;
+
+        expect(eq(byPosition.samples, byLockstep.samples)) << "both routes must match the same number of batches";
+        expect(eq(byPosition.minNs, byLockstep.minNs)) << "and produce the same distribution";
+        expect(eq(byPosition.medianNs, byLockstep.medianNs));
+        expect(eq(byPosition.maxNs, byLockstep.maxNs));
+        expect(eq(byLockstep.unmatched, 0UZ)) << "nothing was left in flight in this capture";
+        expect(eq(byPosition.unmatched, 0UZ)) << "and nothing predates it either -- both modes must account for every invocation";
+    };
+
+    "the position walk reports what it could not pair"_test = [] {
+        // The two modes miss opposite ends -- lockstep leaves a tail the sink had not reached, the
+        // position walk a head whose producer predates the capture -- but neither may drop the count
+        // silently. A distribution that is quietly short understates whatever it was measuring.
+        const std::vector<Event> lateSource{
+            exactRecord(EntityId{1U}, 0U, 100U, 500U, 3000UL),   // the source record starts at 500
+            exactRecord(EntityId{3U}, 100U, 100U, 400U, 1000UL), // this sink read data produced earlier
+            exactRecord(EntityId{3U}, 100U, 100U, 500U, 4000UL), // this one is inside the capture
+        };
+        const std::vector<EntityId> chain{EntityId{1U}, EntityId{3U}};
+        const ChainLatency          latency = chainLatency(lateSource, chain);
+        expect(latency.computed >> fatal) << latency.reason;
+        expect(eq(latency.samples, 1UZ)) << "only the sink invocation with a producer in the capture can be timed";
+        expect(eq(latency.unmatched, 1UZ)) << "the one whose producer predates the capture must be counted, not dropped";
+    };
+
+    "the position walk is the default; lockstep must be asked for"_test = [] {
+        // An assumption the caller supplies must never be one they get by accident.
+        const std::vector<Event> strided{
+            exactRecord(EntityId{1U}, 0U, 100U, 0U, 1000UL),   //
+            exactRecord(EntityId{1U}, 0U, 100U, 100U, 3000UL), //
+            exactRecord(EntityId{2U}, 100U, 100U, 0U, 1500UL), // positions outrun the counts
+            exactRecord(EntityId{2U}, 100U, 100U, 150U, 3500UL),
+            exactRecord(EntityId{3U}, 100U, 100U, 0U, 2000UL), //
+            exactRecord(EntityId{3U}, 100U, 100U, 100U, 4000UL),
+        };
+        const std::vector<EntityId> chain{EntityId{1U}, EntityId{2U}, EntityId{3U}};
+
+        const ChainLatency byDefault = chainLatency(strided, chain);
+        expect(!byDefault.computed) << "the default must still refuse a chain it cannot reconstruct exactly";
+        expect(byDefault.reason.find("stride") != std::string::npos) << byDefault.reason;
+
+        // ... and the whole point of the option: lockstep reads no positions, so it reconstructs the
+        // chain the position walk has to decline.
+        const ChainLatency byLockstep = chainLatency(strided, chain, LatencyMode::invocationLockstep);
+        expect(byLockstep.computed >> fatal) << "lockstep needs no positions, so a stride cannot stop it: " << byLockstep.reason;
+        expect(eq(byLockstep.samples, 2UZ));
+        expect(eq(byLockstep.minNs, 1000UL)) << "invocation 0: produced at 1100, consumed at 2100";
+        expect(eq(byLockstep.maxNs, 1000UL)) << "invocation 1: produced at 3100, consumed at 4100";
+    };
+
+    "lockstep refuses a capture that contradicts the assumption"_test = [] {
+        // The sink cannot productively run more often than the source did -- it would be consuming
+        // batches nobody produced. A capture showing that describes a graph the caller has
+        // misunderstood, and pairing anyway would be confident nonsense.
+        const std::vector<Event> sinkRunsMore{
+            exactRecord(EntityId{1U}, 0U, 100U, 0U, 1000UL), //
+            exactRecord(EntityId{3U}, 50U, 50U, 0U, 2000UL), //
+            exactRecord(EntityId{3U}, 50U, 50U, 50U, 3000UL),
+        };
+        const std::vector<EntityId> chain{EntityId{1U}, EntityId{3U}};
+        const ChainLatency          refused = chainLatency(sinkRunsMore, chain, LatencyMode::invocationLockstep);
+        expect(!refused.computed) << "two sink invocations against one source invocation is not lockstep";
+        // The *specific* reason, not merely a refusal. Dropping the count check makes the pairing loop
+        // read past the source records, and whatever it finds there can trip the ordering check
+        // instead -- a refusal with a different cause, which a looser assertion accepts happily.
+        expect(refused.reason.find("the sink ran 2") != std::string::npos) << "the refusal must name the count mismatch it found: " << refused.reason;
+        expect(refused.reason.find("source's 1") != std::string::npos) << refused.reason;
+    };
+
+    "lockstep reports what the capture ended before delivering"_test = [] {
+        // A capture that stops with batches in flight leaves source invocations with no sink
+        // invocation yet. That is expected rather than wrong, so it is reported rather than hidden --
+        // a silently shorter distribution would understate the tail.
+        const std::vector<Event> inFlight{
+            exactRecord(EntityId{1U}, 0U, 100U, 0U, 1000UL),   //
+            exactRecord(EntityId{1U}, 0U, 100U, 100U, 2000UL), //
+            exactRecord(EntityId{1U}, 0U, 100U, 200U, 3000UL), //
+            exactRecord(EntityId{3U}, 100U, 100U, 0U, 1500UL),
+        };
+        const std::vector<EntityId> chain{EntityId{1U}, EntityId{3U}};
+        const ChainLatency          latency = chainLatency(inFlight, chain, LatencyMode::invocationLockstep);
+        expect(latency.computed >> fatal) << latency.reason;
+        expect(eq(latency.samples, 1UZ)) << "only the batch that reached the sink can be timed";
+        expect(eq(latency.unmatched, 2UZ)) << "and the two still in flight must be counted, not dropped";
+    };
+
     "a chain is refused rather than averaged when it cannot be reconstructed"_test = [] {
         DecimatingRun run;
         run.run(categoryMask(Category::workExact));
