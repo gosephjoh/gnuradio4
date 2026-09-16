@@ -312,6 +312,50 @@ const boost::ut::suite<"TraceOracle"> oracleTests = [] {
         reset();
     };
 
+    "the report marks a lossy capture unreliable"_test = [] {
+        reset();
+        setCategories(categoryMask(Category::deadline, Category::release, Category::work));
+        runContended<gr::scheduler::EdfPolicy>(1.0e-6f, 1.0e-6f, 2048U);
+        const std::vector<Event> events = collect();
+
+        expect(fieldOr<bool>(report(events, 0UL), "reliable", false)) << "the same capture is reliable when nothing was lost";
+
+        const gr::property_map lossy = report(events, 3UL);
+        expect(!fieldOr<bool>(lossy, "reliable", true)) << "a capture that dropped records understates every figure in it and must say so";
+        expect(fieldOr<std::string>(lossy, "reliable_reason", std::string{}).contains("evicted")) << "and name the reason rather than merely flagging it";
+
+        setCategories(0U);
+        reset();
+    };
+
+    "the report reports a disagreement rather than splitting the difference"_test = [] {
+        // Built by hand, because the disagreement this detects -- a released job discarded before it
+        // ran -- is what the scheduler does on a re-sync, and provoking it through a graph would make
+        // the test depend on the house-keeping cadence. The arithmetic under test is the comparison,
+        // and a synthetic capture exercises it exactly.
+        //
+        // One release with a 1000 ns deadline, one execution completing 5000 ns later. Reconstruction
+        // therefore sees a miss. No live `deadlineMiss` record accompanies it, as though the marker
+        // had been unable to record one -- which is precisely the asymmetry the cross-check exists to
+        // surface.
+        constexpr std::uint64_t  kRelease = 1'000'000UL;
+        const std::vector<Event> synthetic{
+            Event{.startNs = kRelease, .payload0 = 64U, .payload1 = 1000U, .payload2 = 64U, .entity = 1U, .kind = Kind::jobRelease},
+            Event{.startNs = kRelease + 1000UL, .durationNs = 4000U, .payload0 = 64U, .payload1 = 64U, .entity = 1U, .kind = Kind::workEnd, .flags = flag::kJobBacked},
+        };
+
+        const gr::property_map summary = report(synthetic, 0UL);
+        expect(eq(fieldOr<std::uint64_t>(summary, "misses_reconstructed", 0UL), 1UL) >> fatal) << "a completion 5000 ns after a release with a 1000 ns deadline is late by reconstruction";
+        expect(eq(fieldOr<std::uint64_t>(summary, "misses_live", 99UL), 0UL)) << "and no live record accompanies it in this capture";
+        expect(eq(fieldOr<std::string>(summary, "cross_check", std::string{}), std::string("disagree"))) << "the two methods disagree, and the report must say so";
+        expect(fieldOr<std::string>(summary, "cross_check_reason", std::string{}).contains("discarded")) << "naming the cause a reader should go looking for";
+
+        // The agreeing case, so the check is not simply always reporting disagreement.
+        std::vector<Event> agreeing = synthetic;
+        agreeing.push_back(Event{.startNs = kRelease + 5000UL, .payload0 = 4000U, .payload1 = 5000U, .payload2 = 64U, .entity = 1U, .kind = Kind::deadlineMiss, .flags = flag::kDeadlineMissed});
+        expect(eq(fieldOr<std::string>(report(agreeing, 0UL), "cross_check", std::string{}), std::string("agree"))) << "with the live record present the two agree, and that must be reported too";
+    };
+
     "the report refuses a response-time distribution it cannot support"_test = [] {
         reset();
         setCategories(categoryMask(Category::deadline)); // misses only: no releases to attribute them to

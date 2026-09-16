@@ -682,6 +682,11 @@ const boost::ut::suite<"TraceSchedulingPolicy"> policyMarkerTests = [] {
         expect(eq(empties.back().payload0, 3U)) << "the record carries how many blocks were looked at";
         expect(eq(empties.back().payload1, 0U)) << "and that no selection was made in the pass that found nothing";
 
+        // The other half of the field's range: a pass that selected, drained its ready set and *then*
+        // found nothing is the more informative record, and asserting only the zero case would leave a
+        // count hard-coded to zero indistinguishable from a working one.
+        expect(std::ranges::any_of(empties, [](const Event& e) { return e.payload1 > 0U; })) << "some pass must have made selections before exhausting, or the count is untested above zero";
+
         std::ignore = scheduler.changeStateTo(gr::lifecycle::State::STOPPED);
         setCategories(0U);
         reset();
@@ -1081,6 +1086,87 @@ const boost::ut::suite<"TraceSchedulingPolicy"> policyMarkerTests = [] {
 
         setCategories(0U);
         std::ignore = setRingCapacity(kDefaultRingCapacity);
+        reset();
+    };
+
+    "tracing does not change what an EDF scheduler does"_test = [] {
+        // Section 6 item 2 of the design note, which T2 had left undone. The round-robin scenario
+        // asserts that nothing is *emitted*; this asserts that nothing is *changed*. They are
+        // different claims, and only the second one says the measurements mean anything.
+        //
+        // Asserted on what must not change -- samples delivered and the statuses returned -- never on
+        // selection order, which a bounded pass makes sensitive to timing.
+        const auto runOnce = [](bool traced) {
+            reset();
+            setCategories(traced ? kAllCategories : 0U);
+
+            ContendedGraph                                                                                                               fixture{0.010f, 0.020f};
+            gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::externalStep, gr::profiling::null::Profiler, gr::scheduler::EdfPolicy> scheduler;
+            expect(scheduler.exchange(std::move(fixture.graph)).has_value() >> fatal);
+            expect(scheduler.settings().set({{"max_work_items", gr::Size_t{256U}}}).empty() >> fatal);
+            std::ignore = scheduler.settings().activateContext();
+            std::ignore = scheduler.settings().applyStagedParameters();
+            expect(scheduler.changeStateTo(gr::lifecycle::State::INITIALISED).has_value() >> fatal);
+            expect(scheduler.changeStateTo(gr::lifecycle::State::RUNNING).has_value() >> fatal);
+
+            std::vector<std::underlying_type_t<gr::work::Status>> statuses;
+            std::size_t                                           passes = 0UZ;
+            for (; passes < 256UZ; ++passes) {
+                const gr::work::Result result = scheduler.step();
+                statuses.push_back(std::to_underlying(result.status));
+                if (result.status == gr::work::Status::DONE) {
+                    break;
+                }
+            }
+            std::ignore = scheduler.changeStateTo(gr::lifecycle::State::STOPPED);
+            setCategories(0U);
+            return std::pair{statuses, passes};
+        };
+
+        const auto [untracedStatuses, untracedPasses] = runOnce(false);
+        const auto [tracedStatuses, tracedPasses]     = runOnce(true);
+
+        expect(gt(untracedPasses, 0UZ) >> fatal) << "the graph must actually run, or identical nothing proves nothing";
+        expect(eq(tracedPasses, untracedPasses)) << "tracing must not change how many passes the graph takes to finish";
+        expect(tracedStatuses == untracedStatuses) << "nor the sequence of statuses it returns";
+
+        reset();
+    };
+
+    "the outstanding-job cap is reached through a real graph, not only by hand"_test = [] {
+        // The drop marker exists to profile `max_outstanding_jobs`, and until now it was only ever
+        // reached by calling the release function directly. A marker whose whole purpose is a setting
+        // must be shown to fire when that setting is applied to a scheduler.
+        reset();
+        setCategories(categoryMask(Category::release));
+
+        ContendedGraph                                                                                                               fixture{0.0f, 0.0f};
+        gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::externalStep, gr::profiling::null::Profiler, gr::scheduler::EdfPolicy> scheduler;
+        expect(scheduler.exchange(std::move(fixture.graph)).has_value() >> fatal);
+        // A cap of one, with a batch small enough that a block is eligible again immediately: the
+        // second release for a block that still holds its first has nowhere to go.
+        // The cap alone is not enough: the selection loop drains a block's queue within the pass that
+        // filled it, so nothing is ever outstanding when the next release is attempted. Bounding the
+        // pass to a single selection leaves the other blocks holding jobs across the sweep boundary,
+        // which is when the backstop's next attempt meets a full ring.
+        expect(scheduler.settings().set({{"max_outstanding_jobs", gr::Size_t{1U}}, {"max_work_items", gr::Size_t{64U}}, {"max_selections_per_pass", gr::Size_t{1U}}}).empty() >> fatal);
+        std::ignore = scheduler.settings().activateContext();
+        std::ignore = scheduler.settings().applyStagedParameters();
+        expect(scheduler.changeStateTo(gr::lifecycle::State::INITIALISED).has_value() >> fatal);
+        expect(scheduler.changeStateTo(gr::lifecycle::State::RUNNING).has_value() >> fatal);
+        for (std::size_t pass = 0UZ; pass < 128UZ; ++pass) {
+            if (scheduler.step().status == gr::work::Status::DONE) {
+                break;
+            }
+        }
+
+        const std::vector<Event> dropped = ofKind(Kind::jobReleaseDropped);
+        expect(gt(dropped.size(), 0UZ) >> fatal) << "a cap of one on a graph with data waiting must refuse a release, and that refusal is the only evidence the cap bound";
+        expect(eq(dropped.front().payload1, 1U)) << "the record carries the capacity that bound, which is the setting under test";
+        expect(gt(dropped.back().payload2, 0U)) << "and the running total of refusals";
+
+        std::ignore = scheduler.changeStateTo(gr::lifecycle::State::STOPPED);
+        setCategories(0U);
         reset();
     };
 
