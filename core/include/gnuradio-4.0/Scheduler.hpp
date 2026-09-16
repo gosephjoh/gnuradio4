@@ -1050,15 +1050,41 @@ protected:
             }
         };
 
+        // Releases, and answers whether it did. The queue length is the only honest witness: a
+        // release can happen with the ring already non-empty, so "was empty, now is not" would
+        // undercount. Compiled away entirely when tracing is out, which is why the call is written
+        // twice rather than the count being taken unconditionally.
+        [[maybe_unused]] const auto releaseAndCount = [](BlockModel& block, SchedState& state, std::chrono::steady_clock::time_point now, std::uint8_t pathFlag) -> std::size_t {
+            if constexpr (gr::trace::kEnabled) {
+                const std::size_t before = state.jobs.size;
+                gr::scheduler::releaseIfEligible(block, state, now, pathFlag);
+                return state.jobs.size > before ? 1UZ : 0UZ;
+            } else {
+                gr::scheduler::releaseIfEligible(block, state, now, pathFlag);
+                return 0UZ;
+            }
+        };
+
         // Backstop release pass. Covers what event-driven detection cannot reach: sources, which
         // have no producer to trigger them, and blocks fed across a worker boundary, whose
         // upstream must not write this worker's state. It also catches the event trigger's own
         // misses -- a block that publishes its last samples and returns DONE reports
         // `performed_work == 0` -- so it is load-bearing, not merely a fallback.
         if constexpr (needsReleaseTracking(TPolicy::kPriorityClass)) {
-            const std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
-            for (std::size_t i = 0UZ; i < std::min(blocks.size(), states.size()); ++i) {
-                gr::scheduler::releaseIfEligible(*blocks[i], states[i], now, 0U /* backstop */);
+            const std::chrono::steady_clock::time_point now      = std::chrono::steady_clock::now();
+            const std::size_t                           nScanned = std::min(blocks.size(), states.size());
+
+            // A complete record, and emitted whether or not anything was released. A scan that finds
+            // nothing is the *cost* side of "did event-driven detection earn its keep" -- recording
+            // only the productive scans would make both paths look free and answer the question wrong.
+            [[maybe_unused]] gr::trace::Scope scanScope{gr::trace::Event{.payload0 = gr::trace::saturate(nScanned), .kind = gr::trace::Kind::releaseScan, .workerId = traceWorkerId}};
+            [[maybe_unused]] std::size_t      nReleased = 0UZ;
+
+            for (std::size_t i = 0UZ; i < nScanned; ++i) {
+                nReleased += releaseAndCount(*blocks[i], states[i], now, 0U /* backstop */);
+            }
+            if constexpr (gr::trace::kEnabled) {
+                scanScope.event().payload1 = gr::trace::saturate(nReleased);
             }
         }
 
@@ -1070,16 +1096,26 @@ protected:
                 return;
             }
             const std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
+
+            // `entity` is the producer whose output triggered this walk, where the backstop's scan
+            // carries `kNoEntity`. That is what lets a report attribute a walk's cost to the block
+            // that caused it rather than to the sweep it happened in.
+            [[maybe_unused]] gr::trace::Scope scanScope{gr::trace::Event{.payload0 = gr::trace::saturate(states[producer].successors.size()), .entity = states[producer].entityId, .kind = gr::trace::Kind::releaseScan, .workerId = traceWorkerId, .flags = gr::trace::flag::kViaSuccessorWalk}};
+            [[maybe_unused]] std::size_t      nReleased = 0UZ;
+
             for (std::size_t successor : states[producer].successors) {
                 if (successor < blocks.size() && successor < states.size()) {
                     // The empty-to-non-empty transition is what a heap selector needs to hear about:
                     // a block already holding a job is already in the heap.
                     const bool wasEmpty = states[successor].jobs.empty();
-                    gr::scheduler::releaseIfEligible(*blocks[successor], states[successor], now, gr::trace::flag::kViaSuccessorWalk);
+                    nReleased += releaseAndCount(*blocks[successor], states[successor], now, gr::trace::flag::kViaSuccessorWalk);
                     if (wasEmpty && !states[successor].jobs.empty()) {
                         onNewlyReady(successor);
                     }
                 }
+            }
+            if constexpr (gr::trace::kEnabled) {
+                scanScope.event().payload1 = gr::trace::saturate(nReleased);
             }
         };
 

@@ -4,6 +4,9 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <format>
+#include <map>
 #include <set>
 #include <span>
 #include <string>
@@ -114,6 +117,21 @@ void collectingConsumer(const gr::trace::Event& event, void* user) noexcept { st
         }
     }
     return matching;
+}
+
+/// Writes the capture to `$GR4_TRACE_ARTEFACT_DIR/<name>.gr4trace` when that variable is set.
+///
+/// Unset -- every ordinary run, and CI -- and this is a no-op, so the suite stays hermetic. Capturing
+/// a timeline to look at by hand is an explicit opt-in, which keeps a test that asserts behaviour
+/// from also being a test that depends on a writable directory.
+void exportTimeline([[maybe_unused]] std::string_view name) {
+    if constexpr (gr::trace::kEnabled) {
+        const char* directory = std::getenv("GR4_TRACE_ARTEFACT_DIR");
+        if (directory == nullptr) {
+            return;
+        }
+        std::ignore = gr::trace::dump(std::format("{}/{}.gr4trace", directory, name));
+    }
 }
 
 /// The post-release queue depth, unpacked from the flag byte's high six bits.
@@ -330,6 +348,159 @@ const boost::ut::suite<"TraceSchedulingPolicy"> policyMarkerTests = [] {
         reset();
     };
 
+    "both detection passes are costed, including the ones that find nothing"_test = [] {
+        // The cost side of the ledger T2a's flag opened. "Did event-driven detection earn its keep"
+        // is a ratio -- releases won against scanning done -- and it is only answerable if the
+        // *unproductive* scans are recorded too. A layer that recorded only the productive ones would
+        // make both paths look free and answer the question wrong in the flattering direction.
+        reset();
+        setCategories(categoryMask(Category::release));
+
+        gr::Graph graph;
+        auto&     source = graph.emplaceBlock<gr::testing::ConstantSource<float>>({{"name", std::string("src")}, {"n_samples_max", gr::Size_t{8192U}}});
+        auto&     copy   = graph.emplaceBlock<gr::testing::Copy<float>>({{"name", std::string("mid")}});
+        auto&     sink   = graph.emplaceBlock<gr::testing::NullSink<float>>({{"name", std::string("snk")}});
+        std::ignore      = graph.connect<"out", "in">(source, copy);
+        std::ignore      = graph.connect<"out", "in">(copy, sink);
+
+        gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::externalStep, gr::profiling::null::Profiler, gr::scheduler::EdfPolicy> scheduler;
+        expect(scheduler.exchange(std::move(graph)).has_value() >> fatal);
+        expect(scheduler.changeStateTo(gr::lifecycle::State::INITIALISED).has_value() >> fatal);
+        expect(scheduler.changeStateTo(gr::lifecycle::State::RUNNING).has_value() >> fatal);
+        for (std::size_t pass = 0UZ; pass < 64UZ; ++pass) {
+            if (scheduler.step().status == gr::work::Status::DONE) {
+                break;
+            }
+        }
+
+        std::size_t backstops = 0UZ, walks = 0UZ, barrenWalks = 0UZ, walkReleases = 0UZ;
+        bool        backstopNamedABlock = false, everyWalkNamedItsProducer = true;
+        for (const Event& event : ofKind(Kind::releaseScan)) {
+            if ((event.flags & flag::kViaSuccessorWalk) != 0U) {
+                ++walks;
+                walkReleases += event.payload1;
+                barrenWalks += event.payload1 == 0U ? 1UZ : 0UZ;
+                everyWalkNamedItsProducer = everyWalkNamedItsProducer && event.entity != kNoEntity;
+            } else {
+                ++backstops;
+                backstopNamedABlock = backstopNamedABlock || event.entity != kNoEntity;
+            }
+        }
+
+        expect(gt(backstops, 0UZ) >> fatal) << "the per-sweep backstop must be costed once per sweep";
+        expect(gt(walks, 0UZ) >> fatal) << "and each successor walk costed where it happened";
+        expect(gt(barrenWalks, 0UZ)) << "a walk that releases nothing must still be recorded -- otherwise the cost of event-driven detection is invisible and it looks free";
+        expect(lt(walkReleases, walks)) << "if every walk released something, this graph is not exercising the unproductive path the ratio depends on";
+        expect(everyWalkNamedItsProducer) << "a walk is attributable to the block whose output triggered it";
+        expect(!backstopNamedABlock) << "the backstop scans every block, so it belongs to no single one";
+
+        std::ignore = scheduler.changeStateTo(gr::lifecycle::State::STOPPED);
+        setCategories(0U);
+        reset();
+    };
+
+    "a scan counts what it scanned, and what that produced"_test = [] {
+        reset();
+        setCategories(categoryMask(Category::release));
+
+        gr::Graph graph;
+        auto&     source = graph.emplaceBlock<gr::testing::ConstantSource<float>>({{"name", std::string("src")}, {"n_samples_max", gr::Size_t{2048U}}});
+        auto&     copy   = graph.emplaceBlock<gr::testing::Copy<float>>({{"name", std::string("mid")}});
+        auto&     sink   = graph.emplaceBlock<gr::testing::NullSink<float>>({{"name", std::string("snk")}});
+        std::ignore      = graph.connect<"out", "in">(source, copy);
+        std::ignore      = graph.connect<"out", "in">(copy, sink);
+
+        gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::externalStep, gr::profiling::null::Profiler, gr::scheduler::EdfPolicy> scheduler;
+        expect(scheduler.exchange(std::move(graph)).has_value() >> fatal);
+        expect(scheduler.changeStateTo(gr::lifecycle::State::INITIALISED).has_value() >> fatal);
+        expect(scheduler.changeStateTo(gr::lifecycle::State::RUNNING).has_value() >> fatal);
+        for (std::size_t pass = 0UZ; pass < 32UZ; ++pass) {
+            std::ignore = scheduler.step();
+        }
+
+        const std::vector<Event> scans    = ofKind(Kind::releaseScan);
+        const std::size_t        releases = ofKind(Kind::jobRelease).size();
+        expect(gt(scans.size(), 0UZ) >> fatal);
+
+        std::size_t countedReleases = 0UZ;
+        for (const Event& scan : scans) {
+            expect(le(scan.payload1, scan.payload0)) << "a scan cannot release more blocks than it looked at";
+            countedReleases += scan.payload1;
+            if ((scan.flags & flag::kViaSuccessorWalk) == 0U) {
+                expect(eq(scan.payload0, 3U)) << "the backstop scans every block on the worker, and this graph has three";
+            }
+        }
+        expect(eq(countedReleases, releases)) << "every release must be attributed to exactly one scan -- a mismatch means a release happened on a path nothing is costing";
+
+        std::ignore = scheduler.changeStateTo(gr::lifecycle::State::STOPPED);
+        setCategories(0U);
+        reset();
+    };
+
+    "a job-backed execution is always preceded by the release that admitted it"_test = [] {
+        // The ordering the whole release category rests on: under a job-driven policy a block runs
+        // *because* a job was released for it, so every execution must have a release behind it. If
+        // one did not, the block ran on a job nothing recorded, and every response time computed from
+        // this capture would be attributed to the wrong release.
+        //
+        // This is also the scenario the documentation figure is rendered from, which is why it runs
+        // with work, release and scheduler-loop markers together rather than release alone.
+        reset();
+        setCategories(categoryMask(Category::work, Category::release, Category::schedulerLoop));
+
+        gr::Graph graph;
+        auto&     source = graph.emplaceBlock<gr::testing::ConstantSource<float>>({{"name", std::string("src")}, {"n_samples_max", gr::Size_t{4096U}}});
+        auto&     copy   = graph.emplaceBlock<gr::testing::Copy<float>>({{"name", std::string("mid")}});
+        auto&     sink   = graph.emplaceBlock<gr::testing::NullSink<float>>({{"name", std::string("snk")}});
+        std::ignore      = graph.connect<"out", "in">(source, copy);
+        std::ignore      = graph.connect<"out", "in">(copy, sink);
+
+        gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::externalStep, gr::profiling::null::Profiler, gr::scheduler::EdfPolicy> scheduler;
+        expect(scheduler.exchange(std::move(graph)).has_value() >> fatal);
+
+        // A bounded batch, so the run is many modest invocations rather than two enormous ones. That
+        // is both the regime the batching and RT thrusts target and the one where a release-to-
+        // execution distance is a meaningful number rather than an artefact of a single huge call.
+        expect(scheduler.settings().set({{"max_work_items", gr::Size_t{512U}}}).empty() >> fatal);
+        std::ignore = scheduler.settings().activateContext();
+        std::ignore = scheduler.settings().applyStagedParameters();
+
+        expect(scheduler.changeStateTo(gr::lifecycle::State::INITIALISED).has_value() >> fatal);
+        expect(scheduler.changeStateTo(gr::lifecycle::State::RUNNING).has_value() >> fatal);
+        for (std::size_t pass = 0UZ; pass < 24UZ; ++pass) {
+            if (scheduler.step().status == gr::work::Status::DONE) {
+                break;
+            }
+        }
+
+        // Records come back oldest-first per ring, and this run is single-threaded, so one pass in
+        // order is enough to check that a release precedes the execution it paid for.
+        std::map<EntityId, std::size_t> outstanding;
+        std::size_t                     jobBackedRuns = 0UZ;
+        std::size_t                     unbacked      = 0UZ;
+        for (const Event& event : collect()) {
+            if (event.kind == Kind::jobRelease) {
+                ++outstanding[event.entity];
+            } else if (event.kind == Kind::workEnd && (event.flags & flag::kJobBacked) != 0U) {
+                ++jobBackedRuns;
+                if (outstanding[event.entity] == 0UZ) {
+                    ++unbacked;
+                } else {
+                    --outstanding[event.entity];
+                }
+            }
+        }
+
+        expect(gt(jobBackedRuns, 0UZ) >> fatal) << "an EDF run must execute job-backed work, or this asserts nothing";
+        expect(eq(unbacked, 0UZ)) << "a job-backed execution with no release before it means the trace cannot attribute response times";
+
+        exportTimeline("t2-release-to-execution");
+
+        std::ignore = scheduler.changeStateTo(gr::lifecycle::State::STOPPED);
+        setCategories(0U);
+        reset();
+    };
+
     "a full queue records the drop, and does not record a release"_test = [] {
         Chain chain;
         chain.prime(64UZ);
@@ -408,6 +579,7 @@ const boost::ut::suite<"TraceSchedulingPolicy"> policyMarkerTests = [] {
         expect(gt(collect().size(), 0UZ) >> fatal) << "the run must have traced something, or this asserts nothing";
         expect(eq(ofKind(Kind::jobRelease).size(), 0UZ)) << "round robin has no release tracking to record";
         expect(eq(ofKind(Kind::jobReleaseDropped).size(), 0UZ));
+        expect(eq(ofKind(Kind::releaseScan).size(), 0UZ)) << "and no detection pass to pay for";
 
         setCategories(0U);
         reset();
