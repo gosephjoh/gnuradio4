@@ -389,6 +389,23 @@ inline constexpr double kRatioTolerance = 1e-9; /// the counts are integers, so 
  * latency for the hops that happen to qualify would be a number whose meaning depends on which
  * blocks were excluded.
  */
+/// One sink invocation matched to the source batch that produced the samples it read.
+struct LatencyLink {
+    std::uint64_t producedAt = 0UL; /// when the source batch finished
+    std::uint64_t consumedAt = 0UL; /// when the sink invocation that read it finished
+    std::uint64_t latencyNs  = 0UL;
+    EntityId      producer   = kNoEntity;
+    EntityId      consumer   = kNoEntity;
+    std::uint8_t  producerWorker = 0U;
+    std::uint8_t  consumerWorker = 0U;
+};
+
+struct ChainLinks {
+    bool                     computed = false;
+    std::string              reason;
+    std::vector<LatencyLink> links;
+};
+
 struct ChainLatency {
     bool          computed = false;
     std::string   reason;
@@ -398,11 +415,11 @@ struct ChainLatency {
     std::size_t   samples  = 0UZ;
 };
 
-[[nodiscard]] inline ChainLatency chainLatency(std::span<const Event> events, std::span<const EntityId> chain) {
-    ChainLatency latency;
+[[nodiscard]] inline ChainLinks chainLinks(std::span<const Event> events, std::span<const EntityId> chain) {
+    ChainLinks result;
     if (chain.size() < 2UZ) {
-        latency.reason = "a chain needs at least a source and a sink";
-        return latency;
+        result.reason = "a chain needs at least a source and a sink";
+        return result;
     }
 
     // Every hop's ratio first, so a refusal names the ratio rather than a downstream symptom.
@@ -410,8 +427,8 @@ struct ChainLatency {
     for (std::size_t hop = 0UZ; hop + 1UZ < chain.size(); ++hop) {
         const RatioEstimate estimate = ratioOf(events, chain[hop + 1UZ]);
         if (!estimate.stable && hop + 2UZ < chain.size()) {
-            latency.reason = std::format("entity {} has no stable ratio: {}", chain[hop + 1UZ], estimate.reason);
-            return latency;
+            result.reason = std::format("entity {} has no stable ratio: {}", chain[hop + 1UZ], estimate.reason);
+            return result;
         }
         ratios.push_back(estimate.stable ? estimate.outPerIn : 1.0);
     }
@@ -419,15 +436,10 @@ struct ChainLatency {
     const std::vector<Event> sourceRecords = exactRecordsFor(events, chain.front());
     const std::vector<Event> sinkRecords   = exactRecordsFor(events, chain.back());
     if (sourceRecords.empty() || sinkRecords.empty()) {
-        latency.reason = "the chain's ends left no productive records";
-        return latency;
+        result.reason = "the chain's ends left no productive records";
+        return result;
     }
 
-    // Walk the sink's invocations back to the source sample each one's first input came from. A
-    // middle block records only its *input* position, so its output coordinate is that position
-    // scaled by its ratio -- exact for a fixed-rate hop, which is what the stability gate above
-    // guarantees is the only kind present.
-    std::vector<std::uint64_t> latencies;
     for (const Event& sinkRecord : sinkRecords) {
         // The sink's recorded position is its *input* coordinate, which is the preceding block's
         // output coordinate. Dividing by each intermediate block's ratio walks that coordinate back
@@ -439,13 +451,12 @@ struct ChainLatency {
         double coordinate = static_cast<double>(sinkRecord.payload2);
         for (std::size_t hop = ratios.size() - 1UZ; hop-- > 0UZ;) {
             if (ratios[hop] <= 0.0) {
-                latency.reason = "a hop consumes without producing, so the chain does not carry data through";
-                return latency;
+                result.reason = "a hop consumes without producing, so the chain does not carry data through";
+                return result;
             }
             coordinate /= ratios[hop];
         }
 
-        // The source invocation that produced that output coordinate.
         const Event* producer = nullptr;
         for (const Event& candidate : sourceRecords) {
             const double begin = static_cast<double>(candidate.payload2);
@@ -460,22 +471,49 @@ struct ChainLatency {
         const std::uint64_t producedAt = producer->startNs + producer->durationNs;
         const std::uint64_t consumedAt = sinkRecord.startNs + sinkRecord.durationNs;
         if (consumedAt < producedAt) {
-            latency.reason = "a sample was consumed before it was produced: the capture's clock or its positions are inconsistent";
-            return latency;
+            result.reason = "a sample was consumed before it was produced: the capture's clock or its positions are inconsistent";
+            return result;
         }
-        latencies.push_back(consumedAt - producedAt);
+        result.links.push_back(LatencyLink{.producedAt = producedAt, .consumedAt = consumedAt, .latencyNs = consumedAt - producedAt, //
+            .producer = producer->entity, .consumer = sinkRecord.entity, .producerWorker = producer->workerId, .consumerWorker = sinkRecord.workerId});
     }
 
-    if (latencies.empty()) {
-        latency.reason = "no sink invocation could be matched to a source batch within the capture";
+    if (result.links.empty()) {
+        result.reason = "no sink invocation could be matched to a source batch within the capture";
+        return result;
+    }
+    result.computed = true;
+    return result;
+}
+
+/**
+ * @brief Source-to-sink latency for one chain, by data provenance.
+ *
+ * The chain is supplied rather than discovered: **a capture carries no topology**. `EntityRecord`
+ * has no edge list and no record kind describes one, so nothing in a `.gr4trace` file says which
+ * block feeds which. Inferring it from names or port counts would be a guess dressed as a
+ * measurement.
+ *
+ * Every hop must have a stable ratio, and the whole chain is refused if any hop does not. Partial
+ * latency for the hops that happen to qualify would be a number whose meaning depends on which
+ * blocks were excluded.
+ */
+[[nodiscard]] inline ChainLatency chainLatency(std::span<const Event> events, std::span<const EntityId> chain) {
+    const ChainLinks matched = chainLinks(events, chain);
+    ChainLatency     latency{.computed = matched.computed, .reason = matched.reason};
+    if (!matched.computed) {
         return latency;
     }
-    std::ranges::sort(latencies);
-    latency.computed = true;
-    latency.samples  = latencies.size();
-    latency.minNs    = latencies.front();
-    latency.maxNs    = latencies.back();
-    latency.medianNs = latencies[latencies.size() / 2UZ];
+    std::vector<std::uint64_t> values;
+    values.reserve(matched.links.size());
+    for (const LatencyLink& link : matched.links) {
+        values.push_back(link.latencyNs);
+    }
+    std::ranges::sort(values);
+    latency.samples  = values.size();
+    latency.minNs    = values.front();
+    latency.maxNs    = values.back();
+    latency.medianNs = values[values.size() / 2UZ];
     return latency;
 }
 

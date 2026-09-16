@@ -15,6 +15,7 @@
 
 #include <gnuradio-4.0/Trace.hpp>
 #include <gnuradio-4.0/TraceFile.hpp>
+#include <gnuradio-4.0/TraceReport.hpp> // chainLinks, for the flow arrows
 
 /**
  * @brief Converts a capture to Catapult (Chrome) trace JSON, which Perfetto ingests natively.
@@ -122,7 +123,17 @@ namespace detail {
  * first and dividing afterwards keeps nanosecond resolution: a `double` represents every integer up
  * to 2^53 exactly, which is a hundred days of nanoseconds.
  */
-[[nodiscard]] inline std::string catapultJson(const Capture& capture) {
+/**
+ * `chain` is optional. Supplied, each sink invocation is joined to the source batch that produced the
+ * samples it read by a Catapult **flow** — a start/finish pair sharing an `id`, which Perfetto draws
+ * as an arrow between the two spans. That turns the latency from a number in a report into something
+ * traceable in the UI.
+ *
+ * It has to be supplied because a capture carries no topology (`chainLinks`). A chain whose ratios
+ * cannot be reconstructed produces **no arrows at all** rather than partial ones: a timeline showing
+ * some links and not others reads as "these are the slow paths" rather than "this was refused".
+ */
+[[nodiscard]] inline std::string catapultJson(const Capture& capture, std::span<const EntityId> chain = {}) {
     std::map<EntityId, std::string> names;
     for (const LoadedEntity& entity : capture.entities) {
         names[entity.id] = entity.uniqueName;
@@ -193,8 +204,25 @@ namespace detail {
         }
     }
 
+    // Flow arrows last: an `id` ties the "s" to its "f", and Perfetto binds each end to the span it
+    // lands inside, so they must follow the spans they attach to.
+    std::size_t arrows = 0UZ;
+    if (!chain.empty()) {
+        const ChainLinks matched = chainLinks(capture.events, chain);
+        for (const LatencyLink& link : matched.links) {
+            const std::string flowName = std::format("latency {} ns", link.latencyNs);
+            comma();
+            out += std::format(R"({{"name":"{}","cat":"latency","ph":"s","id":{},"ts":{:.3f},"pid":{},"tid":{}}})", //
+                detail::escape(flowName), arrows, micros(link.producedAt), pid, link.producerWorker);
+            comma();
+            out += std::format(R"({{"name":"{}","cat":"latency","ph":"f","bp":"e","id":{},"ts":{:.3f},"pid":{},"tid":{}}})", //
+                detail::escape(flowName), arrows, micros(link.consumedAt), pid, link.consumerWorker);
+            ++arrows;
+        }
+    }
+
     out += R"(],"displayTimeUnit":"ns")";
-    out += std::format(R"(,"otherData":{{"lostRecords":"{}","categoryMask":"{}","clockCostNs":"{}"}}}})", capture.header.lostCount, capture.header.categoryMask, capture.header.clockCostNs);
+    out += std::format(R"(,"otherData":{{"lostRecords":"{}","categoryMask":"{}","clockCostNs":"{}","latencyFlows":"{}"}}}})", capture.header.lostCount, capture.header.categoryMask, capture.header.clockCostNs, arrows);
     return out;
 }
 

@@ -1,5 +1,8 @@
 #include <boost/ut.hpp>
 
+#include <cstdlib>
+#include <format>
+
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -14,6 +17,7 @@
 #include <gnuradio-4.0/Graph.hpp>
 #include <gnuradio-4.0/Scheduler.hpp>
 #include <gnuradio-4.0/Trace.hpp>
+#include <gnuradio-4.0/TraceCatapult.hpp>
 #include <gnuradio-4.0/TraceReport.hpp>
 
 #include <gnuradio-4.0/testing/NullSources.hpp>
@@ -51,6 +55,18 @@ struct Decimator : public gr::Block<Decimator<T>, gr::Resampling<>> {
     }
 };
 
+/// Writes the capture to `$GR4_TRACE_ARTEFACT_DIR/<name>.gr4trace` when that variable is set, and
+/// does nothing otherwise, so the suite stays hermetic and writes nothing in an ordinary run.
+void exportTimeline([[maybe_unused]] std::string_view name) {
+    if constexpr (gr::trace::kEnabled) {
+        const char* directory = std::getenv("GR4_TRACE_ARTEFACT_DIR");
+        if (directory == nullptr || name.empty()) {
+            return;
+        }
+        std::ignore = gr::trace::dump(std::format("{}/{}.gr4trace", directory, name));
+    }
+}
+
 void collectingConsumer(const gr::trace::Event& event, void* user) noexcept { static_cast<std::vector<gr::trace::Event>*>(user)->push_back(event); }
 
 [[nodiscard]] std::vector<gr::trace::Event> collect() {
@@ -82,6 +98,8 @@ struct DecimatingRun {
     /// `batchCap` is not decoration: left unset, the whole stream moves in a *single* `work()` call
     /// and there is no second record to compare a position against. Capping it is what makes the
     /// stream coordinate observable at all.
+    std::string artefact; /// non-empty exports the capture when GR4_TRACE_ARTEFACT_DIR is set
+
     void run(std::uint32_t categories, std::size_t nSamples = 4096UZ, gr::Size_t batchCap = 512U) {
         gr::trace::reset();
         gr::trace::setCategories(categories);
@@ -117,6 +135,7 @@ struct DecimatingRun {
         std::ignore = scheduler.changeStateTo(gr::lifecycle::State::STOPPED);
 
         events = collect();
+        exportTimeline(artefact);
         gr::trace::setCategories(0U);
     }
 };
@@ -473,7 +492,8 @@ const boost::ut::suite<"TraceBlock"> traceBlockTests = [] {
 
     "end-to-end latency matches a chain whose answer is known"_test = [] {
         DecimatingRun run;
-        run.run(categoryMask(Category::workExact));
+        run.artefact = "t4-latency-chain";
+        run.run(categoryMask(Category::work, Category::workExact, Category::workPhases));
 
         const std::vector<EntityId> chain{run.source, run.decimator, run.sink};
         const ChainLatency          latency = chainLatency(run.events, chain);
@@ -594,6 +614,58 @@ const boost::ut::suite<"TraceBlock"> traceBlockTests = [] {
         const ChainLatency          refused = chainLatency(events, chain);
         expect(!refused.computed) << "an unstable middle hop must refuse the chain";
         expect(refused.reason.find("stable") != std::string::npos) << refused.reason;
+    };
+
+    "a chain becomes flow arrows a viewer can follow"_test = [] {
+        DecimatingRun run;
+        run.run(categoryMask(Category::work, Category::workExact));
+
+        Capture capture;
+        capture.events = run.events;
+
+        const std::string without = catapultJson(capture);
+        expect(without.find(R"("ph":"s")") == std::string::npos) << "no chain means no arrows: the converter must not invent a topology";
+        expect(without.find(R"("latencyFlows":"0")") != std::string::npos) << "and must say it emitted none";
+
+        const std::vector<EntityId> chain{run.source, run.decimator, run.sink};
+        const std::string           with = catapultJson(capture, chain);
+        expect(with.find(R"("ph":"s")") != std::string::npos >> fatal) << "a reconstructable chain must produce flow starts";
+        expect(with.find(R"("ph":"f")") != std::string::npos) << "and the finishes that close them";
+        expect(with.find(R"("cat":"latency")") != std::string::npos);
+
+        // Every arrow is a start and a finish sharing an id, so the two counts must agree -- a
+        // dangling start is an arrow Perfetto silently drops.
+        const auto occurrences = [](const std::string& text, std::string_view needle) {
+            std::size_t count = 0UZ;
+            for (std::size_t at = text.find(needle); at != std::string::npos; at = text.find(needle, at + needle.size())) {
+                ++count;
+            }
+            return count;
+        };
+        const std::size_t starts   = occurrences(with, R"("ph":"s")");
+        const std::size_t finishes = occurrences(with, R"("ph":"f")");
+        expect(eq(starts, finishes)) << "every flow start must have a finish";
+
+        const ChainLatency latency = chainLatency(run.events, chain);
+        expect(latency.computed >> fatal);
+        expect(eq(starts, latency.samples)) << "one arrow per matched sample, so the picture and the report agree";
+        expect(with.find(std::format(R"("latencyFlows":"{}")", latency.samples)) != std::string::npos) << "and the count is stated in the file";
+    };
+
+    "a refused chain draws no arrows rather than some"_test = [] {
+        // Half a picture is worse than none: arrows for the hops that happened to reconstruct read
+        // as "these are the slow paths" rather than as "this chain was refused".
+        Capture capture;
+        capture.events = std::vector<Event>{
+            exactRecord(EntityId{1U}, 0U, 400U, 0U, 1000UL),   //
+            exactRecord(EntityId{2U}, 400U, 100U, 0U, 2000UL), //
+            exactRecord(EntityId{2U}, 400U, 200U, 400U, 3000UL),
+            exactRecord(EntityId{3U}, 100U, 100U, 0U, 4000UL),
+        };
+        const std::vector<EntityId> chain{EntityId{1U}, EntityId{2U}, EntityId{3U}};
+        const std::string           json = catapultJson(capture, chain);
+        expect(json.find(R"("ph":"s")") == std::string::npos) << "an unstable middle hop must produce no arrows at all";
+        expect(json.find(R"("latencyFlows":"0")") != std::string::npos);
     };
 
     "the block-side markers do not change what a block does"_test = [] {

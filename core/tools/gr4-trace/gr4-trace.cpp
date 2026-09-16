@@ -2,6 +2,8 @@
 #include <cstdlib>
 #include <fstream>
 #include <print>
+#include <optional>
+#include <algorithm>
 #include <span>
 #include <string>
 #include <string_view>
@@ -66,7 +68,8 @@ int usage() {
     std::println(stderr, "usage: gr4-trace <command> <capture.gr4trace> [output]");
     std::println(stderr, "");
     std::println(stderr, "  report    <capture>            per-block cost, jitter and marginal-cost fit");
-    std::println(stderr, "  catapult  <capture> <out.json> Chrome trace JSON, for ui.perfetto.dev");
+    std::println(stderr, "  catapult  <capture> <out.json> [block ...] Chrome trace JSON, for ui.perfetto.dev");
+    std::println(stderr, "            naming a source-to-sink chain adds latency flow arrows");
     std::println(stderr, "  summary   <capture>            header fields and a record census");
     return 2;
 }
@@ -147,13 +150,56 @@ int commandReport(const Capture& capture) {
     return 0;
 }
 
-int commandCatapult(const Capture& capture, const std::string& outputPath) {
+/// Resolves block names to interned ids, so a chain is given as names rather than ids a user would
+/// have to look up first.
+///
+/// Matched as a **substring** of the unique name, because that name is type-derived -- a block the
+/// user called "src" is recorded as `gr::testing::ConstantSource<float32>#16` -- so requiring the
+/// whole thing would mean copying it out of a report first. An ambiguous or unknown name is an error
+/// rather than a silently wrong chain: picking the first of two matches would produce a latency for
+/// a path the user did not ask about.
+[[nodiscard]] std::optional<std::vector<EntityId>> resolveChain(const Capture& capture, std::span<const std::string_view> names) {
+    std::vector<EntityId> chain;
+    for (const std::string_view name : names) {
+        std::vector<const LoadedEntity*> matches;
+        for (const LoadedEntity& entity : capture.entities) {
+            if (entity.uniqueName.find(name) != std::string::npos) {
+                matches.push_back(&entity);
+            }
+        }
+        if (matches.empty()) {
+            std::println(stderr, "gr4-trace: no block matching '{}' in this capture", name);
+            return std::nullopt;
+        }
+        if (matches.size() > 1UZ) {
+            std::println(stderr, "gr4-trace: '{}' matches {} blocks; name one of them more precisely:", name, matches.size());
+            for (const LoadedEntity* entity : matches) {
+                std::println(stderr, "  {}", entity->uniqueName);
+            }
+            return std::nullopt;
+        }
+        chain.push_back(matches.front()->id);
+    }
+    return chain;
+}
+
+int commandCatapult(const Capture& capture, const std::string& outputPath, std::span<const EntityId> chain) {
     std::ofstream out(outputPath, std::ios::binary | std::ios::trunc);
     if (!out.is_open()) {
         std::println(stderr, "gr4-trace: cannot open '{}' for writing", outputPath);
         return 1;
     }
-    const std::string json = catapultJson(capture);
+    const std::string json = catapultJson(capture, chain);
+    if (!chain.empty()) {
+        // Said out loud, because a chain that could not be reconstructed produces a timeline that
+        // looks exactly like one that was never asked for.
+        const ChainLatency latency = chainLatency(capture.events, chain);
+        if (latency.computed) {
+            std::println("latency over {} samples: min {} ns, median {} ns, max {} ns", latency.samples, latency.minNs, latency.medianNs, latency.maxNs);
+        } else {
+            std::println("no flow arrows: {}", latency.reason);
+        }
+    }
     out.write(json.data(), static_cast<std::streamsize>(json.size()));
     out.flush();
     if (!out.good()) {
@@ -196,7 +242,16 @@ int main(int argc, char** argv) {
             std::println(stderr, "gr4-trace catapult needs an output path");
             return usage();
         }
-        return commandCatapult(*capture, std::string(args[3]));
+        std::vector<EntityId> chain;
+        if (args.size() > 4UZ) {
+            const std::vector<std::string_view> names(args.begin() + 4, args.end());
+            const auto                          resolved = resolveChain(*capture, names);
+            if (!resolved.has_value()) {
+                return 1;
+            }
+            chain = *resolved;
+        }
+        return commandCatapult(*capture, std::string(args[3]), chain);
     }
     std::println(stderr, "gr4-trace: unknown command '{}'", command);
     return usage();
