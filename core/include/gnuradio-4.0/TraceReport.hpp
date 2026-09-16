@@ -440,6 +440,21 @@ struct ChainLatency {
         return result;
     }
 
+    // The search below is a binary one, which needs the source's positions ordered. They are, for any
+    // capture worth reconstructing -- a source's output position advances with time -- so a sequence
+    // that is not ordered has wrapped or is discontinuous, and that is refused for the same reason
+    // `ratioOf` refuses it: a wrap and a gap are indistinguishable in 32 bits.
+    //
+    // Linear search here would be O(sinks x sources). The ring holds 65 536 records per thread by
+    // default and its ceiling is configurable to 4 GiB, so that product reaches the billions on a
+    // capture the layer is explicitly built to take.
+    for (std::size_t i = 1UZ; i < sourceRecords.size(); ++i) {
+        if (sourceRecords[i].payload2 < sourceRecords[i - 1UZ].payload2) {
+            result.reason = "the source's stream positions do not advance: a 32-bit wrap or a discontinuity";
+            return result;
+        }
+    }
+
     for (const Event& sinkRecord : sinkRecords) {
         // The sink's recorded position is its *input* coordinate, which is the preceding block's
         // output coordinate. Dividing by each intermediate block's ratio walks that coordinate back
@@ -457,17 +472,18 @@ struct ChainLatency {
             coordinate /= ratios[hop];
         }
 
-        const Event* producer = nullptr;
-        for (const Event& candidate : sourceRecords) {
-            const double begin = static_cast<double>(candidate.payload2);
-            if (coordinate >= begin && coordinate < begin + static_cast<double>(candidate.payload1)) {
-                producer = &candidate;
-                break;
-            }
+        // The last batch that began at or before this coordinate is the only one that can contain
+        // it, because the batches are contiguous and ordered.
+        const auto after = std::ranges::partition_point(sourceRecords, [coordinate](const Event& candidate) { return static_cast<double>(candidate.payload2) <= coordinate; });
+        if (after == sourceRecords.begin()) {
+            continue; // produced before the capture opened; not an error, just unmatched
         }
-        if (producer == nullptr) {
-            continue; // the producing batch is outside the capture; not an error, just unmatched
+        const Event& candidate = *std::prev(after);
+        const double begin     = static_cast<double>(candidate.payload2);
+        if (coordinate >= begin + static_cast<double>(candidate.payload1)) {
+            continue; // falls in a gap between batches, so nothing in this capture produced it
         }
+        const Event* producer = &candidate;
         const std::uint64_t producedAt = producer->startNs + producer->durationNs;
         const std::uint64_t consumedAt = sinkRecord.startNs + sinkRecord.durationNs;
         if (consumedAt < producedAt) {
