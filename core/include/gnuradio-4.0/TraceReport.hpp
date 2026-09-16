@@ -517,6 +517,26 @@ struct ChainLatency {
     return latency;
 }
 
+/**
+ * Whether an entity is a fused group rather than a single block.
+ *
+ * A `Merge<>` unit is one `BlockModel` and therefore one identity with one set of markers; its
+ * internal stages are invisible by construction. That is correct -- the merged group is the
+ * schedulable grain -- but a report that prints the group under a block's heading invites exactly
+ * the wrong conclusion about where the time went.
+ *
+ * Keyed on the recorded type name because nothing else in a capture distinguishes the two: the trace
+ * layer sees a `BlockModel`, and fusion is a compile-time property of the type behind it. `Merge` and
+ * `FeedbackMerge` are aliases for `gr::MergeByIndex` and `gr::FeedbackMergeByIndex`, and an alias
+ * does not survive into a type name, so the framework spelling is what a capture actually holds.
+ */
+[[nodiscard]] inline bool isFusedGroup(std::string_view typeName) noexcept { return typeName.find("MergeByIndex<") != std::string_view::npos; }
+
+[[nodiscard]] inline std::string entityTypeName(EntityId id, std::span<const LoadedEntity> entities) {
+    const auto found = std::ranges::find_if(entities, [id](const LoadedEntity& e) { return e.id == id; });
+    return found != entities.end() ? found->typeName : std::string{};
+}
+
 [[nodiscard]] inline std::string entityLabel(EntityId id, std::span<const LoadedEntity> entities) {
     const auto found = std::ranges::find_if(entities, [id](const LoadedEntity& e) { return e.id == id; });
     return found != entities.end() ? found->uniqueName : std::format("entity {}", id);
@@ -589,6 +609,14 @@ struct ChainLatency {
             } else {
                 block["ratio_reason"] = ratio.reason;
             }
+        }
+
+        // Named as what it is. A fused group's internal stages left no markers, so a reader must not
+        // take these numbers for one block's.
+        const std::string typeName = entityTypeName(entity, entities);
+        block["grain"]             = std::string(isFusedGroup(typeName) ? "fused-group" : "block");
+        if (isFusedGroup(typeName)) {
+            block["grain_note"] = std::string("stages inside a fused group emit no markers; these figures cover the group as a whole");
         }
 
         perBlock[entityLabel(entity, entities)] = std::move(block);

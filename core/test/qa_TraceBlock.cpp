@@ -14,6 +14,7 @@
 #include <vector>
 
 #include <gnuradio-4.0/Block.hpp>
+#include <gnuradio-4.0/BlockMerging.hpp>
 #include <gnuradio-4.0/Graph.hpp>
 #include <gnuradio-4.0/Scheduler.hpp>
 #include <gnuradio-4.0/Trace.hpp>
@@ -143,6 +144,11 @@ struct DecimatingRun {
 /// One hand-built `workExact` record. The refusal paths cannot be reached from a healthy graph --
 /// a real chain has a stable ratio and positions that match its counts -- so they are driven from
 /// constructed records, the same way `qa_TraceReport.cpp` drives its fit gates.
+/// One scheduler-side invocation, so `timingReport` has something to fold.
+[[nodiscard]] gr::trace::Event invocationOf(gr::trace::EntityId entity, std::uint32_t performedWork, std::uint32_t durationNs) {
+    return gr::trace::Event{.durationNs = durationNs, .payload0 = performedWork, .payload1 = performedWork, .entity = entity, .kind = gr::trace::Kind::workEnd};
+}
+
 [[nodiscard]] gr::trace::Event exactRecord(gr::trace::EntityId entity, std::uint32_t processedIn, std::uint32_t processedOut, std::uint32_t position, std::uint64_t startNs = 0UL) {
     return gr::trace::Event{.startNs = startNs, .durationNs = 100U, .payload0 = processedIn, .payload1 = processedOut, .payload2 = position, .entity = entity, .kind = gr::trace::Kind::workExact};
 }
@@ -666,6 +672,38 @@ const boost::ut::suite<"TraceBlock"> traceBlockTests = [] {
         const std::string           json = catapultJson(capture, chain);
         expect(json.find(R"("ph":"s")") == std::string::npos) << "an unstable middle hop must produce no arrows at all";
         expect(json.find(R"("latencyFlows":"0")") != std::string::npos);
+    };
+
+    "a fused group is named as a group, not as a block"_test = [] {
+        // A Merge<> unit is one BlockModel, so it interns once and its internal stages emit nothing.
+        // The figures are the group's, and a report that labelled them a block's would invite exactly
+        // the wrong conclusion about where the time went.
+        expect(isFusedGroup("gr::MergeByIndex<gr::testing::Copy<float>, 0, gr::testing::Copy<float>, 0>"));
+        expect(isFusedGroup("gr::FeedbackMergeByIndex<A, 0, B, 0>")) << "the feedback form is a fused group too";
+        expect(!isFusedGroup("gr::testing::Copy<float32>")) << "an ordinary block is not a group";
+        expect(!isFusedGroup("")) << "an entity with no recorded type name is not a group by default";
+        // The match has to be the framework's type, not the word. A user block whose own name happens
+        // to contain "Merge" is an ordinary block, and labelling it a group would tell a reader its
+        // internals are invisible when they were never fused in the first place.
+        expect(!isFusedGroup("acme::MergeSortFilter<float>")) << "a user type containing the word is still one block";
+        expect(!isFusedGroup("acme::Merge<float>")) << "and so is one that shares the alias name without being the framework type";
+
+        // And the key reaches the report, keyed off what a capture actually records.
+        const std::vector<Event>        events{exactRecord(EntityId{1U}, 100U, 100U, 0U), invocationOf(EntityId{1U}, 100U, 500U)};
+        const std::vector<LoadedEntity> fused{LoadedEntity{.id = EntityId{1U}, .uniqueName = "merged#1", .typeName = "gr::MergeByIndex<A, 0, B, 0>"}};
+        const gr::property_map          reportMap = timingReport(events, fused);
+
+        const auto             blocksIt    = reportMap.find("blocks");
+        expect((blocksIt != reportMap.end()) >> fatal);
+        const gr::pmt::Value   blocksValue = (*blocksIt).second;
+        const gr::property_map blocks      = blocksValue.value_or(gr::property_map{});
+        const auto             blockIt     = blocks.find("merged#1");
+        expect((blockIt != blocks.end()) >> fatal) << "the group must appear under its own name";
+        const gr::pmt::Value   blockValue = (*blockIt).second;
+        const gr::property_map block      = blockValue.value_or(gr::property_map{});
+        const auto             grainIt    = block.find("grain");
+        expect((grainIt != block.end()) >> fatal) << "every entry must say what grain it describes";
+        expect(eq((*grainIt).second.value_or(std::string{}), std::string("fused-group")));
     };
 
     "the block-side markers do not change what a block does"_test = [] {
