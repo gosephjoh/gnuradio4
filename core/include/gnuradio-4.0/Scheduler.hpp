@@ -1056,6 +1056,9 @@ protected:
         // that answers it. Round robin has no bound and never calls this, so it compiles nothing.
         [[maybe_unused]] const auto traceSelectionBoundHit = [&](std::size_t boundValue, std::size_t blockCount) {
             if constexpr (gr::trace::kEnabled) {
+                if (!gr::trace::categoryEnabled(gr::trace::Category::select)) {
+                    return;
+                }
                 gr::trace::emit(gr::trace::Event{.startNs = gr::trace::now(),
                     .payload0                             = gr::trace::saturate(boundValue),
                     .payload1                             = gr::trace::saturate(blockCount), //
@@ -1271,6 +1274,13 @@ protected:
             [[maybe_unused]] bool       staleSkipped = false;
             [[maybe_unused]] const auto traceSelect  = [&](std::size_t chosen, std::size_t readySetSize, std::size_t heapPopulation, std::uint8_t pathFlag) {
                 if constexpr (gr::trace::kEnabled) {
+                    // The category is tested *before* the clock is read, not left to `emit()`. A clock
+                    // read is an argument, so it is evaluated whether or not the record is wanted --
+                    // and selections are the one marker whose own category is off by default because
+                    // of its rate, which would be pointless if the cost stayed on with it.
+                    if (!gr::trace::categoryEnabled(gr::trace::Category::select)) {
+                        return;
+                    }
                     gr::trace::emit(gr::trace::Event{.startNs = gr::trace::now(),
                          .payload0                             = gr::trace::saturate(readySetSize),
                          .payload1                             = gr::trace::saturate(selections),
@@ -1287,6 +1297,9 @@ protected:
             // worker is at parity with it is an argument until this is counted.
             [[maybe_unused]] const auto traceSelectEmpty = [&] {
                 if constexpr (gr::trace::kEnabled) {
+                    if (!gr::trace::categoryEnabled(gr::trace::Category::select)) {
+                        return;
+                    }
                     gr::trace::emit(gr::trace::Event{.startNs = gr::trace::now(),
                         .payload0                             = gr::trace::saturate(nBlocks),
                         .payload1                             = gr::trace::saturate(selections), //
@@ -1309,16 +1322,22 @@ protected:
                     if (!gr::trace::categoryEnabled(gr::trace::Category::deadline) || states[chosen].jobs.empty()) {
                         return;
                     }
-                    const Job&                                  job        = states[chosen].jobs.front();
-                    const std::chrono::steady_clock::time_point completion = std::chrono::steady_clock::now();
+                    const Job& job = states[chosen].jobs.front();
 
-                    // Recomputed here rather than carried on the job: a relative deadline larger than
-                    // the clock's range makes `absoluteDeadline` the result of an out-of-range
-                    // double-to-integer conversion, which is undefined behaviour and not a value any
-                    // comparison against it can be trusted to have produced.
+                    // Both cheap tests come first, so a graph that sets no deadline -- the default --
+                    // pays no clock read to discover there is nothing to report.
                     const bool suspect = states[chosen].relativeDeadlineSeconds > kMaxRepresentableDeadlineSeconds;
                     const bool unset   = job.absoluteDeadline == std::chrono::steady_clock::time_point::max();
-                    if (!suspect && (unset || completion <= job.absoluteDeadline)) {
+                    if (unset && !suspect) {
+                        return;
+                    }
+                    const std::chrono::steady_clock::time_point completion = std::chrono::steady_clock::now();
+
+                    // `suspect` is recomputed here rather than carried on the job: a relative deadline
+                    // larger than the clock's range makes `absoluteDeadline` the result of an
+                    // out-of-range double-to-integer conversion, which is undefined behaviour and not
+                    // a value any comparison against it can be trusted to have produced.
+                    if (!suspect && completion <= job.absoluteDeadline) {
                         return;
                     }
 

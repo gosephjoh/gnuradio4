@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <deque>
 #include <map>
 #include <span>
 #include <string>
@@ -55,16 +56,20 @@ namespace detail {
     out["records"] = events.size();
     out["lost"]    = lostRecords;
 
-    std::vector<std::uint64_t>                                               lateness;
-    std::vector<std::uint64_t>                                               liveResponse;
-    std::uint64_t                                                            suspect       = 0UL;
-    std::uint64_t                                                            saturatedLate = 0UL;
-    std::map<EntityId, std::vector<std::pair<std::uint64_t, std::uint32_t>>> released; // release instant, relative deadline
-    std::vector<std::uint64_t>                                               reconstructedResponse;
-    std::uint64_t                                                            reconstructedLate = 0UL;
-    std::uint64_t                                                            executions        = 0UL;
-    bool                                                                     sawRelease        = false;
-    bool                                                                     sawWork           = false;
+    std::vector<std::uint64_t> lateness;
+    std::vector<std::uint64_t> liveResponse;
+    std::uint64_t              suspect       = 0UL;
+    std::uint64_t              saturatedLate = 0UL;
+    std::uint64_t              liveMisses    = 0UL;
+    // A deque, not a vector: releases are consumed from the front, and `erase(begin())` on a vector
+    // is linear per pairing and quadratic per block -- invisible on a test capture, ruinous on a real
+    // one.
+    std::map<EntityId, std::deque<std::pair<std::uint64_t, std::uint32_t>>> released; // release instant, relative deadline
+    std::vector<std::uint64_t>                                              reconstructedResponse;
+    std::uint64_t                                                           reconstructedLate = 0UL;
+    std::uint64_t                                                           executions        = 0UL;
+    bool                                                                    sawRelease        = false;
+    bool                                                                    sawWork           = false;
 
     for (const Event& event : events) {
         switch (event.kind) {
@@ -73,7 +78,15 @@ namespace detail {
                 ++suspect;
                 break;
             }
-            saturatedLate += event.payload0 == kSaturated ? 1UL : 0UL;
+            // A saturated lateness means "at least 4.29 s, by an unknown margin". Counting it *and*
+            // admitting it to the distribution is the worst of both: the maximum then reads as exactly
+            // the sentinel and the median is dragged by a number that is not a measurement. It is
+            // counted as a miss, and `tardiness_samples` says how many the distribution could include.
+            ++liveMisses;
+            if (event.payload0 == kSaturated) {
+                ++saturatedLate;
+                break;
+            }
             lateness.push_back(event.payload0);
             liveResponse.push_back(event.payload1);
             break;
@@ -92,7 +105,7 @@ namespace detail {
                 break; // no release to pair with: counted as an execution, contributes no response time
             }
             const auto [releaseNs, relativeDeadlineNs] = queue->second.front();
-            queue->second.erase(queue->second.begin());
+            queue->second.pop_front();
             const std::uint64_t completion = event.startNs + event.durationNs;
             if (completion < releaseNs) {
                 break; // clocks disagree; refuse the sample rather than record a negative wait
@@ -108,9 +121,10 @@ namespace detail {
         }
     }
 
-    out["deadline_misses"]     = lateness.size();
+    out["deadline_misses"]     = liveMisses;
     out["deadline_suspect"]    = suspect;
     out["tardiness_saturated"] = saturatedLate;
+    out["tardiness_samples"]   = lateness.size(); // fewer than `deadline_misses` where any saturated
     if (!lateness.empty()) {
         out["tardiness_max_ns"]    = *std::ranges::max_element(lateness);
         out["tardiness_median_ns"] = detail::percentileOf(lateness, 0.5);
@@ -136,10 +150,13 @@ namespace detail {
     // Both methods present: they must agree, and a disagreement names a cause rather than splitting
     // the difference. Reconstruction alone cannot see a job discarded before it ran; the live record
     // cannot exist for a job that never ran. That asymmetry is exactly what the comparison detects.
-    if (sawRelease && sawWork && (!lateness.empty() || reconstructedLate > 0UL)) {
-        out["misses_live"]          = lateness.size();
+    // Both methods ran, so both can be compared -- including when both found nothing. Agreement on
+    // zero is the common healthy outcome and the one a reader most wants confirmed; calling it
+    // "unavailable" would hide the check exactly when it succeeded.
+    if (sawRelease && sawWork) {
+        out["misses_live"]          = liveMisses;
         out["misses_reconstructed"] = reconstructedLate;
-        const bool agree            = reconstructedLate == lateness.size();
+        const bool agree            = reconstructedLate == liveMisses;
         out["cross_check"]          = std::string(agree ? "agree" : "disagree");
         if (!agree) {
             out["cross_check_reason"] = std::string("live and reconstructed miss counts differ; a released job was discarded before running, or records were lost");
