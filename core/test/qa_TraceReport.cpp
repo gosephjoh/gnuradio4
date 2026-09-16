@@ -159,6 +159,174 @@ const boost::ut::suite<"TraceReport"> reportTests = [] {
         expect(ge(fieldOr<std::uint64_t>(block, "wcet_ns", 0UL), static_cast<std::uint64_t>(fieldOr<double>(block, "acet_ns", 0.0)))) << "the worst case cannot be below the average";
     };
 
+    "the fit recovers a cost model it was never told"_test = [] {
+        // The gate for this milestone. Until a fit is shown to recover a *known* answer, every number
+        // downstream of it is unverified arithmetic that happens to look reasonable. The per-bucket
+        // minimum is the exact model value by construction here, so the recovery should be tight.
+        constexpr std::uint64_t kIntercept = 800UL;
+        constexpr double        kSlope     = 3.0;
+
+        TimingAccumulator accumulator;
+        for (const Event& event : fromCostModel(1U, kIntercept, kSlope, {64U, 256U, 1024U, 4096U, 16384U})) {
+            accumulator.fold(event);
+        }
+        const Fit fit = fitCost(accumulator.blocks.at(1U));
+
+        expect(fit.identifiable >> fatal) << "five well-separated batch sizes are as identifiable as this gets: " << fit.reason;
+        expect(lt(std::abs(fit.slopeNsPerItem - kSlope), 0.05)) << std::format("slope {:.4f} should be {:.4f} ns per item", fit.slopeNsPerItem, kSlope);
+        expect(lt(std::abs(fit.interceptNs - static_cast<double>(kIntercept)), 50.0)) << std::format("intercept {:.1f} should be {} ns", fit.interceptNs, kIntercept);
+        expect(lt(fit.residualRms, kMaxFitResidual)) << "and the line must describe the points it was fitted to";
+    };
+
+    "a single batch size yields no slope, not a confident one"_test = [] {
+        // The defect the gates exist to prevent: one bucket, and a line through one point has any
+        // slope you care to give it. This feeds admission decisions, so a plausible number here is
+        // invented data entering a scheduling decision.
+        TimingAccumulator accumulator;
+        for (const Event& event : fromCostModel(1U, 800UL, 3.0, {512U})) {
+            accumulator.fold(event);
+        }
+        const Fit fit = fitCost(accumulator.blocks.at(1U));
+
+        expect(!fit.identifiable) << "one work bucket cannot identify a slope";
+        expect(fit.reason.contains("bucket")) << "and the refusal must say which gate stopped it";
+
+        // The keys must be *absent*, not present-and-flagged: a consumer will read a number it finds.
+        const gr::property_map block = blockOf(timingReport(fromCostModel(1U, 800UL, 3.0, {512U})), "entity 1");
+        expect(eq(fieldOr<std::string>(block, "fit", std::string{}), std::string("low-confidence")) >> fatal);
+        expect(block.find("item_cost_ns") == block.end()) << "no slope key may exist when no slope was identified";
+        expect(block.find("invocation_cost_ns") == block.end()) << "nor an intercept, which is the same line";
+        expect(block.find("wcet_estimate_ns") == block.end()) << "nor an estimate derived from a fit that was refused";
+    };
+
+    "two batch sizes are not enough, because two points always fit exactly"_test = [] {
+        TimingAccumulator accumulator;
+        for (const Event& event : fromCostModel(1U, 800UL, 3.0, {64U, 4096U})) {
+            accumulator.fold(event);
+        }
+        const Fit fit = fitCost(accumulator.blocks.at(1U));
+
+        expect(!fit.identifiable) << "a line through two points has no residual, so nothing can disagree with it";
+        expect(eq(fit.points, 2UZ));
+        expect(fit.reason.contains("at least")) << "the refusal must name the threshold, not merely refuse";
+    };
+
+    "a narrow span of work counts cannot separate a slope from an intercept"_test = [] {
+        // Reaching this gate at all takes care, and that is itself informative. Buckets are powers of
+        // two, so three *distinct* ones normally span at least 4x and the point-count gate would have
+        // passed them anyway. The span gate binds independently only when the centroids sit at
+        // opposite ends of their buckets -- here 127 at the top of one and 257 at the bottom of the
+        // one two along, a span of 2.02x across three buckets.
+        TimingAccumulator accumulator;
+        for (const Event& event : fromCostModel(1U, 800UL, 3.0, {127U, 128U, 257U})) {
+            accumulator.fold(event);
+        }
+        const Fit fit = fitCost(accumulator.blocks.at(1U));
+
+        expect(ge(fit.points, 3UZ) >> fatal) << "the point-count gate must not be what stops this one";
+        expect(!fit.identifiable) << "a span this narrow cannot pin a slope";
+        expect(fit.reason.contains("span")) << "and the refusal must identify the span as the reason";
+        expect(lt(fit.spanRatio, kMinFitSpan));
+    };
+
+    "a fit that does not describe its own inputs is refused"_test = [] {
+        // Costs unrelated to the work done: a straight line through them is arithmetically available
+        // and physically meaningless, and the residual is what notices.
+        TimingAccumulator                                          accumulator;
+        const std::vector<std::pair<std::uint32_t, std::uint32_t>> wild{{64U, 9000U}, {512U, 200U}, {4096U, 7000U}, {32768U, 300U}};
+        for (const auto& [work, cost] : wild) {
+            for (std::size_t r = 0UZ; r < 4UZ; ++r) {
+                accumulator.fold(invocation(1U, work, cost));
+            }
+        }
+        const Fit fit = fitCost(accumulator.blocks.at(1U));
+
+        expect(!fit.identifiable) << "noise is not a cost model";
+        expect(fit.reason.contains("misses its own inputs") or fit.reason.contains("impossible")) << std::format("the refusal must name the residual or the impossibility, and said: {}", fit.reason);
+    };
+
+    "a plausible-looking line that misses its points is refused on the residual alone"_test = [] {
+        // Deliberately constructed so the *other* gates pass: four buckets spanning 512x, and a fit
+        // whose intercept (+5232 ns) and slope (+0.46 ns/item) both come out positive, leaving only
+        // the residual (29 %) to notice that the line does not describe the points. Getting here took
+        // arithmetic rather than intuition -- the obvious "wild costs" data produces a *negative*
+        // intercept, so the impossible-fit gate fires first and the residual gate is never reached. Without a case like this the residual gate can be deleted
+        // with every test still green -- the impossible-fit gate catches the ill-conditioned data
+        // first, and the coverage looks complete while resting on one gate doing two jobs.
+        TimingAccumulator accumulator;
+        for (const auto& [work, cost] : std::vector<std::pair<std::uint32_t, std::uint32_t>>{{64U, 8000U}, {512U, 1000U}, {4096U, 9000U}, {32768U, 20000U}}) {
+            for (std::size_t r = 0UZ; r < 4UZ; ++r) {
+                accumulator.fold(invocation(1U, work, cost));
+            }
+        }
+        const Fit fit = fitCost(accumulator.blocks.at(1U));
+
+        expect(ge(fit.points, kMinFitPoints) >> fatal) << "the point-count gate must not be what stops this";
+        expect(ge(fit.spanRatio, kMinFitSpan) >> fatal) << "nor the span gate";
+        expect(!fit.identifiable) << "a line missing its own points by tens of percent describes nothing";
+        expect(fit.reason.contains("misses its own inputs")) << std::format("and the residual must be the stated reason; it said: {}", fit.reason);
+    };
+
+    "outliers do not move the fit, which is why the floor is used and not the average"_test = [] {
+        // RT specifies the per-bucket minimum because preemption and page faults inflate costs upward
+        // and never downward, so the floor is the clean signal. Verified rather than assumed: the same
+        // model, with a handful of ten-fold outliers in the largest bucket only. A fit built on bucket
+        // means would swing its slope badly; one built on floors should not move at all.
+        constexpr std::uint64_t          kIntercept = 800UL;
+        constexpr double                 kSlope     = 3.0;
+        const std::vector<std::uint32_t> batches{64U, 256U, 1024U, 4096U, 16384U};
+
+        TimingAccumulator clean;
+        for (const Event& event : fromCostModel(1U, kIntercept, kSlope, batches)) {
+            clean.fold(event);
+        }
+        const Fit cleanFit = fitCost(clean.blocks.at(1U));
+        expect(cleanFit.identifiable >> fatal);
+
+        TimingAccumulator disturbed;
+        for (const Event& event : fromCostModel(1U, kIntercept, kSlope, batches)) {
+            disturbed.fold(event);
+        }
+        for (std::size_t r = 0UZ; r < 6UZ; ++r) {
+            const auto stalled = static_cast<std::uint32_t>(10.0 * (static_cast<double>(kIntercept) + kSlope * 16384.0));
+            disturbed.fold(invocation(1U, 16384U, stalled)); // the worker was preempted mid-invocation
+        }
+        const Fit disturbedFit = fitCost(disturbed.blocks.at(1U));
+
+        expect(disturbedFit.identifiable >> fatal) << "outliers must not make a good measurement unusable: " << disturbedFit.reason;
+        expect(lt(std::abs(disturbedFit.slopeNsPerItem - cleanFit.slopeNsPerItem), 1e-9)) << "the floor is unchanged by anything above it, so the slope must be identical";
+        expect(lt(std::abs(disturbedFit.slopeNsPerItem - kSlope), 0.05)) << "and must still be the model's slope";
+
+        // The outliers are not discarded -- they are what the observed worst case is *for*.
+        expect(gt(disturbed.blocks.at(1U).overall.maxNs, clean.blocks.at(1U).overall.maxNs)) << "a stall belongs in the worst case even though it is kept out of the fit";
+    };
+
+    "a physically impossible fit is refused rather than clamped"_test = [] {
+        // Cost falling with work: a negative slope fits, and means an item saves time. The model does
+        // not describe this block, which is a refusal rather than a number to clamp to zero.
+        TimingAccumulator accumulator;
+        for (const auto& [work, cost] : std::vector<std::pair<std::uint32_t, std::uint32_t>>{{64U, 4000U}, {512U, 3000U}, {4096U, 2000U}, {32768U, 1000U}}) {
+            for (std::size_t r = 0UZ; r < 4UZ; ++r) {
+                accumulator.fold(invocation(1U, work, cost));
+            }
+        }
+        const Fit fit = fitCost(accumulator.blocks.at(1U));
+
+        expect(!fit.identifiable) << "an item cannot save time";
+        expect(fit.reason.contains("impossible")) << std::format("and the refusal must say so, rather than reporting a clamped zero; it said: {}", fit.reason);
+    };
+
+    "refusing a slope does not suppress the statistics that remain valid"_test = [] {
+        // The likeliest over-correction to the gates above: throwing out the whole report when only
+        // the regression was ill-conditioned. ACET, jitter and worst case need no fit.
+        const gr::property_map block = blockOf(timingReport(fromCostModel(1U, 800UL, 3.0, {512U})), "entity 1");
+
+        expect(eq(fieldOr<std::string>(block, "fit", std::string{}), std::string("low-confidence")) >> fatal);
+        expect(gt(fieldOr<std::uint64_t>(block, "invocations", 0UL), 0UL)) << "the invocations were still counted";
+        expect(gt(fieldOr<double>(block, "acet_ns", 0.0), 0.0)) << "the average is still an average";
+        expect(gt(fieldOr<std::uint64_t>(block, "wcet_ns", 0UL), 0UL)) << "and the observed worst case is still what was observed";
+    };
+
     "a block is named from the capture's identity table when it has one"_test = [] {
         const std::vector<Event>        events{invocation(7U, 64U, 100U)};
         const std::vector<LoadedEntity> entities{LoadedEntity{.id = 7U, .workerId = 0U, .nInputPorts = 1U, .nOutputPorts = 1U, .uniqueName = "fir_filter", .typeName = "gr::blocks::Fir<float>"}};

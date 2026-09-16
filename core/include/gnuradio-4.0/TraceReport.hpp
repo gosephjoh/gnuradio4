@@ -12,7 +12,11 @@
 #include <array>
 #include <bit>
 #include <cmath>
+#include <format>
+#include <functional>
 #include <limits>
+#include <ranges>
+#include <utility>
 
 #include <gnuradio-4.0/Tag.hpp> // property_map
 #include <gnuradio-4.0/Trace.hpp>
@@ -160,6 +164,109 @@ namespace detail {
  * header's count for a file. It is not inferred, because a reader cannot tell a short capture from a
  * truncated one, and every figure below is unreliable once anything was evicted.
  */
+/**
+ * @brief The marginal-cost fit, and the three gates that decide whether it may be reported at all.
+ *
+ * `cost ≈ I + Δ · work`: an invocation costs a fixed amount plus a per-item amount. The intercept is
+ * framework overhead per call, the slope is the block's actual work per item, and the pair is what a
+ * batch optimiser and a `wcet_estimate` both want.
+ *
+ * **The failure this exists to prevent.** A graph run at one batch size puts every sample in one
+ * bucket, and a line through one point has whatever slope you care to give it. The fit feeds
+ * admission and utilisation decisions, so a confident-looking slope from one batch size is invented
+ * data entering a scheduling decision — not a cosmetic problem.
+ *
+ * So the verdict carries **no slope at all** when it is not identifiable, rather than a slope beside a
+ * warning. A number present in a report will be read by something; the only reliable way to stop that
+ * is for it not to be there.
+ *
+ * The regression uses **per-bucket minima against bucket centroids**, not every sample: the minimum
+ * is the least preemption-polluted estimate of the true floor (RT §3.8.3), and the centroid is where
+ * that bucket's work actually sat rather than where its edge is.
+ */
+struct Fit {
+    bool        identifiable   = false;
+    double      interceptNs    = 0.0; /// `I` — per-invocation cost independent of the work done
+    double      slopeNsPerItem = 0.0; /// `Δ` — marginal cost per item
+    double      residualRms    = 0.0; /// relative to the mean observed cost; the fit's own self-assessment
+    std::size_t points         = 0UZ; /// populated buckets the fit had to work with
+    double      spanRatio      = 0.0; /// largest centroid over smallest; a narrow span cannot pin a slope
+    std::string reason;               /// why it is not identifiable, when it is not
+};
+
+/// A slope is reported only when all three hold. Each threshold answers a specific way of being
+/// wrong, rather than being a general-purpose confidence number.
+inline constexpr std::size_t kMinFitPoints   = 3UZ;  /// two points fit a line exactly, leaving no residual to disbelieve
+inline constexpr double      kMinFitSpan     = 4.0;  /// over a narrow range the slope is swamped by the intercept's error
+inline constexpr double      kMaxFitResidual = 0.25; /// a fit that does not describe its own inputs describes nothing
+
+[[nodiscard]] inline Fit fitCost(const BlockTiming& timing) {
+    Fit fit;
+
+    std::vector<std::pair<double, double>> points; // centroid, floor cost
+    for (const Bucket& bucket : timing.buckets) {
+        if (bucket.count > 0UL) {
+            points.emplace_back(bucket.centroid(), static_cast<double>(bucket.minNs));
+        }
+    }
+    fit.points = points.size();
+
+    if (fit.points < kMinFitPoints) {
+        fit.reason = std::format("only {} populated work bucket(s); a slope needs at least {}, since two points fit a line exactly", fit.points, kMinFitPoints);
+        return fit;
+    }
+
+    const auto [smallest, largest] = std::ranges::minmax(points | std::views::transform([](const auto& p) { return p.first; }));
+    fit.spanRatio                  = smallest > 0.0 ? largest / smallest : 0.0;
+    if (fit.spanRatio < kMinFitSpan) {
+        fit.reason = std::format("work counts span only {:.2f}x, below the {:.0f}x a slope can be separated from the intercept over", fit.spanRatio, kMinFitSpan);
+        return fit;
+    }
+
+    // Ordinary least squares over the bucket floors.
+    const auto   n     = static_cast<double>(points.size());
+    const double sumX  = std::ranges::fold_left(points | std::views::transform([](const auto& p) { return p.first; }), 0.0, std::plus{});
+    const double sumY  = std::ranges::fold_left(points | std::views::transform([](const auto& p) { return p.second; }), 0.0, std::plus{});
+    const double meanX = sumX / n;
+    const double meanY = sumY / n;
+
+    double covariance = 0.0;
+    double varianceX  = 0.0;
+    for (const auto& [x, y] : points) {
+        covariance += (x - meanX) * (y - meanY);
+        varianceX += (x - meanX) * (x - meanX);
+    }
+    if (varianceX <= 0.0) {
+        fit.reason = "every populated bucket has the same centroid, so no slope exists to find";
+        return fit;
+    }
+
+    fit.slopeNsPerItem = covariance / varianceX;
+    fit.interceptNs    = meanY - fit.slopeNsPerItem * meanX;
+
+    double squaredError = 0.0;
+    for (const auto& [x, y] : points) {
+        const double predicted = fit.interceptNs + fit.slopeNsPerItem * x;
+        squaredError += (y - predicted) * (y - predicted);
+    }
+    fit.residualRms = meanY > 0.0 ? std::sqrt(squaredError / n) / meanY : 0.0;
+    if (fit.residualRms > kMaxFitResidual) {
+        fit.reason = std::format("the line misses its own inputs by {:.1f}% on average, above the {:.0f}% a fit is trusted within", 100.0 * fit.residualRms, 100.0 * kMaxFitResidual);
+        return fit;
+    }
+
+    // A negative intercept or slope is arithmetically possible and physically meaningless: an
+    // invocation cannot cost less than nothing, nor an item save time. It means the model does not
+    // describe this block, which is a refusal rather than a number to clamp.
+    if (fit.interceptNs < 0.0 || fit.slopeNsPerItem < 0.0) {
+        fit.reason = std::format("the fit is physically impossible: intercept {:.1f} ns, slope {:.4f} ns/item", fit.interceptNs, fit.slopeNsPerItem);
+        return fit;
+    }
+
+    fit.identifiable = true;
+    return fit;
+}
+
 /// The name a report shows for a block, or a stable stand-in when the capture carries no table.
 [[nodiscard]] inline std::string entityLabel(EntityId id, std::span<const LoadedEntity> entities) {
     const auto found = std::ranges::find_if(entities, [id](const LoadedEntity& e) { return e.id == id; });
@@ -189,14 +296,35 @@ namespace detail {
     property_map perBlock;
     for (const auto& [entity, timing] : accumulator.blocks) {
         property_map block;
-        block["invocations"]                    = timing.overall.count;
-        block["acet_ns"]                        = timing.overall.mean;
-        block["jitter_ns"]                      = timing.overall.stddev();
-        block["wcet_ns"]                        = static_cast<std::uint64_t>(timing.overall.maxNs);
-        block["fastest_ns"]                     = static_cast<std::uint64_t>(timing.overall.minNs);
-        block["work_min"]                       = static_cast<std::uint64_t>(timing.workMin);
-        block["work_max"]                       = static_cast<std::uint64_t>(timing.workMax);
-        block["buckets_populated"]              = timing.populatedBuckets();
+        block["invocations"]       = timing.overall.count;
+        block["acet_ns"]           = timing.overall.mean;
+        block["jitter_ns"]         = timing.overall.stddev();
+        block["wcet_ns"]           = static_cast<std::uint64_t>(timing.overall.maxNs);
+        block["fastest_ns"]        = static_cast<std::uint64_t>(timing.overall.minNs);
+        block["work_min"]          = static_cast<std::uint64_t>(timing.workMin);
+        block["work_max"]          = static_cast<std::uint64_t>(timing.workMax);
+        block["buckets_populated"] = timing.populatedBuckets();
+
+        // The slope and intercept keys are **absent** unless the fit is identifiable, rather than
+        // present beside a low-confidence flag. A consumer reading a `property_map` will take a
+        // number it finds; the only reliable way to stop it taking one that means nothing is for the
+        // key not to exist. `wcet_estimate_ns` is emitted as an integer beside the float a caller
+        // might want, because a seconds-valued float truncates -- the same hazard that silently
+        // floors a sub-microsecond relative deadline to zero.
+        const Fit fit           = fitCost(timing);
+        block["fit"]            = std::string(fit.identifiable ? "identifiable" : "low-confidence");
+        block["fit_points"]     = static_cast<std::uint64_t>(fit.points);
+        block["fit_span_ratio"] = fit.spanRatio;
+        if (fit.identifiable) {
+            block["invocation_cost_ns"] = fit.interceptNs;
+            block["item_cost_ns"]       = fit.slopeNsPerItem;
+            block["fit_residual"]       = fit.residualRms;
+            block["wcet_estimate_ns"]   = static_cast<std::uint64_t>(timing.overall.maxNs);
+            block["wcet_estimate_s"]    = static_cast<double>(timing.overall.maxNs) * 1e-9;
+        } else {
+            block["fit_reason"] = fit.reason;
+        }
+
         perBlock[entityLabel(entity, entities)] = std::move(block);
     }
     out["blocks"] = std::move(perBlock);
