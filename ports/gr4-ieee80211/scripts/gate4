@@ -23,7 +23,8 @@ while [ $# -gt 0 ]; do
         *) echo "gate4: unknown option $1" >&2; exit 2;;
     esac
 done
-[ -x build/rx_latency4 ] || { echo "gate4: build/rx_latency4 missing" >&2; exit 2; }
+RX="${RX:-build/rx_latency4}"   # RX=build-generic/rx_latency4 ./scripts/gate4 judges another build
+[ -x "$RX" ] || { echo "gate4: $RX missing" >&2; exit 2; }
 [ -x "$GR3/build/compare" ] || { echo "gate4: $GR3/build/compare missing" >&2; exit 2; }
 FIX="$GR3/results/phase9/fixture/index.json"
 [ -f "$FIX" ] || { echo "gate4: $FIX missing" >&2; exit 2; }
@@ -41,7 +42,7 @@ for cell in $CELLS; do
     G="$GR3/data/golden/$cell"
     C="data/gate4/$cell"
     mkdir -p "$C"
-    ./build/rx_latency4 --run-dir "$G" --input "$G/rx_stimulus.cf32" --out-dir "$C" --rate "$RATE" --record --timeout-s 120 > "$C/run.log" 2>&1
+    "$RX" --run-dir "$G" --input "$G/rx_stimulus.cf32" --out-dir "$C" --rate "$RATE" --record --timeout-s 120 > "$C/run.log" 2>&1
     rx=$?
     if [ "$rx" -ne 0 ]; then
         echo "FAIL  $cell: rx_latency4 exit $rx (see $C/run.log)" | tee -a "$LOG"; fail=$((fail+1))

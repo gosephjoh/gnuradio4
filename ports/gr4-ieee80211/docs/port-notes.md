@@ -205,3 +205,17 @@ lifecycle state and the stage counters.
   even with the registry off; link it with `-Wl,--no-as-needed`.
 - GR4 options set for the subdirectory: tests, examples, benchmarks, block
   registry, plugins, mold, ccache, HTTP all off; warnings not errors.
+
+## Fixed batching and the scheduling policies (decision 0036, 2026-09-17)
+
+The receiver can run at a fixed batch size N under GR4's `RoundRobinPolicy`,
+`EdfPolicy` and `RateMonotonicPolicy` with the trace-marker layer live; the
+procedure, the findings of the first runs (one worker cannot keep 10 Msps on
+the development machine; RM ranks among equal periods are a tie-break; RM
+emits about three times EDF's record rate) and the traps (the flush tail at
+N <= 1024, the throttle's anchor, staged settings, the analysis being empty
+before `runAndWait()`) are in `docs/batch-rt-experiments.md`. On aarch64 the
+Viterbi decoder is upstream's portable one (`wifi_codec.hpp`, selected by
+`__SSE2__`), checked on x86 with `-DGR4WIFI_GENERIC_VITERBI=ON` against the
+fixture.
+

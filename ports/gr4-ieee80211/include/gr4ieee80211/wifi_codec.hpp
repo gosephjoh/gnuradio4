@@ -23,7 +23,16 @@
  */
 #pragma once
 
+// The SSE2 Viterbi (upstream viterbi_decoder_x86.cc) where the target has
+// SSE2; upstream's portable viterbi_decoder_generic.cc otherwise (aarch64,
+// e.g. Raspberry Pi 5) or when GR4WIFI_GENERIC_VITERBI is defined, which
+// lets an x86 build prove the generic path against the fixture.
+#if defined(__SSE2__) && !defined(GR4WIFI_GENERIC_VITERBI)
+#define GR4WIFI_VITERBI_SSE2 1
 #include <emmintrin.h>
+#else
+#define GR4WIFI_VITERBI_SSE2 0
+#endif
 
 #include <algorithm>
 #include <array>
@@ -134,10 +143,16 @@ inline unsigned decision(Encoding e, const cf& s) {
 }
 
 // ------------------------------------------------------------ viterbi
+// viterbi_decoder/base.{h,cc}: the parity table both decoders share.
+inline constexpr unsigned char VITERBI_PARTAB[256] = {
+    0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 1, 1, 0,
+};
+
+#if GR4WIFI_VITERBI_SSE2
 // viterbi_decoder/base.{h,cc} + viterbi_decoder_x86.cc, verbatim arithmetic.
-class ViterbiDecoder {
+class ViterbiDecoderSse2 {
 public:
-    ViterbiDecoder() { std::memset(d_depunctured.data(), 0, d_depunctured.size()); }
+    ViterbiDecoderSse2() { std::memset(d_depunctured.data(), 0, d_depunctured.size()); }
 
     // Returns n_data_bits (rounded up to a byte) decoded bits, one per byte.
     // `in` holds frame.n_sym * ofdm.n_cbps bits.
@@ -172,7 +187,6 @@ private:
     static constexpr unsigned char PUNCTURE_1_2[2] = {1, 1};
     static constexpr unsigned char PUNCTURE_2_3[4] = {1, 1, 1, 0};
     static constexpr unsigned char PUNCTURE_3_4[6] = {1, 1, 1, 0, 0, 1};
-    static const unsigned char     PARTAB[256];
 
     union branchtab27 {
         unsigned char c[32];
@@ -246,8 +260,8 @@ private:
         }
         const int polys[2] = {0x6d, 0x4f};
         for (int i = 0; i < 32; i++) {
-            d_branchtab27_sse2[0].c[i] = (polys[0] < 0) ^ PARTAB[(2 * i) & std::abs(polys[0])] ? 1 : 0;
-            d_branchtab27_sse2[1].c[i] = (polys[1] < 0) ^ PARTAB[(2 * i) & std::abs(polys[1])] ? 1 : 0;
+            d_branchtab27_sse2[0].c[i] = (polys[0] < 0) ^ VITERBI_PARTAB[(2 * i) & std::abs(polys[0])] ? 1 : 0;
+            d_branchtab27_sse2[1].c[i] = (polys[1] < 0) ^ VITERBI_PARTAB[(2 * i) & std::abs(polys[1])] ? 1 : 0;
         }
         for (int i = 0; i < 64; i++) {
             d_mmresult[i] = 0;
@@ -360,10 +374,255 @@ private:
         return static_cast<unsigned char>(bestmetric);
     }
 };
+using ViterbiDecoder = ViterbiDecoderSse2;
+#else
 
-inline const unsigned char ViterbiDecoder::PARTAB[256] = {
-    0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 1, 1, 0,
+// viterbi_decoder/viterbi_decoder_generic.cc, verbatim arithmetic: the same
+// Karn/Diaconescu decoder with the 16-lane SSE2 vectors written out as byte
+// loops.  Same depuncture (including the port's zero-fill departure), same
+// traceback, same output; on x86 it is checked against the fixture with
+// -DGR4WIFI_GENERIC_VITERBI=ON (docs/batch-rt-experiments.md, "Raspberry Pi").
+class ViterbiDecoderGeneric {
+public:
+    ViterbiDecoderGeneric() { std::memset(d_depunctured.data(), 0, d_depunctured.size()); }
+
+    const uint8_t* decode(const ofdm_param& ofdm, const frame_param& frame, const uint8_t* in) {
+        d_ofdm  = ofdm;
+        d_frame = frame;
+        reset();
+        depuncture(in);
+
+        int in_count = 0, out_count = 0, n_decoded = 0;
+        while (n_decoded < d_frame.n_data_bits) {
+            if ((in_count % 4) == 0) {
+                viterbi_butterfly2_generic(&d_depunctured[static_cast<std::size_t>(in_count & ~3)], d_metric0, d_metric1, d_path0, d_path1);
+                if ((in_count > 0) && (in_count % 16) == 8) {
+                    unsigned char c;
+                    viterbi_get_output_generic(d_metric0, d_path0, d_ntraceback, &c);
+                    if (out_count >= d_ntraceback) {
+                        for (int i = 0; i < 8; i++) {
+                            d_decoded[static_cast<std::size_t>((out_count - d_ntraceback) * 8 + i)] = (c >> (7 - i)) & 0x1;
+                            n_decoded++;
+                        }
+                    }
+                    out_count++;
+                }
+            }
+            in_count++;
+        }
+        return d_decoded.data();
+    }
+
+private:
+    static constexpr unsigned char PUNCTURE_1_2[2] = {1, 1};
+    static constexpr unsigned char PUNCTURE_2_3[4] = {1, 1, 1, 0};
+    static constexpr unsigned char PUNCTURE_3_4[6] = {1, 1, 1, 0, 0, 1};
+
+    struct branchtab27 {
+        unsigned char c[32];
+    } d_branchtab27[2];
+
+    alignas(16) unsigned char d_metric0[64];
+    alignas(16) unsigned char d_metric1[64];
+    alignas(16) unsigned char d_path0[64];
+    alignas(16) unsigned char d_path1[64];
+
+    int d_store_pos = 0;
+    alignas(16) unsigned char d_mmresult[64];
+    alignas(16) unsigned char d_ppresult[TRACEBACK_MAX][64];
+
+    int                  d_ntraceback = 5;
+    int                  d_k          = 1;
+    ofdm_param           d_ofdm;
+    frame_param          d_frame;
+    const unsigned char* d_depuncture_pattern = PUNCTURE_1_2;
+
+    std::array<uint8_t, DECODER_IN_SIZE>  d_depunctured{};
+    std::array<uint8_t, MAX_ENCODED_BITS> d_decoded{};
+
+    void depuncture(const uint8_t* in) {
+        const int n_cbps = d_ofdm.n_cbps;
+        int       count  = 0;
+        if (d_ntraceback == 5) {
+            count = d_frame.n_sym * n_cbps;
+            std::memcpy(d_depunctured.data(), in, static_cast<std::size_t>(count));
+        } else {
+            for (int i = 0; i < d_frame.n_sym; i++) {
+                for (int k = 0; k < n_cbps; k++) {
+                    while (d_depuncture_pattern[count % (2 * d_k)] == 0) {
+                        d_depunctured[static_cast<std::size_t>(count)] = 2;
+                        count++;
+                    }
+                    d_depunctured[static_cast<std::size_t>(count)] = in[i * n_cbps + k];
+                    count++;
+                    while (d_depuncture_pattern[count % (2 * d_k)] == 0) {
+                        d_depunctured[static_cast<std::size_t>(count)] = 2;
+                        count++;
+                    }
+                }
+            }
+        }
+        const int last_read = 16 * (d_frame.n_data_bits / 8 + d_ntraceback) + 16;
+        if (last_read > count) {
+            std::memset(d_depunctured.data() + count, 0, static_cast<std::size_t>(std::min(last_read, DECODER_IN_SIZE) - count));
+        }
+    }
+
+    void reset() {
+        viterbi_chunks_init_generic();
+        switch (d_ofdm.encoding) {
+        case BPSK_1_2: case QPSK_1_2: case QAM16_1_2:
+            d_ntraceback = 5; d_depuncture_pattern = PUNCTURE_1_2; d_k = 1; break;
+        case QAM64_2_3:
+            d_ntraceback = 9; d_depuncture_pattern = PUNCTURE_2_3; d_k = 2; break;
+        default:
+            d_ntraceback = 10; d_depuncture_pattern = PUNCTURE_3_4; d_k = 3; break;
+        }
+    }
+
+    void viterbi_chunks_init_generic() {
+        for (int i = 0; i < 64; i++) {
+            d_metric0[i] = 0;
+            d_path0[i]   = 0;
+        }
+        const int polys[2] = {0x6d, 0x4f};
+        for (int i = 0; i < 32; i++) {
+            d_branchtab27[0].c[i] = (polys[0] < 0) ^ VITERBI_PARTAB[(2 * i) & std::abs(polys[0])] ? 1 : 0;
+            d_branchtab27[1].c[i] = (polys[1] < 0) ^ VITERBI_PARTAB[(2 * i) & std::abs(polys[1])] ? 1 : 0;
+        }
+        for (int i = 0; i < 64; i++) {
+            d_mmresult[i] = 0;
+            for (int j = 0; j < TRACEBACK_MAX; j++) {
+                d_ppresult[j][i] = 0;
+            }
+        }
+        d_store_pos = 0;
+    }
+
+    // one half of viterbi_butterfly2_generic: two symbols, 4x16 lanes
+    void butterfly_half(const unsigned char* symbols, unsigned char* metric0, unsigned char* metric1, unsigned char* path0, unsigned char* path1) {
+        unsigned char m0[16], m1[16], m2[16], m3[16], decision0[16], decision1[16], survivor0[16], survivor1[16];
+        unsigned char metsv[16], metsvm[16], shift0[16], shift1[16], tmp0[16], tmp1[16], sym0v[16], sym1v[16];
+        unsigned short simd_epi16;
+        for (int j = 0; j < 16; j++) {
+            sym0v[j] = symbols[0];
+            sym1v[j] = symbols[1];
+        }
+        for (int i = 0; i < 2; i++) {
+            if (symbols[0] == 2) {
+                for (int j = 0; j < 16; j++) {
+                    metsvm[j] = static_cast<unsigned char>(d_branchtab27[1].c[(i * 16) + j] ^ sym1v[j]);
+                    metsv[j]  = static_cast<unsigned char>(1 - metsvm[j]);
+                }
+            } else if (symbols[1] == 2) {
+                for (int j = 0; j < 16; j++) {
+                    metsvm[j] = static_cast<unsigned char>(d_branchtab27[0].c[(i * 16) + j] ^ sym0v[j]);
+                    metsv[j]  = static_cast<unsigned char>(1 - metsvm[j]);
+                }
+            } else {
+                for (int j = 0; j < 16; j++) {
+                    metsvm[j] = static_cast<unsigned char>((d_branchtab27[0].c[(i * 16) + j] ^ sym0v[j]) + (d_branchtab27[1].c[(i * 16) + j] ^ sym1v[j]));
+                    metsv[j]  = static_cast<unsigned char>(2 - metsvm[j]);
+                }
+            }
+            for (int j = 0; j < 16; j++) {
+                m0[j] = static_cast<unsigned char>(metric0[(i * 16) + j] + metsv[j]);
+                m1[j] = static_cast<unsigned char>(metric0[((i + 2) * 16) + j] + metsvm[j]);
+                m2[j] = static_cast<unsigned char>(metric0[(i * 16) + j] + metsvm[j]);
+                m3[j] = static_cast<unsigned char>(metric0[((i + 2) * 16) + j] + metsv[j]);
+            }
+            for (int j = 0; j < 16; j++) {
+                // upstream generic: the promoted int difference (the SSE2 build
+                // compares the wrapped signed byte; the two agree while the
+                // renormalised metrics stay within 127 of each other, which
+                // the per-byte renormalisation in get_output keeps them)
+                decision0[j] = ((m0[j] - m1[j]) > 0) ? 0xff : 0x0;
+                decision1[j] = ((m2[j] - m3[j]) > 0) ? 0xff : 0x0;
+                survivor0[j] = static_cast<unsigned char>((decision0[j] & m0[j]) | ((~decision0[j]) & m1[j]));
+                survivor1[j] = static_cast<unsigned char>((decision1[j] & m2[j]) | ((~decision1[j]) & m3[j]));
+            }
+            for (int j = 0; j < 16; j += 2) {
+                simd_epi16 = path0[(i * 16) + j];
+                simd_epi16 = static_cast<unsigned short>(simd_epi16 | (path0[(i * 16) + (j + 1)] << 8));
+                simd_epi16 = static_cast<unsigned short>(simd_epi16 << 1);
+                shift0[j]     = static_cast<unsigned char>(simd_epi16);
+                shift0[j + 1] = static_cast<unsigned char>(simd_epi16 >> 8);
+                simd_epi16 = path0[((i + 2) * 16) + j];
+                simd_epi16 = static_cast<unsigned short>(simd_epi16 | (path0[((i + 2) * 16) + (j + 1)] << 8));
+                simd_epi16 = static_cast<unsigned short>(simd_epi16 << 1);
+                shift1[j]     = static_cast<unsigned char>(simd_epi16);
+                shift1[j + 1] = static_cast<unsigned char>(simd_epi16 >> 8);
+            }
+            for (int j = 0; j < 16; j++) {
+                shift1[j] = static_cast<unsigned char>(shift1[j] + 1);
+            }
+            for (int j = 0, k = 0; j < 16; j += 2, k++) {
+                metric1[(2 * i * 16) + j]       = survivor0[k];
+                metric1[(2 * i * 16) + (j + 1)] = survivor1[k];
+            }
+            for (int j = 0; j < 16; j++) {
+                tmp0[j] = static_cast<unsigned char>((decision0[j] & shift0[j]) | ((~decision0[j]) & shift1[j]));
+            }
+            for (int j = 0, k = 8; j < 16; j += 2, k++) {
+                metric1[((2 * i + 1) * 16) + j]       = survivor0[k];
+                metric1[((2 * i + 1) * 16) + (j + 1)] = survivor1[k];
+            }
+            for (int j = 0; j < 16; j++) {
+                tmp1[j] = static_cast<unsigned char>((decision1[j] & shift0[j]) | ((~decision1[j]) & shift1[j]));
+            }
+            for (int j = 0, k = 0; j < 16; j += 2, k++) {
+                path1[(2 * i * 16) + j]       = tmp0[k];
+                path1[(2 * i * 16) + (j + 1)] = tmp1[k];
+            }
+            for (int j = 0, k = 8; j < 16; j += 2, k++) {
+                path1[((2 * i + 1) * 16) + j]       = tmp0[k];
+                path1[((2 * i + 1) * 16) + (j + 1)] = tmp1[k];
+            }
+        }
+    }
+
+    void viterbi_butterfly2_generic(const unsigned char* symbols, unsigned char* mm0, unsigned char* mm1, unsigned char* pp0, unsigned char* pp1) {
+        butterfly_half(symbols, mm0, mm1, pp0, pp1);
+        butterfly_half(symbols + 2, mm1, mm0, pp1, pp0);
+    }
+
+    unsigned char viterbi_get_output_generic(unsigned char* mm0, unsigned char* pp0, int ntraceback, unsigned char* outbuf) {
+        int bestmetric, minmetric, beststate = 0, pos = 0;
+        d_store_pos = (d_store_pos + 1) % ntraceback;
+        for (int i = 0; i < 4; i++) {
+            for (int j = 0; j < 16; j++) {
+                d_mmresult[(i * 16) + j]              = mm0[(i * 16) + j];
+                d_ppresult[d_store_pos][(i * 16) + j] = pp0[(i * 16) + j];
+            }
+        }
+        bestmetric = d_mmresult[beststate];
+        minmetric  = d_mmresult[beststate];
+        for (int i = 1; i < 64; i++) {
+            if (d_mmresult[i] > bestmetric) {
+                bestmetric = d_mmresult[i];
+                beststate  = i;
+            }
+            if (d_mmresult[i] < minmetric) {
+                minmetric = d_mmresult[i];
+            }
+        }
+        int i;
+        for (i = 0, pos = d_store_pos; i < (ntraceback - 1); i++) {
+            beststate = d_ppresult[pos][beststate] >> 2;
+            pos       = (pos - 1 + ntraceback) % ntraceback;
+        }
+        *outbuf = d_ppresult[pos][beststate];
+        for (i = 0; i < 4; i++) {
+            for (int j = 0; j < 16; j++) {
+                pp0[(i * 16) + j] = 0;
+                mm0[(i * 16) + j] = static_cast<unsigned char>(mm0[(i * 16) + j] - minmetric);
+            }
+        }
+        return static_cast<unsigned char>(bestmetric);
+    }
 };
+using ViterbiDecoder = ViterbiDecoderGeneric;
+#endif
 
 // --------------------------------------------------- decode_mac helpers
 

@@ -19,8 +19,14 @@ then compared packet for packet between the two runtimes.
 
 ```
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=g++-15
-cmake --build build -j1 --target rx_latency4 gen4    # ~6 min the first time; one TU needs 2.4 GB
+cmake --build build -j1 --target rx_latency4 gen4 trace_export   # ~6 min the first time; one TU needs 2.4 GB
 ```
+
+GR4's trace-marker layer is compiled in by default (`-DGR4WIFI_TRACING=OFF`
+to compile it away; inert until `--trace-categories` is given). On aarch64
+(Raspberry Pi 5) the build takes upstream's portable Viterbi decoder and no
+`-msse2`; `-DGR4WIFI_GENERIC_VITERBI=ON` forces that decoder on x86 for the
+fixture check.
 
 ## Quick start — generate samples, run, read the response times
 
@@ -190,6 +196,36 @@ The binary's own defaults are GR4's (`--threads 0` = all hardware threads,
 in the GR3 formats for `compare`; `--no-check` skips the payload check. The GR3
 run directory is never written to.
 
+## Batch response time under RR, EDF and RM (decision 0036)
+
+The second experiment this repository carries: the same graph at a **fixed
+batch size** N under GR4's `RoundRobinPolicy`, `EdfPolicy` and
+`RateMonotonicPolicy`, traced with GR4's lightweight-tracing layer, read back
+as batch response times (nominal arrival of batch j → `sync_short` consumed
+it) beside the frame response times above. No GR4 scheduler code was touched;
+the policies and the trace records are GR4's own.
+
+```
+./scripts/rt-sweep4 experiments/profiles/x86-8core.json --probe      # probes -> plan.json
+./scripts/rt-sweep4 experiments/profiles/x86-8core.json --plan <cell>/runs4/sweep-x86-8core/plan.json
+./scripts/rt-plot4.py <cell>/runs4/sweep-x86-8core --out-dir results/sweep-x86-8core
+```
+
+One run by hand:
+
+```
+./build/rx_latency4 --run-dir $CELL --out-dir $OUT --rate 5e6 --chains 1 --threads 1 \
+    --policy edf --fixed-batch 1024 \
+    --trace-categories all --trace-buffer 8388608 --trace-out $OUT/trace.gr4trace
+./scripts/trace-batch-rt.py $OUT --warmup 5 --window 20      # -> $OUT/batch_rt.json, batch_rt.csv
+```
+
+**`docs/batch-rt-experiments.md`** is the full procedure: what a fixed-batch
+run does, what the analysis computes, how points are chosen by measured
+utilization, the Raspberry Pi 5 profile (portable Viterbi, smaller rings),
+what the first runs showed, and the traps. `experiments/profiles/pi5.json`
+is the Pi's parameter set.
+
 ## Verification
 
 ```
@@ -219,9 +255,13 @@ include/gr4ieee80211/   wifi_codec.hpp (params, tables, Viterbi, descrambler, CR
                         SymbolsRecorder), chain.hpp
 src/chain.cpp           one receiver chain wired into a gr::Graph (the heavy TU)
 include/gr4ieee80211/wifi_tx.hpp, wifi_tables.h   the standalone transmitter (gen4)
-apps/rx_latency4.cpp    the app; apps/gen4.cpp the generator; apps/probe.cpp the diagnostic
-scripts/                rt-run4, rt-table, gate4, compare-runs.py, check-gen4.py
+apps/rx_latency4.cpp    the app; apps/gen4.cpp the generator; apps/probe.cpp the diagnostic;
+                        apps/trace_export.cpp a .gr4trace capture -> CSV tables
+scripts/                rt-run4, rt-table, gate4, compare-runs.py, check-gen4.py;
+                        rt-sweep4, rt-plan4.py, trace-batch-rt.py, rt-plot4.py (decision 0036)
+experiments/profiles/   per-machine sweep parameters (x86-8core.json, pi5.json)
 third_party/nlohmann    vendored JSON header (MIT)
 docs/port-notes.md      what changed and why
-results/                gate4.log, gate4.csv
+docs/batch-rt-experiments.md   the batch response-time experiments, end to end
+results/                gate4.log, gate4.csv, latency_knobs.md, sweep-*/ (figures, summary.csv)
 ```

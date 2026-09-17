@@ -1,0 +1,61 @@
+{
+  "name": "x86-8core",
+  "description": "the development machine: 8 hardware threads, 14 GB RAM (decision 0036 defaults); the probe runs at probe_rate (the lowest) so its per-block costs are taken unsaturated",
+  "cell": "data/rt_300_300_102934_QPSK_1_2_s1",
+  "gr3_cell": "/home/gr3/gr3-ieee802-11-project/data/phase10/rt_300_300_102934_QPSK_1_2_s1",
+  "policies": [
+    "rr",
+    "edf",
+    "rm"
+  ],
+  "batches": [
+    1024,
+    2048,
+    4096
+  ],
+  "workers": [
+    1,
+    2,
+    6
+  ],
+  "receivers": [
+    1,
+    2,
+    3,
+    4
+  ],
+  "rates": [
+    2500000,
+    5000000,
+    10000000
+  ],
+  "rate_sweep": {
+    "receivers": 1,
+    "workers": 1,
+    "rates": [
+      2500000,
+      5000000,
+      10000000,
+      20000000
+    ]
+  },
+  "utilization_targets": [
+    0.3,
+    0.5,
+    0.7,
+    0.85,
+    0.95
+  ],
+  "run_s": 60,
+  "repeats": 3,
+  "warmup_s": 5,
+  "window_s": 20,
+  "trace_categories": "all",
+  "trace_buffer_records": 33554432,
+  "trace_limit_mb": 1024,
+  "sched_ratio": 0,
+  "controls": "top",
+  "timeout_s": 180,
+  "probe_rate": 2500000,
+  "ring_note": "with every category live an idle worker emits ~7 M records/s (its probing of blocks with no work); the ring keeps the most recent records, so the analysis window is whatever the ring holds and trace-batch-rt.py reports window_covered_s"
+}

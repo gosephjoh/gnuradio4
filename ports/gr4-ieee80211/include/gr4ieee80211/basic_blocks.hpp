@@ -45,18 +45,38 @@ struct Throttle : gr::Block<Throttle<T>>, gr::BlockingSync<Throttle<T>> {
     // block gets one call per scheduler pass, so a per-call cap of chunk_size
     // drains a backlog only chunk_size per pass).  false = BlockingSync's cap.
     bool       catch_up            = false;
+    // whole_chunks: publish only whole multiples of chunk_size, k*chunk_size
+    // per call with k = min(chunks due by the wall clock, chunks that fit).
+    // This is the fixed-batch arrival point of decision 0036: chunk j
+    // (samples [j*N, (j+1)*N)) is nominally complete at start + (j+1)*N/rate
+    // and becomes visible downstream at the first call after that.  A late
+    // call publishes several chunks, so lateness is recoverable (catch_up is
+    // implied).  The wall clock is CLOCK_MONOTONIC from `_start_ns`, the
+    // same clock the trace layer and the arrival stamper use.
+    bool       whole_chunks        = false;
 
-    GR_MAKE_REFLECTABLE(Throttle, in, out, sample_rate, chunk_size, use_internal_thread, catch_up);
+    GR_MAKE_REFLECTABLE(Throttle, in, out, sample_rate, chunk_size, use_internal_thread, catch_up, whole_chunks);
 
     uint64_t _calls = 0, _released = 0, _last_call_ns = 0, _max_gap_ns = 0, _max_backlog = 0, _sum_gap_ns = 0;
+    uint64_t _start_ns = 0;        // CLOCK_MONOTONIC at the first processBulk call: the nominal-arrival anchor
+    uint64_t _lifecycle_start_ns = 0; // CLOCK_MONOTONIC at start(), for the record
+    uint64_t _chunks_published = 0; // whole_chunks mode: chunks so far
+    uint64_t _max_chunks_per_call = 0;
     static uint64_t nowNs() { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return static_cast<uint64_t>(t.tv_sec) * 1000000000ull + static_cast<uint64_t>(t.tv_nsec); }
 
-    void start() { this->blockingSyncStart(); }
+    void start() {
+        this->blockingSyncStart();
+        _lifecycle_start_ns = nowNs();
+        _start_ns           = 0; // set on the first call: the graph is only running then (start() precedes
+                                 // the workers by tens of milliseconds, which is a start-up transient,
+                                 // not a response time)
+    }
     void stop() { this->blockingSyncStop(); }
 
     gr::work::Status processBulk(gr::InputSpanLike auto& input, gr::OutputSpanLike auto& output) {
         const std::size_t avail = std::min(input.size(), output.size());
         const uint64_t    now   = nowNs();
+        if (_start_ns == 0) { _start_ns = now; }
         if (_last_call_ns) { const uint64_t g = now - _last_call_ns; _sum_gap_ns += g; if (g > _max_gap_ns) { _max_gap_ns = g; } }
         _last_call_ns = now;
         _calls++;
@@ -65,7 +85,16 @@ struct Throttle : gr::Block<Throttle<T>>, gr::BlockingSync<Throttle<T>> {
         const uint64_t backlog = due_total > static_cast<double>(_released) ? static_cast<uint64_t>(due_total - static_cast<double>(_released)) : 0;
         if (backlog > _max_backlog) { _max_backlog = backlog; }
         std::size_t n;
-        if (catch_up) {
+        if (whole_chunks) {
+            // chunks due by the monotonic clock, minus chunks already out
+            const double   due_total_mono = static_cast<double>(now - _start_ns) * 1e-9 * static_cast<double>(sample_rate);
+            const uint64_t due            = due_total_mono > static_cast<double>(_released) ? static_cast<uint64_t>(due_total_mono - static_cast<double>(_released)) : 0;
+            if (due > _max_backlog) { _max_backlog = due; }
+            const std::size_t k = std::min(static_cast<std::size_t>(due / chunk_size), avail / chunk_size);
+            n                   = k * chunk_size;
+            _chunks_published += k;
+            if (k > _max_chunks_per_call) { _max_chunks_per_call = k; }
+        } else if (catch_up) {
             const std::size_t due = std::min(avail, static_cast<std::size_t>(backlog));
             n = due;
             // keep BlockingSync's clock in step: consume the same count from it

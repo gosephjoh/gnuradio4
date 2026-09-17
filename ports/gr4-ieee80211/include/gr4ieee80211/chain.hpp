@@ -25,6 +25,8 @@
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace gr4wifi {
 
@@ -41,6 +43,22 @@ struct ChainConfig {
     std::size_t buffer      = 0;   // edge minBufferSize in items; 0 = GR4 default (65536)
     bool        catch_up    = false; // Throttle::catch_up
     unsigned    batch       = 0;     // max_batch_size on every block; 0 = GR4 default (unbounded)
+    // Fixed batching (decision 0036): every input port of the blocks between
+    // the throttle and the gate (mag2 .. div) requires exactly `fixed_batch`
+    // samples per call (min_samples = max_samples = N); the gate (syncshort)
+    // takes any amount up to 2N (chain.cpp says why); the throttle
+    // publishes whole N-sample chunks only, the file source pads its tail to
+    // a multiple of N, and the source and throttle are excluded from the
+    // batch ceiling so they can run ahead / catch up.  0 = off.
+    unsigned    fixed_batch = 0;
+    // Explicit `period` (seconds) on the file source and the throttle so
+    // EDF's temporal gate never paces them and RM ranks them most urgent
+    // (0036 item 8).  0 = leave unset (derived from the rate like every
+    // other block).
+    float       tiny_period = 0.f;
+    // Declare the throttle rate as the file source's `sample_rate` so GR4's
+    // scheduling analysis derives a period per block (RT reference 4.2).
+    bool        declare_rate = true;
 };
 
 struct ChainCounters {
@@ -54,6 +72,7 @@ struct ChainCounters {
     uint64_t stamper_reentry = 0;
     uint64_t src_calls = 0, src_max_read_ns = 0, src_sum_read_ns = 0, src_max_read_items = 0;
     uint64_t thr_calls = 0, thr_max_gap_ns = 0, thr_sum_gap_ns = 0, thr_max_backlog = 0;
+    uint64_t thr_start_ns = 0, thr_chunks = 0, thr_max_chunks_per_call = 0; // whole_chunks mode
     uint64_t fft_tags_in = 0, fft_tags_out = 0, eq_tags_in = 0;
     uint64_t sl_neg_tags = 0, sl_far_tags = 0, sl_tags_seen = 0, sl_max_copy_run = 0, sl_short_calls = 0;
     float    max_cor = 0;
@@ -66,6 +85,9 @@ struct ChainBlocks {
     SymbolsRecorder* sym     = nullptr; // record only
     std::function<ChainCounters()> counters;
     int block_count = 0;
+    // every block of the chain: GR4 unique name (what a trace capture
+    // records) -> our role name ("throttle", "mag2", ... "latsink")
+    std::vector<std::pair<std::string, std::string>> roles;
 };
 
 ChainBlocks buildChain(gr::Graph& graph, const ChainConfig& cfg);

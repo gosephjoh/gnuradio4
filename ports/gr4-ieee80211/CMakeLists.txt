@@ -29,7 +29,23 @@ set(WARNINGS_AS_ERRORS OFF CACHE BOOL "" FORCE)
 set(USE_MOLD_LINKER OFF CACHE BOOL "" FORCE)
 set(USE_CCACHE OFF CACHE BOOL "" FORCE)
 set(GR_ENABLE_HTTP OFF CACHE STRING "" FORCE)
+# The trace-marker layer (branch lightweight-tracing): compiled in by default
+# so one binary serves traced and untraced runs -- with no category live a
+# marker is one predicted branch (LIGHTWEIGHT_TRACING_REFERENCE 5.1).
+option(GR4WIFI_TRACING "compile GR4's scheduler/work() trace markers in (inert until trace_categories is set)" ON)
+set(GR4_ENABLE_TRACING ${GR4WIFI_TRACING} CACHE BOOL "" FORCE)
 add_subdirectory(${GNURADIO4_DIR} gnuradio4 EXCLUDE_FROM_ALL)
+
+# SIMD flags: GR3's -msse2 on x86; nothing on aarch64 (Raspberry Pi 5), where
+# the Viterbi decoder falls back to upstream's portable implementation.
+# GR4WIFI_GENERIC_VITERBI=ON forces that implementation on x86 too, which is
+# how it is checked against the fixture (docs/batch-rt-experiments.md).
+option(GR4WIFI_GENERIC_VITERBI "use the portable Viterbi decoder even where SSE2 exists" OFF)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64|i[3-6]86")
+  set(GR4WIFI_SIMD_FLAGS -msse2)
+else()
+  set(GR4WIFI_SIMD_FLAGS "")
+endif()
 
 # nlohmann/json is vendored (third_party/, MIT) so the tree builds on a machine
 # without the -dev package; a system copy is not needed.
@@ -42,7 +58,10 @@ target_include_directories(gr4ieee80211 INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/in
 target_link_libraries(gr4ieee80211 INTERFACE
   gnuradio4::gnuradio-core gnuradio4::gnuradio-blocklib-core gnuradio4::gnuradio-algorithm
   gnuradio4::gr-basic gnuradio4::gr-fileio gnuradio4::gr-math gnuradio4::gr-testing)
-target_compile_options(gr4ieee80211 INTERFACE -O3 -msse2)
+target_compile_options(gr4ieee80211 INTERFACE -O3 ${GR4WIFI_SIMD_FLAGS})
+if(GR4WIFI_GENERIC_VITERBI)
+  target_compile_definitions(gr4ieee80211 INTERFACE GR4WIFI_GENERIC_VITERBI)
+endif()
 
 # One chain of the graph, instantiated once in its own translation unit
 add_library(gr4chain STATIC src/chain.cpp)
@@ -65,4 +84,9 @@ target_link_options(probe PRIVATE -Wl,--no-as-needed)
 add_executable(gen4 apps/gen4.cpp)
 target_include_directories(gen4 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(gen4 PRIVATE gr4json)
-target_compile_options(gen4 PRIVATE -O2 -msse2)
+target_compile_options(gen4 PRIVATE -O2 ${GR4WIFI_SIMD_FLAGS})
+
+# trace_export: a .gr4trace capture -> CSV tables for scripts/trace-batch-rt.py
+add_executable(trace_export apps/trace_export.cpp)
+target_link_libraries(trace_export PRIVATE gnuradio4::gnuradio-core gnuradio4::gnuradio-blocklib-core gr4json)
+target_link_options(trace_export PRIVATE -Wl,--no-as-needed)
