@@ -86,6 +86,7 @@ ChainBlocks buildChain(gr::Graph& g, const ChainConfig& cfg) {
     // file_source semantics in a dozen lines.
     gr::property_map srcm{{"name", nm("fsrc")}, {"file_name", cfg.input}};
     if (cfg.declare_rate && cfg.rate > 0) { srcm.insert_or_assign("sample_rate", static_cast<float>(cfg.rate)); }
+    if (cfg.max_samples > 0) { srcm.insert_or_assign("max_items", cfg.max_samples); }
     if (N > 0) {
         srcm.insert_or_assign("pad_to_multiple", Size_t(N));
         srcm.insert_or_assign("pad_min_tail", Size_t(std::max(3U * N, 2560U))); // the fixed-batch flush tail (FileSourceRaw.hpp)

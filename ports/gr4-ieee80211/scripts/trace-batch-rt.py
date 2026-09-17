@@ -97,6 +97,8 @@ def main():
     f_last = np.array([f["sample_offset"] + f["samples"] - pad_tail - 1 for f in man["frames"]], dtype=np.int64)
     f_first = np.array([f["sample_offset"] + pad_front for f in man["frames"]], dtype=np.int64)
     total_samples = int(man.get("prediction", {}).get("total_samples", 0) or (f_last[-1] + pad_tail + 1))
+    if meta.get("max_samples"):
+        total_samples = min(total_samples, int(meta["max_samples"]))  # --max-samples: only that much was replayed
     out["air_s"] = total_samples / rate if rate > 0 else None
     # slower than real time = the graph could not keep up = response times are unbounded (the
     # throttle publishes late because its output buffer stays full); the point is saturated

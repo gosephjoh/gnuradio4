@@ -47,8 +47,12 @@ struct FileSourceRaw : gr::Block<FileSourceRaw<T>> {
     // lost at N <= 1024 with the 448 alone and decoded at N = 2048 (2008
     // trailing samples).  chain.cpp asks for max(3 N, 2560).
     gr::Size_t pad_min_tail = 0U;
+    // max_items: read at most this many samples of the file, then behave as
+    // at end of file (padding included).  A run of fixed wall-clock length
+    // whatever the rate: rx_latency4 --max-samples.  0 = the whole file.
+    uint64_t   max_items = 0;
 
-    GR_MAKE_REFLECTABLE(FileSourceRaw, out, file_name, sample_rate, pad_to_multiple, pad_min_tail);
+    GR_MAKE_REFLECTABLE(FileSourceRaw, out, file_name, sample_rate, pad_to_multiple, pad_min_tail, max_items);
 
     std::FILE* _f        = nullptr;
     uint64_t   _items    = 0;
@@ -84,7 +88,12 @@ struct FileSourceRaw : gr::Block<FileSourceRaw<T>> {
         }
         struct timespec a, b;
         clock_gettime(CLOCK_MONOTONIC, &a);
-        const std::size_t n = std::fread(sOut.data(), sizeof(T), sOut.size(), _f);
+        std::size_t want = sOut.size();
+        if (max_items > 0) {
+            const uint64_t left = max_items > _items ? max_items - _items : 0;
+            want                = static_cast<std::size_t>(std::min<uint64_t>(want, left));
+        }
+        const std::size_t n = want > 0 ? std::fread(sOut.data(), sizeof(T), want, _f) : 0;
         clock_gettime(CLOCK_MONOTONIC, &b);
         const uint64_t dt = static_cast<uint64_t>(b.tv_sec - a.tv_sec) * 1000000000ull + static_cast<uint64_t>(b.tv_nsec - a.tv_nsec);
         _calls++;

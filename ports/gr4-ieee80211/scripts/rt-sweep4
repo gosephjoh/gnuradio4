@@ -4,7 +4,7 @@
     ./scripts/rt-sweep4 PROFILE.json --probe            # the probe runs (one per batch size), then rt-plan4
     ./scripts/rt-sweep4 PROFILE.json --plan PLAN.json   # the sweep: every point x policy x repeat, plus controls
     ./scripts/rt-sweep4 PROFILE.json --plan PLAN.json --dry-run   # print the commands only
-    ./scripts/rt-sweep4 PROFILE.json --smoke            # a 10 s, one-repeat mini matrix to prove the pipeline
+    ./scripts/rt-sweep4 PROFILE.json --smoke            # a one-repeat mini matrix to prove the pipeline (run_s of the profile)
 
 Every run lands in <cell>/runs4/sweep-<profile>/<tag>/ with latency.csv,
 latency_summary.json, trace_meta.json, the capture (trace.gr4trace, gitignored)
@@ -46,10 +46,6 @@ def ensure_cell(prof, dry):
     return cell
 
 
-def frames_for(prof, run_s, rate):
-    """the cell holds 60 s of air at 10 Msps; the run length is set by rate x cell, so
-    nothing to cut here -- the analysis window does the selection.  Returned for the log."""
-    return None
 
 
 def one_run(prof, cell, sweep_dir, point, policy, rep, traced, run_s, a):
@@ -58,9 +54,13 @@ def one_run(prof, cell, sweep_dir, point, policy, rep, traced, run_s, a):
     tag = f"{kind}_N{N}_t{T}_r{R}_rate{int(rate)}_{policy}_{'trace' if traced else 'notrace'}_rep{rep}"
     out = os.path.join(sweep_dir, tag)
     os.makedirs(out, exist_ok=True)
+    # a run of run_s seconds whatever the rate: replay the first run_s x rate samples
+    max_samples = int(run_s * rate) if run_s else 0
     cmd = [RX, "--run-dir", cell, "--input", os.path.join(cell, "rx_stimulus.cf32"), "--out-dir", out,
            "--rate", str(int(rate)), "--chains", str(R), "--threads", str(T), "--policy", policy,
            "--fixed-batch", str(N), "--timeout-s", str(prof.get("timeout_s", 300))]
+    if max_samples:
+        cmd += ["--max-samples", str(max_samples)]
     if prof.get("sched_ratio"):
         cmd += ["--sched-ratio", str(prof["sched_ratio"])]
     if traced:
@@ -70,10 +70,17 @@ def one_run(prof, cell, sweep_dir, point, policy, rep, traced, run_s, a):
     rc = sh(cmd, a.dry_run)
     if not a.dry_run:
         rc2 = sh([sys.executable, ANALYSE, out, "--warmup", str(prof["warmup_s"]), "--window", str(prof["window_s"]), "--quiet"], False)
-        if a.drop_captures and traced:
+        if traced and not a.keep_captures:
             cap = os.path.join(out, "trace.gr4trace")
             if os.path.exists(cap):
                 os.remove(cap)
+        if traced and not a.keep_tables:
+            # the per-record tables are hundreds of MB per run; batch_rt.json/csv, the header,
+            # the census, the entities and the small EDF/sync tables stay
+            for f in ("trace_invocations.csv", "trace_work.csv", "trace_probes.csv", "trace_events.csv", "trace_sweeps.csv"):
+                fp = os.path.join(out, f)
+                if os.path.exists(fp):
+                    os.remove(fp)
     else:
         rc2 = 0
     return {"tag": tag, "dir": out, "N": N, "workers": T, "receivers": R, "rate": rate, "policy": policy, "traced": traced, "rep": rep,
@@ -89,7 +96,9 @@ def main():
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--policies", help="comma list overriding the profile's")
     ap.add_argument("--repeats", type=int)
-    ap.add_argument("--drop-captures", action="store_true", help="delete trace.gr4trace after analysis (the CSV tables stay)")
+    ap.add_argument("--keep-captures", action="store_true", help="keep trace.gr4trace after analysis (default: deleted; ~1 GB per run)")
+    ap.add_argument("--keep-tables", action="store_true", help="keep the per-record CSV tables after analysis (default: deleted; hundreds of MB per run)")
+    ap.add_argument("--rep-start", type=int, default=0, help="first repeat index to run (resume a sweep)")
     ap.add_argument("--cell", help="override the profile's cell (e.g. a short one for --smoke)")
     a = ap.parse_args()
     prof = json.load(open(a.profile))
@@ -121,12 +130,12 @@ def main():
             pts = [{"N": prof["batches"][0], "workers": 1, "receivers": 1, "rate": prof.get("probe_rate", min(prof["rates"])), "kind": "smoke"}]
             for pt in pts:
                 for pol in policies:
-                    index.append(one_run(prof, cell, sweep_dir, pt, pol, 0, True, 10, a))
-                index.append(one_run(prof, cell, sweep_dir, pts[0], policies[0], 0, False, 10, a))
+                    index.append(one_run(prof, cell, sweep_dir, pt, pol, 0, True, prof["run_s"], a))
+                index.append(one_run(prof, cell, sweep_dir, pts[0], policies[0], 0, False, prof["run_s"], a))
     if a.plan:
         plan = json.load(open(a.plan))
         pts = plan["points"]
-        for rep in range(repeats):
+        for rep in range(a.rep_start, repeats):
             for pt in pts:
                 for pol in policies:
                     index.append(one_run(prof, cell, sweep_dir, pt, pol, rep, True, prof["run_s"], a))

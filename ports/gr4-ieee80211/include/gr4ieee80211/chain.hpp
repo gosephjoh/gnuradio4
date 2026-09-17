@@ -59,6 +59,9 @@ struct ChainConfig {
     // Declare the throttle rate as the file source's `sample_rate` so GR4's
     // scheduling analysis derives a period per block (RT reference 4.2).
     bool        declare_rate = true;
+    // Replay only the first `max_samples` of the file (0 = all): a run of
+    // fixed length whatever the rate (FileSourceRaw::max_items).
+    uint64_t    max_samples = 0;
 };
 
 struct ChainCounters {

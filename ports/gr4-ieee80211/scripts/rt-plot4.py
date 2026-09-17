@@ -66,6 +66,9 @@ def pooled(chains, key):
 def gr3_points(run_dirs):
     out = []
     for rd in run_dirs:
+        if not (os.path.exists(os.path.join(rd, "latency_summary.json")) and os.path.exists(os.path.join(rd, "latency.csv"))):
+            print(f"rt-plot4: --gr3 {rd}: no latency_summary.json/latency.csv, skipped", file=sys.stderr)
+            continue
         summ = json.load(open(os.path.join(rd, "latency_summary.json")))
         lat = list(csv.DictReader(open(os.path.join(rd, "latency.csv"))))
         v = np.array([float(r["lat_last_us"]) for r in lat if r.get("decoded") == "1" and r.get("lat_last_us")])

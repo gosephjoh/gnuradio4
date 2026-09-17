@@ -84,6 +84,7 @@ struct Options {
     unsigned    sched_ratio = 0;     // process_stream_to_message_ratio; 0 = default (16)
     std::string selection   = "heap";
     unsigned    max_outstanding_jobs = 0; // 0 = default (64)
+    uint64_t    max_samples = 0;     // replay only the first M samples (0 = whole file)
 };
 
 uint32_t parseMask(const char* a) {
@@ -122,7 +123,9 @@ void usage() {
         "  --trace-out PATH    write the capture (.gr4trace) here after the run\n"
         "  --sched-ratio N     process_stream_to_message_ratio (default GR4's 16)\n"
         "  --selection S       EDF selector: heap (default) | scan\n"
-        "  --max-outstanding-jobs N  EDF: cap on a block's admitted jobs (default GR4's 64)");
+        "  --max-outstanding-jobs N  EDF: cap on a block's admitted jobs (default GR4's 64)\n"
+        "  --max-samples M     replay only the first M samples of the file (frames beyond are dropped from\n"
+        "                      the tables), so a run lasts M/rate seconds whatever the rate; 0 = whole file");
 }
 
 double percentile(const std::vector<double>& sorted, double q) {
@@ -138,7 +141,7 @@ double percentile(const std::vector<double>& sorted, double q) {
 
 int main(int argc, char** argv) {
     Options opt;
-    static const struct option kOpts[] = {{"run-dir", required_argument, nullptr, 1}, {"input", required_argument, nullptr, 2}, {"out-dir", required_argument, nullptr, 3}, {"rate", required_argument, nullptr, 4}, {"chunk", required_argument, nullptr, 5}, {"chains", required_argument, nullptr, 6}, {"deadline-ms", required_argument, nullptr, 7}, {"timeout-s", required_argument, nullptr, 8}, {"record", no_argument, nullptr, 9}, {"no-check", no_argument, nullptr, 10}, {"buffer", required_argument, nullptr, 11}, {"catch-up", no_argument, nullptr, 12}, {"single", no_argument, nullptr, 13}, {"threads", required_argument, nullptr, 14}, {"batch", required_argument, nullptr, 15}, {"policy", required_argument, nullptr, 16}, {"fixed-batch", required_argument, nullptr, 17}, {"tiny-period", required_argument, nullptr, 18}, {"trace-categories", required_argument, nullptr, 19}, {"trace-buffer", required_argument, nullptr, 20}, {"trace-limit-mb", required_argument, nullptr, 21}, {"trace-out", required_argument, nullptr, 22}, {"sched-ratio", required_argument, nullptr, 23}, {"selection", required_argument, nullptr, 24}, {"max-outstanding-jobs", required_argument, nullptr, 25}, {"help", no_argument, nullptr, 'h'}, {nullptr, 0, nullptr, 0}};
+    static const struct option kOpts[] = {{"run-dir", required_argument, nullptr, 1}, {"input", required_argument, nullptr, 2}, {"out-dir", required_argument, nullptr, 3}, {"rate", required_argument, nullptr, 4}, {"chunk", required_argument, nullptr, 5}, {"chains", required_argument, nullptr, 6}, {"deadline-ms", required_argument, nullptr, 7}, {"timeout-s", required_argument, nullptr, 8}, {"record", no_argument, nullptr, 9}, {"no-check", no_argument, nullptr, 10}, {"buffer", required_argument, nullptr, 11}, {"catch-up", no_argument, nullptr, 12}, {"single", no_argument, nullptr, 13}, {"threads", required_argument, nullptr, 14}, {"batch", required_argument, nullptr, 15}, {"policy", required_argument, nullptr, 16}, {"fixed-batch", required_argument, nullptr, 17}, {"tiny-period", required_argument, nullptr, 18}, {"trace-categories", required_argument, nullptr, 19}, {"trace-buffer", required_argument, nullptr, 20}, {"trace-limit-mb", required_argument, nullptr, 21}, {"trace-out", required_argument, nullptr, 22}, {"sched-ratio", required_argument, nullptr, 23}, {"selection", required_argument, nullptr, 24}, {"max-outstanding-jobs", required_argument, nullptr, 25}, {"max-samples", required_argument, nullptr, 26}, {"help", no_argument, nullptr, 'h'}, {nullptr, 0, nullptr, 0}};
     int c;
     while ((c = getopt_long(argc, argv, "h", kOpts, nullptr)) != -1) {
         switch (c) {
@@ -167,6 +170,7 @@ int main(int argc, char** argv) {
         case 23: opt.sched_ratio = static_cast<unsigned>(std::strtoul(optarg, nullptr, 10)); break;
         case 24: opt.selection = optarg; break;
         case 25: opt.max_outstanding_jobs = static_cast<unsigned>(std::strtoul(optarg, nullptr, 10)); break;
+        case 26: opt.max_samples = std::strtoull(optarg, nullptr, 10); break;
         default: usage(); return 2;
         }
     }
@@ -229,8 +233,13 @@ int main(int argc, char** argv) {
     std::vector<uint32_t> lengths;
     std::vector<uint64_t> offsets;
     bool                  order_mode = false; // every seq null -> pair by order (GR3 payload_checker)
+    uint64_t frames_dropped = 0;
     for (const auto& fr : manifest.at("frames")) {
         const uint64_t so = fr.at("sample_offset").get<uint64_t>(), ns = fr.at("samples").get<uint64_t>();
+        if (opt.max_samples > 0 && so + ns > opt.max_samples) {
+            ++frames_dropped; // beyond the replayed part of the file (the manifest is in offset order)
+            continue;
+        }
         first.push_back(so + static_cast<uint64_t>(pad_front));
         last.push_back(so + ns - static_cast<uint64_t>(pad_tail) - 1);
         lengths.push_back(fr.at("length").get<uint32_t>());
@@ -244,6 +253,13 @@ int main(int argc, char** argv) {
         }
     }
     const std::size_t frames = first.size();
+    if (frames_dropped > 0) {
+        std::println(stderr, "rx_latency4: --max-samples {}: replaying {} of {} frames", opt.max_samples, frames, frames + frames_dropped);
+    }
+    if (frames == 0) {
+        std::println(stderr, "rx_latency4: no frame ends before --max-samples {}", opt.max_samples);
+        return 2;
+    }
     if (order_mode) {
         for (const auto& fr : manifest.at("frames")) {
             if (!fr.at("seq").is_null()) {
@@ -285,6 +301,7 @@ int main(int argc, char** argv) {
         cfg.batch       = opt.batch;
         cfg.fixed_batch = opt.fixed_batch;
         cfg.tiny_period = opt.fixed_batch > 0 ? opt.tiny_period : 0.f;
+        cfg.max_samples = opt.max_samples;
         ChainBlocks cb  = buildChain(graph, cfg);
         cb.stamper->setFrames(first, last);
         cb.sink->setFrames(frames);
@@ -469,7 +486,7 @@ int main(int argc, char** argv) {
     }
     std::fclose(csv);
 
-    json summary = {{"app", "rx_latency4"}, {"runtime", "gnuradio4"}, {"scheduler", sched_name}, {"policy", opt.policy}, {"policy_name", policy_name}, {"fixed_batch", opt.fixed_batch}, {"tiny_period_s", opt.fixed_batch > 0 ? opt.tiny_period : 0.f}, {"selection_strategy", opt.selection}, {"sched_ratio", opt.sched_ratio}, {"max_outstanding_jobs", opt.max_outstanding_jobs}, {"trace", trace_info}, {"buffer", opt.buffer}, {"catch_up", opt.catch_up}, {"threads", opt.single ? 1U : pool_threads}, {"batch", opt.batch}, {"hw_threads", hw_threads}, {"chains", opt.chains}, {"order_mode", order_mode}, {"blocks_per_chain", chains[0].block_count}, {"frames", frames}, {"decoded_total", decoded_total}, {"missing_total", missing_total}, {"wrong_payload_total", opt.check ? json(wrong_total) : json(nullptr)}, {"deadline_misses_total", misses_total}, {"elapsed_s", elapsed_s}, {"latency", {{"rate", opt.rate}, {"chunk", opt.chunk}, {"deadline_ms", opt.deadline_ms}, {"stamp_bias_max_us", opt.rate > 0 ? opt.chunk / opt.rate * 1e6 : 0.0}, {"input", opt.input}}}, {"result", ok ? "ok" : (timed_out.load() ? "timeout" : "error")}, {"per_chain", per_chain}};
+    json summary = {{"app", "rx_latency4"}, {"runtime", "gnuradio4"}, {"scheduler", sched_name}, {"policy", opt.policy}, {"policy_name", policy_name}, {"fixed_batch", opt.fixed_batch}, {"tiny_period_s", opt.fixed_batch > 0 ? opt.tiny_period : 0.f}, {"selection_strategy", opt.selection}, {"sched_ratio", opt.sched_ratio}, {"max_outstanding_jobs", opt.max_outstanding_jobs}, {"trace", trace_info}, {"max_samples", opt.max_samples}, {"frames_dropped", frames_dropped}, {"buffer", opt.buffer}, {"catch_up", opt.catch_up}, {"threads", opt.single ? 1U : pool_threads}, {"batch", opt.batch}, {"hw_threads", hw_threads}, {"chains", opt.chains}, {"order_mode", order_mode}, {"blocks_per_chain", chains[0].block_count}, {"frames", frames}, {"decoded_total", decoded_total}, {"missing_total", missing_total}, {"wrong_payload_total", opt.check ? json(wrong_total) : json(nullptr)}, {"deadline_misses_total", misses_total}, {"elapsed_s", elapsed_s}, {"latency", {{"rate", opt.rate}, {"chunk", opt.chunk}, {"deadline_ms", opt.deadline_ms}, {"stamp_bias_max_us", opt.rate > 0 ? opt.chunk / opt.rate * 1e6 : 0.0}, {"input", opt.input}}}, {"result", ok ? "ok" : (timed_out.load() ? "timeout" : "error")}, {"per_chain", per_chain}};
     {
         std::ofstream f(opt.out_dir + "/latency_summary.json");
         f << summary.dump(2) << "\n";
@@ -485,7 +502,7 @@ int main(int argc, char** argv) {
             for (const auto& [uname, role] : chains[k].roles) { blocks.push_back({{"unique_name", uname}, {"role", role}}); }
             jchains.push_back({{"chain", k}, {"throttle_start_ns", cc.thr_start_ns}, {"throttle_chunks", cc.thr_chunks}, {"throttle_max_chunks_per_call", cc.thr_max_chunks_per_call}, {"throttle_max_backlog_samples", cc.thr_max_backlog}, {"blocks", blocks}});
         }
-        json meta = {{"app", "rx_latency4"}, {"run_dir", opt.run_dir}, {"input", opt.input}, {"out_dir", opt.out_dir}, {"policy", opt.policy}, {"policy_name", policy_name}, {"scheduler", sched_name}, {"threads", opt.single ? 1U : pool_threads}, {"hw_threads", hw_threads}, {"rate", opt.rate}, {"chunk", opt.chunk}, {"fixed_batch", opt.fixed_batch}, {"batch", opt.batch}, {"buffer", opt.buffer}, {"tiny_period_s", opt.fixed_batch > 0 ? opt.tiny_period : 0.f}, {"selection_strategy", opt.selection}, {"sched_ratio", opt.sched_ratio}, {"max_outstanding_jobs", opt.max_outstanding_jobs}, {"frames", frames}, {"elapsed_s", elapsed_s}, {"result", ok ? "ok" : (timed_out.load() ? "timeout" : "error")}, {"trace", trace_info}, {"chains", jchains}, {"analysis", analysis}, {"diagnostics", diagnostics}};
+        json meta = {{"app", "rx_latency4"}, {"run_dir", opt.run_dir}, {"input", opt.input}, {"out_dir", opt.out_dir}, {"policy", opt.policy}, {"policy_name", policy_name}, {"scheduler", sched_name}, {"threads", opt.single ? 1U : pool_threads}, {"hw_threads", hw_threads}, {"rate", opt.rate}, {"chunk", opt.chunk}, {"fixed_batch", opt.fixed_batch}, {"batch", opt.batch}, {"buffer", opt.buffer}, {"tiny_period_s", opt.fixed_batch > 0 ? opt.tiny_period : 0.f}, {"selection_strategy", opt.selection}, {"sched_ratio", opt.sched_ratio}, {"max_outstanding_jobs", opt.max_outstanding_jobs}, {"frames", frames}, {"max_samples", opt.max_samples}, {"elapsed_s", elapsed_s}, {"result", ok ? "ok" : (timed_out.load() ? "timeout" : "error")}, {"trace", trace_info}, {"chains", jchains}, {"analysis", analysis}, {"diagnostics", diagnostics}};
         std::ofstream f(opt.out_dir + "/trace_meta.json");
         f << meta.dump(2) << "\n";
     }
