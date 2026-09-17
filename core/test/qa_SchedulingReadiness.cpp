@@ -108,7 +108,7 @@ struct MixedJoin : gr::Block<MixedJoin<T>> {
 
 /// A block declaring an *explicit* message input port. `all_input_ports` includes it, the stream-only
 /// `PortCache` does not, and it reports `isSynchronous() == true` -- so before the gating rule was
-/// centralised it landed in the capacity minimum and shrank the bound (DEVLOG_M3 §15).
+/// centralised it landed in the capacity minimum and shrank the bound.
 template<typename T>
 struct MsgGatedCopy : gr::Block<MsgGatedCopy<T>> {
     gr::PortIn<T>  in;
@@ -122,7 +122,7 @@ struct MsgGatedCopy : gr::Block<MsgGatedCopy<T>> {
 
 constexpr std::size_t kProbeCeiling = 1024UZ;
 
-/// Outcome of running the predicate and `work()` side by side (DEVLOG_M3 §5B.4).
+/// Outcome of running the predicate and `work()` side by side.
 ///
 /// `falseNegatives` is the number that matters: the predicate said "not runnable" and the block
 /// then moved data anyway. Under the release model that is not a missed tick but a permanent
@@ -324,8 +324,7 @@ const boost::ut::suite<"readiness predicate vs work()"> crossCheckTests = [] {
     "an asynchronous join is optimistic, and that divergence is real"_test = [] {
         // in0 has data, in1 has none. The `max`-across-async rule reports the block runnable, but
         // `processBulk` takes `min(a, b, out)` and moves nothing. Asserted rather than merely
-        // noted, so that narrowing the predicate later shows up here as a deliberate change
-        // (DEVLOG_M3 §5A.6, §5B.4).
+        // noted, so that narrowing the predicate later shows up here as a deliberate change.
         TwoInput<Join2Async<float>, "in0", "in1"> harness;
         harness.prime(64UZ, 0UZ);
         activate(*harness.under);
@@ -344,7 +343,8 @@ const boost::ut::suite<"readiness predicate vs work()"> crossCheckTests = [] {
     // `availableToProcess`, so `computeSampleLimits()` folds `requestedWork` through unchanged and
     // `performed_work` comes back equal to it -- with both input buffers empty, nothing consumed
     // and nothing published. Any loop treating `performed_work > 0` as "this block did something"
-    // is therefore misled by such a block; M2e's selection loop restarts on exactly that signal.
+    // is therefore misled by such a block; the fixed-priority selection loop restarts on exactly
+    // that signal.
     "performed_work is non-zero for an idle all-asynchronous block"_test = [] {
         TwoInput<Join2Async<float>, "in0", "in1"> harness;
         harness.prime(0UZ, 0UZ);

@@ -68,12 +68,12 @@ struct DerivedAttributes {
 
     /// The source this block's rate descends from. Periods are anchored against *this* source's
     /// `sample_rate`, not a single graph-wide one, so independent chains keep independent
-    /// timebases and one chain's rate cannot rescale another's (debt D3).
+    /// timebases and one chain's rate cannot rescale another's.
     const BlockModel* originSource = nullptr;
 
     /// Rate of the stream this block processes, relative to its source's -- the propagated
     /// primitive. It depends only on resampling ratios and strides, never on batch sizes, which is
-    /// what lets blocks run at different batches without disturbing one another (§14.5).
+    /// what lets blocks run at different batches without disturbing one another.
     double relativeSampleRate = 1.0;
 
     double      relativeRate = 1.0; /// invocations per invocation of the component's source; derived from the above
@@ -178,7 +178,7 @@ namespace detail {
 /// Samples the stream advances per invocation -- `stride` where it is active, otherwise the
 /// window itself. This is the *consumption* quantum, which sets invocation rate and downstream
 /// sample rate; the *work* quantum, which execution cost scales with, is the window. The two
-/// coincide only while stride is inactive -- see STRIDE_SEMANTICS.md, "the two quanta".
+/// coincide only while stride is inactive.
 [[nodiscard]] inline std::size_t effectiveAdvance(const BlockModel& block) {
     const std::size_t chunk = std::max(settingAsSize(block, "input_chunk_size", 1UZ), 1UZ);
     return strideActive(block) ? std::max(settingAsSize(block, "stride", chunk), 1UZ) : chunk;
@@ -189,7 +189,7 @@ namespace detail {
 /// The one place the port-gating rule lives: which ports count, and how their per-port quantities
 /// combine. Everything that reasons about a block's input gate goes through it, because two
 /// implementations of this rule agreeing on the combination and diverging on the membership is
-/// exactly how the capacity bound came to be computed over the wrong ports (§15).
+/// exactly how the capacity bound came to be computed over the wrong ports.
 ///
 /// A port counts when it is **connected** and is a **stream** port. Message ports are excluded
 /// deliberately: `Port::kIsSynch` is "synchronous unless marked `Async`", so a message port reports
@@ -330,7 +330,19 @@ struct Readiness {
 /// minimum separation between consecutive releases. `now` is the detection instant and becomes the
 /// job's release time -- no nominal instant is ever invented, because a release is *defined* as the
 /// detection of eligibility and a nominal one asserts an eligibility that may never have occurred.
-inline void releaseIfEligible(BlockModel& block, SchedState& state, std::chrono::steady_clock::time_point now) {
+/// Largest relative deadline whose conversion to `steady_clock::duration` stays inside the integer
+/// range. Beyond it `duration_cast` performs an out-of-range `double` -> `int64` conversion, which is
+/// undefined behaviour rather than wrap-around -- so the check has to precede the conversion, and a
+/// deadline computed past this point cannot be tested after the fact because there is no defined
+/// "after". This detects the condition; clamping it would change which block the scheduler runs and
+/// belongs to the scheduling thrust, not to instrumentation.
+inline constexpr double kMaxRepresentableDeadlineSeconds = static_cast<double>(std::numeric_limits<std::chrono::steady_clock::rep>::max()) * static_cast<double>(std::chrono::steady_clock::period::num) / static_cast<double>(std::chrono::steady_clock::period::den);
+
+/// `traceFlags` carries what only the caller knows: which detection path this is. Clear means the
+/// per-sweep backstop, `gr::trace::flag::kViaSuccessorWalk` the event-driven walk. Defaulted because
+/// the backstop is the neutral answer and the unit tests that drive this function directly are not
+/// testing the detection path; the two scheduler call sites both pass it explicitly.
+inline void releaseIfEligible(BlockModel& block, SchedState& state, std::chrono::steady_clock::time_point now, [[maybe_unused]] std::uint8_t traceFlags = 0U) {
     if (state.finished) {
         return;
     }
@@ -387,10 +399,59 @@ inline void releaseIfEligible(BlockModel& block, SchedState& state, std::chrono:
 
     if (!state.jobs.push(Job{.batch = batch, .releaseTime = now, .absoluteDeadline = deadline})) {
         ++state.overruns;
+        if constexpr (gr::trace::kEnabled) {
+            if (gr::trace::categoryEnabled(gr::trace::Category::release)) {
+                // The samples stay unassigned and are offered again later, so this is backlog rather
+                // than an error -- and it is the only place the `max_outstanding_jobs` clamp becomes
+                // visible, which is what makes its default profileable at all.
+                gr::trace::emit(gr::trace::Event{.startNs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count()), //
+                    .payload0                             = gr::trace::saturate(batch),
+                    .payload1                             = gr::trace::saturate(state.jobs.capacity()),
+                    .payload2                             = gr::trace::saturate(state.overruns), //
+                    .entity                               = state.entityId,
+                    .kind                                 = gr::trace::Kind::jobReleaseDropped,
+                    .workerId                             = state.workerId,
+                    .flags                                = traceFlags});
+            }
+        }
         return;
     }
     state.assignedSamples += batch;
     state.lastRelease = now;
+
+    if constexpr (gr::trace::kEnabled) {
+        if (gr::trace::categoryEnabled(gr::trace::Category::release)) {
+            // `startNs` *is* the release instant, in the same clock domain as every other marker and
+            // as `Job::releaseTime` itself -- which is what lets a report subtract a completion from
+            // it without a conversion step that could disagree.
+            const bool suspectDeadline = deadlineSeconds > kMaxRepresentableDeadlineSeconds;
+
+            // A suspect deadline is reported as saturated rather than as its own flag: `jobRelease`
+            // has no spare bit (0 is the detection path, 1 the waiver, [2,8) the queue depth), and
+            // `kSaturated` already means "the real value exceeded the payload", which is exactly the
+            // case. The miss site recomputes the suspicion from `SchedState`, so nothing has to be
+            // carried through `Job` to reach it.
+            const std::uint32_t relativeDeadlineNs = suspectDeadline ? gr::trace::kSaturated                                      //
+                                                     : deadlineSeconds > 0.0                                                      //
+                                                         ? gr::trace::saturate(static_cast<std::uint64_t>(deadlineSeconds * 1e9)) //
+                                                         : gr::trace::kUnsetDeadline;
+
+            // Saturating at 63 rather than masking: the queue depth shares a byte with two flags and
+            // gets six bits, while `max_outstanding_jobs` defaults to 64 -- so masking would wrap a
+            // full queue to 0 and report "empty" for "completely full". Read together with
+            // `jobReleaseDropped`, which carries the true capacity, 63 is unambiguous.
+            const std::uint8_t packedDepth = static_cast<std::uint8_t>(std::min(state.jobs.size, 63UZ) << 2U);
+
+            gr::trace::emit(gr::trace::Event{.startNs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count()), //
+                .payload0                             = gr::trace::saturate(batch),
+                .payload1                             = relativeDeadlineNs,
+                .payload2                             = gr::trace::saturate(unassigned), //
+                .entity                               = state.entityId,
+                .kind                                 = gr::trace::Kind::jobRelease,
+                .workerId                             = state.workerId, //
+                .flags                                = static_cast<std::uint8_t>(traceFlags | (draining ? gr::trace::flag::kEosWaived : 0U) | packedDepth)});
+        }
+    }
 }
 
 /// Retires the job at the head of the queue, returning its whole assignment to the unassigned pool.
@@ -765,7 +826,7 @@ requires std::invocable<const TUserSetLookup&, const BlockModel&>
     // reference source, so it stays meaningful on graphs with no absolute anchor at all.
     const auto consumedPerInvocation = [&analysis](BlockModel& block) {
         // What the *stream* advances per invocation, which is what sets how often the block fires.
-        // Only stride separates this from the batch the block processes -- STRIDE_SEMANTICS.md.
+        // Only stride separates this from the batch the block processes.
         return detail::strideActive(block) ? static_cast<double>(detail::effectiveAdvance(block)) : static_cast<double>(analysis.perBlock.at(std::addressof(block)).nominalBatch);
     };
 
@@ -788,7 +849,7 @@ requires std::invocable<const TUserSetLookup&, const BlockModel&>
     // different sample rates have two timebases, and forcing them onto one silently rescales every
     // period in the losing chain -- by 48x for a 1 kHz chain measured against a 48 kHz anchor. It
     // was also decided by block *name*, since findSourceBlocks() sorts by name, so renaming a block
-    // could change every derived period in the graph (debt D3).
+    // could change every derived period in the graph.
     std::unordered_map<const BlockModel*, double> anchorOf;
     std::size_t                                   anchoredSources = 0UZ;
     for (const std::shared_ptr<BlockModel>& source : sources) {

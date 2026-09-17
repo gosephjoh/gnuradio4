@@ -5,6 +5,7 @@ set(gnuradio_core_sources
     src/BlockModel.cpp
     src/Logger.cpp
     src/Settings.cpp
+    src/Trace.cpp
     src/Graph.cpp
     src/PluginLoader.cpp
     src/PmtTypeHelpers.cpp)
@@ -41,6 +42,8 @@ set(public_headers
     include/gnuradio-4.0/Tag.hpp
     include/gnuradio-4.0/Tensor.hpp
     include/gnuradio-4.0/TensorMath.hpp
+    include/gnuradio-4.0/Trace.hpp
+    include/gnuradio-4.0/TraceFile.hpp
     include/gnuradio-4.0/TriggerMatcher.hpp
     include/gnuradio-4.0/Value.hpp
     include/gnuradio-4.0/ValueHelper.hpp
@@ -111,6 +114,7 @@ install(
 install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 
 add_subdirectory(src)
+add_subdirectory(tools/gr4-trace)
 
 if(ENABLE_TESTING)
   add_subdirectory(test)

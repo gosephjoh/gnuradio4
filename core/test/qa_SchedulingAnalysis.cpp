@@ -64,7 +64,7 @@ struct StridedWindow : gr::Block<StridedWindow<T, kWindow, kStride>, gr::Resampl
 };
 
 /// A 1:1 block with an active stride -- the pre-2024 contract, where the window comes from the
-/// port bound rather than from `input_chunk_size`. See STRIDE_SEMANTICS.md §2.2.
+/// port bound rather than from `input_chunk_size`.
 template<typename T, gr::Size_t kStride>
 struct StridedPassThrough : gr::Block<StridedPassThrough<T, kStride>, gr::Stride<kStride>> {
     gr::PortIn<T>  in;
@@ -319,7 +319,7 @@ const boost::ut::suite<"SchedulingAnalysis"> schedulingAnalysisTests = [] {
         // `nominalBatch` samples of the full-rate stream per invocation, exactly as its source
         // produces `nominalBatch` per invocation, so the two run equally often; it is the sink,
         // fed at an eighth of the rate, that runs less. Asserting 1/8 *at* the decimator was the
-        // pre-M1d formula's error -- see DEVLOG_M1 §14.5 and §14.9 F3.
+        // earlier formula's error.
         expect(approx(decAttr->relativeSampleRate, 1.0, 1e-9)) << "the decimator still sees the full-rate stream on its input";
         expect(approx(sinkAttr->relativeSampleRate, 1.0 / 8.0, 1e-9)) << "the 8:1 reduction applies to what the decimator emits";
         expect(approx(decAttr->relativeRate, 1.0, 1e-9)) << "consuming a whole batch of the full-rate stream, it invokes as often as its source";
@@ -353,8 +353,8 @@ const boost::ut::suite<"SchedulingAnalysis"> schedulingAnalysisTests = [] {
         //
         // N.B. this used to assert the join took the *faster* branch. `Join2`'s inputs are
         // synchronous, so the block cannot run until both are satisfied and its rate is the
-        // slower one -- see §14.15. The test's purpose is unchanged: it guards re-propagation past
-        // an already-processed block, now in the lowering direction.
+        // slower one. The test's purpose is unchanged: it guards re-propagation past an
+        // already-processed block, now in the lowering direction.
         gr::Graph graph;
         auto&     src  = graph.emplaceBlock<RateSource<float>>(atRate(1000.f));
         auto&     hop1 = graph.emplaceBlock<gr::testing::Copy<float>>();
@@ -383,8 +383,8 @@ const boost::ut::suite<"SchedulingAnalysis"> schedulingAnalysisTests = [] {
     };
 
     "an asynchronous join runs at the rate of its fastest input"_test = [] {
-        // The other half of §14.15: an async port lets the block run when *any* input has data
-        // (Block.hpp:1484), so the fastest contributor sets its rate -- the opposite of the
+        // The other half of the same rule: an async port lets the block run when *any* input has
+        // data (Block.hpp:1484), so the fastest contributor sets its rate -- the opposite of the
         // synchronous case above, from the same propagation pass.
         gr::Graph graph;
         auto&     src  = graph.emplaceBlock<RateSource<float>>(atRate(1000.f));
@@ -568,9 +568,9 @@ const boost::ut::suite<"SchedulingAnalysis"> schedulingAnalysisTests = [] {
     };
 
     "a graph containing a sub-scheduler is analysed without hanging"_test = [] {
-        // Pays down debt D2 (§10.1): every other graph in this suite is flat, so `flatten()`'s
-        // actual purpose went unexercised -- which is how M1d-3 shipped an unguarded
-        // `perBlock.at()` on a block named by the adjacency list but absent from `graph.blocks()`.
+        // Every other graph in this suite is flat, so `flatten()`'s actual purpose went
+        // unexercised -- which is how an earlier revision shipped an unguarded `perBlock.at()` on
+        // a block named by the adjacency list but absent from `graph.blocks()`.
         // It threw inside init(), the scheduler never reached RUNNING, and qa_ManagedSubGraph and
         // qa_SchedulerMessages hung for minutes. A flat-graph suite cannot see any of that.
         using SubScheduler = gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multiThreaded>;
@@ -601,10 +601,10 @@ const boost::ut::suite<"SchedulingAnalysis"> schedulingAnalysisTests = [] {
     };
 
     "a decimator's own period matches its source's"_test = [] {
-        // The M1d-3 guard. Under the pre-M1d formula the decimator's period came out 8x too long,
-        // because an *invocation*-rate ratio was multiplied by a graph-wide batch. It consumes a
-        // whole batch of the full-rate stream, exactly as the source produces one, so the two
-        // periods are equal. Reverting the formula makes this test, and only this test, fail.
+        // The guard on the period formula. Under the earlier formula the decimator's period came
+        // out 8x too long, because an *invocation*-rate ratio was multiplied by a graph-wide batch.
+        // It consumes a whole batch of the full-rate stream, exactly as the source produces one, so
+        // the two periods are equal. Reverting the formula makes this test, and only this test, fail.
         gr::Graph graph;
         auto&     src  = graph.emplaceBlock<RateSource<float>>(atRate(1000.f));
         auto&     dec  = graph.emplaceBlock<Decimate<float, 8U>>();
@@ -711,7 +711,7 @@ const boost::ut::suite<"SchedulingAnalysis"> schedulingAnalysisTests = [] {
     };
 
     "an unbounded block keeps an unbounded execution ceiling"_test = [] {
-        // F2: the strategy's 4096 stand-in is a *modelling* value. Letting it reach the worker
+        // The strategy's 4096 stand-in is a *modelling* value. Letting it reach the worker
         // would cap every block in every stock graph, so only `nominalBatch` may carry it.
         UnanchoredChain g;
         const auto      analysis = deriveSchedulingAttributes(g.graph, defaultStrategy, noneUserSet);
@@ -784,7 +784,7 @@ const boost::ut::suite<"SchedulingAnalysis"> schedulingAnalysisTests = [] {
     };
 
     "port bounds are read from the type-erased snapshot"_test = [] {
-        // F4: DynamicPort holds *copies* of min_samples/max_samples taken once, lazily, when
+        // DynamicPort holds *copies* of min_samples/max_samples taken once, lazily, when
         // initDynamicPorts() first runs -- normally at connect(). A bound applied to the typed
         // port after that is honoured by computeSampleLimits() but invisible here. This test
         // pins the behaviour rather than asserting it is desirable.
@@ -802,14 +802,14 @@ const boost::ut::suite<"SchedulingAnalysis"> schedulingAnalysisTests = [] {
         // N.B. the assertion is on `nominalBatch`, not `executionCeiling`: a port bound is modelling
         // input, never an execution instruction. The block already enforces its own port limits in
         // computeSampleLimits(), and restating them as a `requestedWork` ceiling changes what it
-        // runs -- see §14.13, where doing exactly that broke qa_Block.
+        // runs -- doing exactly that broke qa_Block.
         expect(eq(midAttr->nominalBatch, 512UZ)) << "a port bound set before connection must reach the resolver";
         expect(eq(midAttr->executionCeiling, kUnboundedBatch)) << "but must not be executed against";
         expect(midAttr->batchOrigin == AttributeOrigin::derivedFromRate) << "a port-derived bound rests on the rate model, not on configuration";
     };
 
     "a port bound changed after the first derivation does not reach a later one"_test = [] {
-        // F4: DynamicPort holds *copies* of min_samples/max_samples, taken once under
+        // DynamicPort holds *copies* of min_samples/max_samples, taken once under
         // std::call_once when initDynamicPorts() first runs and never refreshed. Connection does
         // not trigger it -- the resolver itself is normally the first accessor, so a first
         // derivation does see current values. What it cannot see is a later change.
@@ -885,8 +885,8 @@ const boost::ut::suite<"SchedulingAnalysis"> schedulingAnalysisTests = [] {
     };
 
     "independent chains keep independent timebases"_test = [] {
-        // Debt D3. Before this, one global anchor governed the whole graph: these two chains both
-        // came out at 4.096 s, leaving the 48 kHz chain 48x too slow.
+        // Before per-source anchoring, one global anchor governed the whole graph: these two
+        // chains both came out at 4.096 s, leaving the 48 kHz chain 48x too slow.
         gr::Graph graph;
         auto&     slowSrc  = graph.emplaceBlock<RateSource<float>>({{"sample_rate", 1000.f}});
         auto&     slowSink = graph.emplaceBlock<gr::testing::NullSink<float>>();
@@ -947,7 +947,7 @@ const boost::ut::suite<"SchedulingAnalysis"> schedulingAnalysisTests = [] {
     };
 
     "flatten hoists a transparent subgraph's blocks into the analysis"_test = [] {
-        // Debt D2. Every other graph in this suite is flat, so `flatten()`'s actual purpose --
+        // Every other graph in this suite is flat, so `flatten()`'s actual purpose --
         // hoisting the children of a TransparentBlockGroup -- went unexercised. The sub-*scheduler*
         // test above does not cover it: a ScheduledBlockGroup is deliberately *not* traversed by
         // `flatten<TransparentBlockGroup>`, so its children are never hoisted.
@@ -1026,9 +1026,9 @@ const boost::ut::suite<"SchedulingAnalysis"> schedulingAnalysisTests = [] {
     };
 
     "a nested block's analysis entry survives the scheduler taking the graph"_test = [] {
-        // §9.8's lifetime reasoning -- `flatten()` re-adds the *same* `shared_ptr<BlockModel>`, so
-        // pointers captured beforehand stay valid as analysis keys -- asserted for a nested graph
-        // for the first time. Untested, this is exactly the kind of thing that fails as a missing
+        // The lifetime reasoning the analysis keys rest on -- `flatten()` re-adds the *same*
+        // `shared_ptr<BlockModel>`, so pointers captured beforehand stay valid as analysis keys --
+        // asserted for a nested graph for the first time. Untested, this is exactly the kind of thing that fails as a missing
         // map entry long after the change that caused it.
         gr::Graph inner;
         auto&     innerSrc = inner.emplaceBlock<RateSource<float>>(atRate(1000.f));
@@ -1096,8 +1096,8 @@ const boost::ut::suite<"SchedulingAnalysis"> schedulingAnalysisTests = [] {
     };
 
     "per-block batches set periods independently of one another"_test = [] {
-        // The payoff of D1 (§14.12): a block's batch sets *its own* period and leaves the stream
-        // rate alone, so neighbours are free to run at different batches. Before the fix a single
+        // A block's batch sets *its own* period and leaves the stream rate alone, so neighbours
+        // are free to run at different batches. Before the fix a single
         // graph-wide batch was baked into the propagated quantity.
         gr::Graph graph;
         auto&     src   = graph.emplaceBlock<RateSource<float>>(atRate(1000.f));
@@ -1181,7 +1181,7 @@ const boost::ut::suite<"SchedulingAnalysis"> schedulingAnalysisTests = [] {
     };
 
     "a stock graph is still asked for an unbounded batch"_test = [] {
-        // The F2 gate. `NominalBatchStrategy` reports a 4096 stand-in for `nominalBatch` where
+        // `NominalBatchStrategy` reports a 4096 stand-in for `nominalBatch` where
         // nothing bounds a block -- had that reached the worker it would cap every graph in the
         // project at 4096 samples while claiming to be behaviour-neutral.
         gr::Graph graph;

@@ -15,6 +15,7 @@
 #include <vector>
 
 #include <gnuradio-4.0/BlockModel.hpp>
+#include <gnuradio-4.0/Trace.hpp>
 
 namespace gr::scheduler {
 
@@ -75,7 +76,7 @@ enum class SelectionStrategy : std::uint8_t {
 /// Whether the ordering key is fixed once the schedule is formed, and the list can be pre-sorted.
 [[nodiscard]] constexpr bool hasStaticKey(PriorityClass priorityClass) noexcept { return priorityClass == PriorityClass::none || priorityClass == PriorityClass::fixedTask; }
 
-/// Whether the policy needs job-release and absolute-deadline bookkeeping (§3.4).
+/// Whether the policy needs job-release and absolute-deadline bookkeeping.
 [[nodiscard]] constexpr bool needsReleaseTracking(PriorityClass priorityClass) noexcept { return priorityClass == PriorityClass::fixedJob || priorityClass == PriorityClass::dynamic; }
 
 /// Whether the worker selects the highest-priority eligible block each time, rather than sweeping.
@@ -92,7 +93,7 @@ struct Job {
 
 /// Fixed-capacity ring over storage owned elsewhere: the scheduler allocates one arena during setup
 /// and hands each block a slice, so releasing a job never allocates. Capacity is per block and
-/// derived, not a constant -- see DEVLOG_M3 §5.7.
+/// derived from the gating input capacity divided by the block's batch floor, not a constant.
 struct JobQueue {
     std::span<Job> storage{};
     std::size_t    head = 0UZ;
@@ -131,6 +132,17 @@ struct JobQueue {
 struct SchedState {
     std::size_t index = 0UZ;
 
+    /// Interned trace identity, assigned in `syncSchedStates()` and `kNoEntity` where tracing is
+    /// compiled out. Cached here rather than looked up per marker because this struct is already
+    /// beside the block in the worker's hot loop, and because an id derived from the block's address
+    /// survives `applyStaticOrder`'s permutation -- which a position-derived one would not.
+    gr::trace::EntityId entityId = gr::trace::kNoEntity;
+
+    /// Which worker owns this state, for markers emitted from code that has the state but not the
+    /// worker -- `releaseIfEligible()` is a free function and would otherwise attribute every release
+    /// to worker 0. Assigned beside `entityId` in `syncSchedStates()`, which already receives it.
+    std::uint8_t workerId = 0U;
+
     /// Per-invocation batch ceiling, resolved once during setup and handed to `work()` as its
     /// requested work. Ceiling only: a batch *floor* has no enforcement path at this layer, since
     /// `work()` takes an upper bound and clamps it up to the block's release threshold.
@@ -146,6 +158,16 @@ struct SchedState {
     /// inheriting a derived rank -- and because, being block-local, it survives adoption intact.
     std::int32_t userPriority = 0;
 
+    /// Unproductive `work()` invocations this sweep, and what they cost. Aggregated rather than
+    /// recorded one record at a time: under round robin and fixed priority `work()` doubles as the
+    /// eligibility oracle, so most invocations do nothing, and a record each would bury the
+    /// productive ones. Flushed to one `workProbe` per block per sweep and zeroed.
+    ///
+    /// Reset wholesale by `syncSchedStates()` on the house-keeping cadence, which is harmless: these
+    /// are per-sweep quantities and the sweep that filled them has already flushed them.
+    std::uint32_t probeCount = 0U;
+    std::uint64_t probeNs    = 0UL;
+
     /// Set when the block has reported `DONE`, so a selection loop can skip it instead of
     /// re-probing it on every restart. Cleared whenever the states are re-derived, which is the
     /// right scope: a graph mutation invalidates the conclusion.
@@ -157,7 +179,7 @@ struct SchedState {
     JobQueue jobs{};
 
     /// Zero-initialised on purpose: it makes the temporal gate vacuous on the first sweep, so a
-    /// block's first release is decided by data alone (DEVLOG_M3 §5A.5).
+    /// block's first release is decided by data alone.
     std::chrono::steady_clock::time_point lastRelease{};
 
     /// Samples already committed to released-but-unexecuted jobs, so two jobs cannot claim the
@@ -168,7 +190,7 @@ struct SchedState {
     std::size_t batchFloor = 1UZ;
 
     /// Resolved period and relative deadline in seconds, `0` meaning unset. A zero period imposes
-    /// no temporal gate, leaving release governed by data alone (DEVLOG_M3 §5.3).
+    /// no temporal gate, leaving release governed by data alone.
     double periodSeconds           = 0.0;
     double relativeDeadlineSeconds = 0.0;
 
@@ -179,12 +201,12 @@ struct SchedState {
     /// non-zero count used to imply a bookkeeping defect. The `max_outstanding_jobs` clamp removes
     /// that guarantee deliberately, and with it the distinction: under a clamp every block can
     /// saturate, and this counts how often the cap, rather than the data, was the binding
-    /// constraint (DEVLOG_M3 §5.7).
+    /// constraint.
     std::size_t overruns = 0UZ;
 
     /// Indices, within this worker's own list, of the blocks this one feeds. Event-driven release
     /// detection walks these after a `work()` that produced output; cross-worker edges are absent
-    /// by construction and are covered by the per-sweep backstop instead (DEVLOG_M3 §5A.12).
+    /// by construction and are covered by the per-sweep backstop instead.
     std::span<const std::size_t> successors{};
 };
 

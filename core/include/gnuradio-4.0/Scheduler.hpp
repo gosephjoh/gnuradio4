@@ -20,6 +20,7 @@
 #include <gnuradio-4.0/SchedulerModel.hpp> // nested-scheduler dispatch (detail::asSchedulerModel)
 #include <gnuradio-4.0/SchedulingAnalysis.hpp>
 #include <gnuradio-4.0/SchedulingPolicy.hpp>
+#include <gnuradio-4.0/TraceFile.hpp>
 #include <gnuradio-4.0/meta/indirect.hpp>
 #include <gnuradio-4.0/meta/reflection.hpp>
 #include <gnuradio-4.0/thread/thread_pool.hpp>
@@ -66,6 +67,8 @@ inline static const char* const kGroupBlocks   = "GroupBlocks";
 inline static const char* const kUngroupBlocks = "UngroupBlocks";
 inline static const char* const kEmplaceEdge   = "EmplaceEdge";
 inline static const char* const kRemoveEdge    = "RemoveEdge";
+
+inline static const char* const kTraceControl = "TraceControl";
 
 inline static const char* const kBlockEmplaced   = "BlockEmplaced";
 inline static const char* const kBlockRemoved    = "BlockRemoved";
@@ -286,6 +289,7 @@ private:
         callbacks[scheduler::property::kReplaceBlock]     = static_cast<PropertyCallback>(&SchedulerBase::propertyCallbackReplaceBlock);
         callbacks[scheduler::property::kGraphGRC]         = static_cast<PropertyCallback>(&SchedulerBase::propertyCallbackGraphGRC);
         callbacks[scheduler::property::kSchedulerInspect] = static_cast<PropertyCallback>(&SchedulerBase::propertyCallbackSchedulerInspect);
+        callbacks[scheduler::property::kTraceControl]     = static_cast<PropertyCallback>(&SchedulerBase::propertyCallbackTraceControl);
         this->settings().updateActiveParameters();
     }
 
@@ -306,7 +310,10 @@ public:
     Annotated<SelectionStrategy, "selection_strategy", Doc<"dynamic-key policies: how the next block is picked -- linearScan (O(n), no auxiliary state) or readyHeap (O(log n), heap rebuilt per pass)">> selection_strategy      = SelectionStrategy::linearScan;
     Annotated<gr::Size_t, "max_outstanding_jobs", Doc<"release-tracking policies: cap on a block's outstanding jobs, clamping the buffer-derived bound (0: uncapped)">>                                   max_outstanding_jobs    = kDefaultMaxOutstandingJobs;
 
-    GR_MAKE_REFLECTABLE(SchedulerBase, timeout_ms, watchdog_timeout, timeout_inactivity_count, process_stream_to_message_ratio, house_keeping_policy, house_keeping_depth, max_work_items, max_selections_per_pass, max_outstanding_jobs, selection_strategy, poolName, sched_settings);
+    Annotated<gr::Size_t, "trace_categories", Doc<"bitmask of live trace-marker groups (0: tracing off). Inert unless the trace layer was compiled in">>                                                                    trace_categories  = 0U;
+    Annotated<gr::Size_t, "trace_buffer_size", Doc<"records retained per emitting thread; rounded up to a power of two, capped at 4 GiB/thread (a clamp is reported). Takes effect for threads that have not yet emitted">> trace_buffer_size = 65536U;
+
+    GR_MAKE_REFLECTABLE(SchedulerBase, timeout_ms, watchdog_timeout, timeout_inactivity_count, process_stream_to_message_ratio, house_keeping_policy, house_keeping_depth, max_work_items, max_selections_per_pass, max_outstanding_jobs, selection_strategy, trace_categories, trace_buffer_size, poolName, sched_settings);
 
     constexpr static block::Category blockCategory = block::Category::ScheduledBlockGroup;
 
@@ -353,12 +360,12 @@ public:
     /// Resolves each block's cached scheduling state from the analysis. A block the analysis does
     /// not know -- one adopted at run time, after the last derivation -- falls back to the
     /// scheduler's own ceiling, which is what every block received before per-block batches existed.
-    void syncSchedStates(const std::vector<std::shared_ptr<BlockModel>>& blocks, std::vector<SchedState>& states) const {
+    void syncSchedStates(const std::vector<std::shared_ptr<BlockModel>>& blocks, std::vector<SchedState>& states, std::uint8_t workerId = 0U) const {
         states.resize(blocks.size());
         for (std::size_t i = 0UZ; i < blocks.size(); ++i) {
             // The user's own declaration is block-local, so it survives adoption intact -- which is
             // what makes an *absolute* priority scheme exact for adopted blocks where a
-            // rate-monotonic one cannot be (DEVLOG_M2 §3.2).
+            // rate-monotonic one cannot be.
             const std::int32_t userPriority = static_cast<std::int32_t>(gr::scheduler::detail::settingAsDouble(*blocks[i], "sched_priority", 0.0));
 
             std::size_t  ceiling  = kUnboundedBatch;
@@ -373,15 +380,29 @@ public:
                 // input to `executionCeiling` is block-local (its own `max_batch_size`, the
                 // scheduler ceiling, its own ports), so no graph pass is needed. Falling back to
                 // `max_work_items` would silently discard an explicit per-block ceiling for the
-                // rest of the run, breaking "user-set values always win" (§4.2) for exactly the
+                // rest of the run, breaking "user-set values always win" for exactly the
                 // blocks whose configuration arrived most recently.
                 ceiling = _batchStrategy->resolve(*blocks[i], static_cast<std::size_t>(max_work_items)).executionCeiling;
             }
-            states[i] = SchedState{.index = i, .batchCeiling = ceiling, .priority = priority, .userPriority = userPriority};
+            // Interned whenever tracing is *compiled in*, not only while a capture is live: the
+            // identities have to exist already when a category is switched on, or every capture would
+            // open with `kNoEntity` records until the next house-keeping pass re-synced. A known block
+            // costs one hash lookup and no allocation; with tracing compiled out the
+            // `if constexpr` leaves nothing at all.
+            gr::trace::EntityId entityId = gr::trace::kNoEntity;
+            if constexpr (gr::trace::kEnabled) {
+                entityId = gr::trace::intern(std::addressof(*blocks[i]), //
+                    gr::trace::EntityDescription{.uniqueName = blocks[i]->uniqueName(), .typeName = blocks[i]->typeName(), .workerId = workerId, .nInputPorts = static_cast<std::uint16_t>(blocks[i]->dynamicInputPortsSize()), .nOutputPorts = static_cast<std::uint16_t>(blocks[i]->dynamicOutputPortsSize())});
+                // The block-side markers cannot reach this id themselves -- the key above is the
+                // `BlockModel` address, not the block's -- so it is pushed down here, once per re-sync.
+                blocks[i]->setTraceEntityId(entityId);
+            }
+
+            states[i] = SchedState{.index = i, .entityId = entityId, .workerId = workerId, .batchCeiling = ceiling, .priority = priority, .userPriority = userPriority};
 
             if constexpr (needsReleaseTracking(TPolicy::kPriorityClass)) {
                 // The gates' inputs. A block the analysis does not know keeps period and deadline at
-                // zero, which by DEVLOG_M3 §5.3 leaves it released on data alone -- the same
+                // zero, which leaves it released on data alone -- the same
                 // deliberately-imperfect treatment adopted blocks already receive for priority.
                 states[i].batchFloor = gr::scheduler::detail::releaseThreshold(*blocks[i]);
                 if (const DerivedAttributes* attributes = _schedulingAnalysis.find(*blocks[i]); attributes != nullptr) {
@@ -401,7 +422,7 @@ public:
         }
         _schedStates.resize(_executionOrder->size());
         for (std::size_t job = 0UZ; job < _executionOrder->size(); ++job) {
-            syncSchedStates((*_executionOrder)[job], _schedStates[job]);
+            syncSchedStates((*_executionOrder)[job], _schedStates[job], static_cast<std::uint8_t>(job));
 
             // Order the *shared* list too, not only the worker-local copies. `step()` executes
             // `(*_executionOrder)[0]` directly and has no worker-local copy to order, so without
@@ -675,6 +696,24 @@ public:
     }
 
     void settingsChanged(const property_map& /*oldSettings*/, const property_map& newSettings) noexcept {
+        if constexpr (gr::trace::kEnabled) {
+            // Capacity first, then categories. A ring is allocated when a thread first emits, and a
+            // thread only emits once some category is live -- so setting the capacity afterwards would
+            // leave every thread that had already started on the previous size.
+            if (newSettings.contains("trace_buffer_size")) {
+                const std::size_t requested = static_cast<std::size_t>(trace_buffer_size);
+                const std::size_t adopted   = gr::trace::setRingCapacity(requested);
+                if (adopted < requested) {
+                    // Said out loud rather than swallowed. A silently shrunk buffer is a capture that
+                    // quietly loses the oldest records, which is the failure this layer exists to avoid.
+                    this->emitErrorMessage("settingsChanged(trace_buffer_size)", std::format("requested {} records per thread, clamped to {} by the {}-byte ceiling", requested, adopted, gr::trace::ringCapacityLimitBytes()));
+                }
+            }
+            if (newSettings.contains("trace_categories")) {
+                gr::trace::setCategories(static_cast<std::uint32_t>(trace_categories));
+            }
+        }
+
         if (!newSettings.contains("poolName")) {
             return;
         }
@@ -926,7 +965,7 @@ protected:
 
     /// N.B. `states` is parallel to `blocks`; each entry supplies that block's batch ceiling.
     /// Do not reach for `max_work_items` directly here -- routing every batch decision through the
-    /// resolver is what keeps the executor and the derivation from disagreeing (DEVLOG_M1 §14.2).
+    /// resolver is what keeps the executor and the derivation from disagreeing.
     ///
     /// Two loops, selected by the policy's `PriorityClass`:
     ///
@@ -935,11 +974,116 @@ protected:
     /// - **`fixed`** selects the highest-priority *eligible* block each time, which is what
     ///   fixed-priority scheduling means. The list is already priority-sorted, so "highest
     ///   priority eligible" is "the earliest index that can run".
-    work::Result traverseBlockListOnce(const std::vector<std::shared_ptr<BlockModel>>& blocks, std::span<SchedState> states, std::span<ReadyEntry> readyHeap = {}) const {
+    work::Result traverseBlockListOnce(const std::vector<std::shared_ptr<BlockModel>>& blocks, std::span<SchedState> states, std::span<ReadyEntry> readyHeap = {}, std::uint8_t traceWorkerId = 0U) const {
         std::size_t performedWorkAllBlocks = 0UZ;
         bool        unfinishedBlocksExist  = false; // i.e. at least one block returned OK, INSUFFICIENT_INPUT_ITEMS, or INSUFFICIENT_OUTPU_ITEMS
 
         const auto ceilingFor = [&](std::size_t i) { return i < states.size() ? states[i].batchCeiling : static_cast<std::size_t>(max_work_items); };
+
+        // Hoisted once per pass rather than tested per invocation: the mask is a relaxed load, and a
+        // category switched on mid-pass simply takes effect on the next one (mask changes are not
+        // synchronised with emitters by design). `states` may be shorter than `blocks`, or empty --
+        // `step()` passes an empty span -- so identity falls back to `kNoEntity`, which is a valid
+        // worker-scoped record rather than an out-of-range read.
+        [[maybe_unused]] const bool traceWork  = gr::trace::kEnabled && gr::trace::categoryEnabled(gr::trace::Category::work);
+        [[maybe_unused]] const auto entityFor  = [&](std::size_t i) { return i < states.size() ? states[i].entityId : gr::trace::kNoEntity; };
+        [[maybe_unused]] const auto traceEnter = [&](std::size_t i, std::size_t requested, gr::trace::LoopKind loopKind, std::uint8_t extraFlags) -> std::uint64_t {
+            if (!traceWork) {
+                return 0UL;
+            }
+            const std::uint64_t entered = gr::trace::now();
+            gr::trace::emit(gr::trace::Event{.startNs = entered, .payload0 = gr::trace::saturate(requested), .entity = entityFor(i), .kind = gr::trace::Kind::workBegin, .workerId = traceWorkerId, .flags = static_cast<std::uint8_t>(std::to_underlying(loopKind) | extraFlags)});
+            return entered;
+        };
+        // Emitted only for an invocation that did something. The predicate is on `status`, never on
+        // `performed_work`: an all-asynchronous-input block reports `performed_work == requestedWork`
+        // having consumed nothing, and a source that publishes everything and returns DONE reports
+        // zero. Either would be recorded backwards.
+        //
+        // An unmatched `workBegin` therefore means one of two things, and a reader can tell them
+        // apart: an unproductive probe, accounted for by the `workProbe` that follows in the same
+        // sweep; or -- if it is the last record on its ring -- a `work()` that never returned.
+        [[maybe_unused]] const auto traceLeave = [&](std::size_t i, std::uint64_t entered, std::size_t requested, std::size_t performed, work::Status status, gr::trace::LoopKind loopKind, std::uint8_t extraFlags) {
+            if (!traceWork) {
+                return;
+            }
+            if (status == work::Status::INSUFFICIENT_INPUT_ITEMS || status == work::Status::INSUFFICIENT_OUTPUT_ITEMS) {
+                // Aggregated, not recorded. The second clock read is bought deliberately: differencing
+                // adjacent records would fold the scheduler overhead between invocations into the probe
+                // cost, and separating those two is the entire reason `work()` emits a pair at all.
+                if (i < states.size()) {
+                    ++states[i].probeCount;
+                    states[i].probeNs += gr::trace::now() - entered;
+                }
+                return;
+            }
+            gr::trace::emit(gr::trace::Event{.startNs = entered, .durationNs = gr::trace::durationOf(entered, gr::trace::now()), .payload0 = gr::trace::saturate(requested), .payload1 = gr::trace::saturate(performed), .entity = entityFor(i), .kind = gr::trace::Kind::workEnd, .workerId = traceWorkerId, .status = static_cast<std::int8_t>(status), .flags = static_cast<std::uint8_t>(std::to_underlying(loopKind) | extraFlags)});
+        };
+
+        // One sweep marker here rather than one at each caller: `traverseBlockListOnce` *is* the sweep,
+        // and `poolWorker` is unreachable under `externalStep` (only singleThreaded, its blocking
+        // variant and multiThreaded call it), so which driver produced this pass is a compile-time
+        // fact and needs no parameter.
+        constexpr std::uint8_t            kSweepFlags = (executionPolicy() == ExecutionPolicy::externalStep) ? gr::trace::flag::kViaStep : std::uint8_t{0U};
+        [[maybe_unused]] gr::trace::Scope sweepScope{gr::trace::Event{.kind = gr::trace::Kind::sweep, .workerId = traceWorkerId, .flags = kSweepFlags}};
+
+        // Flushed on *every* exit path, the two ERROR returns included, so a pass that failed still
+        // reports what its probing cost -- which is exactly the pass someone will be looking at.
+        // `on_scope_exit` rather than a line before each return: three call sites that must not drift
+        // is how the ERROR path ends up silently uninstrumented.
+        //
+        // Declared *after* `sweepScope`, so it destructs *before* it: the probe records and the
+        // sweep's own payload are both in place by the time the scope emits.
+        [[maybe_unused]] on_scope_exit flushProbes = [&] {
+            if constexpr (gr::trace::kEnabled) {
+                sweepScope.event().payload0 = static_cast<std::uint32_t>(blocks.size());
+                sweepScope.event().payload1 = gr::trace::saturate(performedWorkAllBlocks);
+                sweepScope.event().status   = static_cast<std::int8_t>(unfinishedBlocksExist ? work::Status::OK : work::Status::DONE);
+                if (!traceWork) {
+                    return;
+                }
+                for (std::size_t i = 0UZ; i < std::min(blocks.size(), states.size()); ++i) {
+                    if (states[i].probeCount == 0U) {
+                        continue;
+                    }
+                    gr::trace::emit(gr::trace::Event{.startNs = gr::trace::now(), .payload0 = states[i].probeCount, .payload1 = gr::trace::saturate(states[i].probeNs), .entity = states[i].entityId, .kind = gr::trace::Kind::workProbe, .workerId = traceWorkerId});
+                    states[i].probeCount = 0U;
+                    states[i].probeNs    = 0UL;
+                }
+            }
+        };
+
+        // The per-pass selection bound exists to keep a worker responsive: house-keeping, messages,
+        // adoption and lifecycle checks all live between passes. Whether the default multiplier of
+        // four ever actually binds is an unprofiled question (RT section 8.3), and this is the record
+        // that answers it. Round robin has no bound and never calls this, so it compiles nothing.
+        [[maybe_unused]] const auto traceSelectionBoundHit = [&](std::size_t boundValue, std::size_t blockCount) {
+            if constexpr (gr::trace::kEnabled) {
+                if (!gr::trace::categoryEnabled(gr::trace::Category::select)) {
+                    return;
+                }
+                gr::trace::emit(gr::trace::Event{.startNs = gr::trace::now(),
+                    .payload0                             = gr::trace::saturate(boundValue),
+                    .payload1                             = gr::trace::saturate(blockCount), //
+                    .kind                                 = gr::trace::Kind::selectionBoundHit,
+                    .workerId                             = traceWorkerId});
+            }
+        };
+
+        // Releases, and answers whether it did. The queue length is the only honest witness: a
+        // release can happen with the ring already non-empty, so "was empty, now is not" would
+        // undercount. Compiled away entirely when tracing is out, which is why the call is written
+        // twice rather than the count being taken unconditionally.
+        [[maybe_unused]] const auto releaseAndCount = [](BlockModel& block, SchedState& state, std::chrono::steady_clock::time_point now, std::uint8_t pathFlag) -> std::size_t {
+            if constexpr (gr::trace::kEnabled) {
+                const std::size_t before = state.jobs.size;
+                gr::scheduler::releaseIfEligible(block, state, now, pathFlag);
+                return state.jobs.size > before ? 1UZ : 0UZ;
+            } else {
+                gr::scheduler::releaseIfEligible(block, state, now, pathFlag);
+                return 0UZ;
+            }
+        };
 
         // Backstop release pass. Covers what event-driven detection cannot reach: sources, which
         // have no producer to trigger them, and blocks fed across a worker boundary, whose
@@ -947,9 +1091,20 @@ protected:
         // misses -- a block that publishes its last samples and returns DONE reports
         // `performed_work == 0` -- so it is load-bearing, not merely a fallback.
         if constexpr (needsReleaseTracking(TPolicy::kPriorityClass)) {
-            const std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
-            for (std::size_t i = 0UZ; i < std::min(blocks.size(), states.size()); ++i) {
-                gr::scheduler::releaseIfEligible(*blocks[i], states[i], now);
+            const std::chrono::steady_clock::time_point now      = std::chrono::steady_clock::now();
+            const std::size_t                           nScanned = std::min(blocks.size(), states.size());
+
+            // A complete record, and emitted whether or not anything was released. A scan that finds
+            // nothing is the *cost* side of "did event-driven detection earn its keep" -- recording
+            // only the productive scans would make both paths look free and answer the question wrong.
+            [[maybe_unused]] gr::trace::Scope scanScope{gr::trace::Event{.payload0 = gr::trace::saturate(nScanned), .kind = gr::trace::Kind::releaseScan, .workerId = traceWorkerId}};
+            [[maybe_unused]] std::size_t      nReleased = 0UZ;
+
+            for (std::size_t i = 0UZ; i < nScanned; ++i) {
+                nReleased += releaseAndCount(*blocks[i], states[i], now, 0U /* backstop */);
+            }
+            if constexpr (gr::trace::kEnabled) {
+                scanScope.event().payload1 = gr::trace::saturate(nReleased);
             }
         }
 
@@ -961,22 +1116,35 @@ protected:
                 return;
             }
             const std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
+
+            // `entity` is the producer whose output triggered this walk, where the backstop's scan
+            // carries `kNoEntity`. That is what lets a report attribute a walk's cost to the block
+            // that caused it rather than to the sweep it happened in.
+            [[maybe_unused]] gr::trace::Scope scanScope{gr::trace::Event{.payload0 = gr::trace::saturate(states[producer].successors.size()), .entity = states[producer].entityId, .kind = gr::trace::Kind::releaseScan, .workerId = traceWorkerId, .flags = gr::trace::flag::kViaSuccessorWalk}};
+            [[maybe_unused]] std::size_t      nReleased = 0UZ;
+
             for (std::size_t successor : states[producer].successors) {
                 if (successor < blocks.size() && successor < states.size()) {
                     // The empty-to-non-empty transition is what a heap selector needs to hear about:
                     // a block already holding a job is already in the heap.
                     const bool wasEmpty = states[successor].jobs.empty();
-                    gr::scheduler::releaseIfEligible(*blocks[successor], states[successor], now);
+                    nReleased += releaseAndCount(*blocks[successor], states[successor], now, gr::trace::flag::kViaSuccessorWalk);
                     if (wasEmpty && !states[successor].jobs.empty()) {
                         onNewlyReady(successor);
                     }
                 }
             }
+            if constexpr (gr::trace::kEnabled) {
+                scanScope.event().payload1 = gr::trace::saturate(nReleased);
+            }
         };
 
         if constexpr (!selectsByPriority(TPolicy::kPriorityClass)) {
             for (std::size_t i = 0UZ; i < blocks.size(); ++i) {
-                const auto [requested_work, performed_work, status] = blocks[i]->work(ceilingFor(i));
+                const std::size_t   ceiling                         = ceilingFor(i);
+                const std::uint64_t entered                         = traceEnter(i, ceiling, gr::trace::LoopKind::roundRobin, 0U);
+                const auto [requested_work, performed_work, status] = blocks[i]->work(ceiling);
+                traceLeave(i, entered, requested_work, performed_work, status, gr::trace::LoopKind::roundRobin, 0U);
                 performedWorkAllBlocks += performed_work;
 
                 if (status == work::Status::ERROR) {
@@ -1005,7 +1173,10 @@ protected:
                     continue;
                 }
 
-                const auto [requested_work, performed_work, status] = blocks[index]->work(ceilingFor(index));
+                const std::size_t   ceiling                         = ceilingFor(index);
+                const std::uint64_t entered                         = traceEnter(index, ceiling, gr::trace::LoopKind::fixedPriority, 0U);
+                const auto [requested_work, performed_work, status] = blocks[index]->work(ceiling);
+                traceLeave(index, entered, requested_work, performed_work, status, gr::trace::LoopKind::fixedPriority, 0U);
                 performedWorkAllBlocks += performed_work;
 
                 if (status == work::Status::ERROR) {
@@ -1027,6 +1198,12 @@ protected:
                     ++index; // not eligible right now; try the next-highest priority
                 }
             }
+            if (selections >= bound) {
+                // The strict restart makes this *more* likely here than on the job-driven paths, not
+                // less, which is why the marker is gated on `selectsByPriority` rather than on
+                // release tracking. A bound hit here comes with no `select` records beside it.
+                traceSelectionBoundHit(bound, nBlocks);
+            }
         } else {
             // Job-driven selection for policies whose key is a property of the *job* -- the key
             // changes as jobs are released and retired, so the list cannot be pre-sorted and the
@@ -1044,12 +1221,26 @@ protected:
             // eligible" over a pre-sorted list; taking the minimum outright reconsiders every block
             // on each iteration by construction, so a restart would only repeat work.
             const TPolicy     policy{};
-            const std::size_t nBlocks    = std::min(blocks.size(), states.size());
-            const std::size_t bound      = max_selections_per_pass == 0U ? kDefaultSelectionMultiplier * blocks.size() : static_cast<std::size_t>(max_selections_per_pass);
-            const bool        useHeap    = selection_strategy == SelectionStrategy::readyHeap && readyHeap.size() >= nBlocks;
-            std::size_t       selections = 0UZ;
-            std::size_t       heapSize   = 0UZ;
-            std::size_t       running    = nBlocks;
+            const std::size_t nBlocks = std::min(blocks.size(), states.size());
+            const std::size_t bound   = max_selections_per_pass == 0U ? kDefaultSelectionMultiplier * blocks.size() : static_cast<std::size_t>(max_selections_per_pass);
+            const bool        useHeap = selection_strategy == SelectionStrategy::readyHeap && readyHeap.size() >= nBlocks;
+            if constexpr (gr::trace::kEnabled) {
+                // RT defect B3: a readyHeap request silently reverts to the linear scan when the
+                // scratch is too small, and nothing says so. Level-triggered rather than latched --
+                // the scratch is resized on the same house-keeping pass that grows the block list, so
+                // the condition is transient at worst on the pool path and a *repeated* record is
+                // itself the finding rather than noise to suppress.
+                if (selection_strategy == SelectionStrategy::readyHeap && !useHeap) {
+                    gr::trace::emit(gr::trace::Event{.startNs = gr::trace::now(),
+                        .payload0                             = gr::trace::saturate(nBlocks),
+                        .payload1                             = gr::trace::saturate(readyHeap.size()), //
+                        .kind                                 = gr::trace::Kind::heapFallback,
+                        .workerId                             = traceWorkerId});
+                }
+            }
+            std::size_t selections = 0UZ;
+            std::size_t heapSize   = 0UZ;
+            std::size_t running    = nBlocks;
 
             const auto eligible = [&](std::size_t i) { return !states[i].finished && !states[i].jobs.empty(); };
 
@@ -1075,12 +1266,108 @@ protected:
                 }
             };
 
+            // One record per selection decision, emitted *before* the call it authorises, so a
+            // reader sees release -> select -> workBegin -> workEnd in that order and the replay
+            // oracle can line a decision up against the ready set that produced it.
+            //
+            // `readySetSize` is what the selector itself believed was ready: the heap's population
+            // for the heap path, the eligible count for the scan. Those are not quite the same
+            // quantity -- a heap may hold an entry whose job has since been retired -- which is
+            // exactly why a skipped stale entry is flagged rather than silently corrected.
+            [[maybe_unused]] bool       staleSkipped = false;
+            [[maybe_unused]] const auto traceSelect  = [&](std::size_t chosen, std::size_t readySetSize, std::size_t heapPopulation, std::uint8_t pathFlag) {
+                if constexpr (gr::trace::kEnabled) {
+                    // The category is tested *before* the clock is read, not left to `emit()`. A clock
+                    // read is an argument, so it is evaluated whether or not the record is wanted --
+                    // and selections are the one marker whose own category is off by default because
+                    // of its rate, which would be pointless if the cost stayed on with it.
+                    if (!gr::trace::categoryEnabled(gr::trace::Category::select)) {
+                        return;
+                    }
+                    gr::trace::emit(gr::trace::Event{.startNs = gr::trace::now(),
+                         .payload0                             = gr::trace::saturate(readySetSize),
+                         .payload1                             = gr::trace::saturate(selections),
+                         .payload2                             = gr::trace::saturate(heapPopulation), //
+                         .entity                               = states[chosen].entityId,
+                         .kind                                 = gr::trace::Kind::select,
+                         .workerId                             = traceWorkerId, //
+                         .flags                                = static_cast<std::uint8_t>(pathFlag | (staleSkipped ? gr::trace::flag::kStaleEntrySkipped : 0U))});
+                    staleSkipped = false;
+                }
+            };
+
+            // Nothing was ready. Round robin spins when idle too, so the claim that a job-driven
+            // worker is at parity with it is an argument until this is counted.
+            [[maybe_unused]] const auto traceSelectEmpty = [&] {
+                if constexpr (gr::trace::kEnabled) {
+                    if (!gr::trace::categoryEnabled(gr::trace::Category::select)) {
+                        return;
+                    }
+                    gr::trace::emit(gr::trace::Event{.startNs = gr::trace::now(),
+                        .payload0                             = gr::trace::saturate(nBlocks),
+                        .payload1                             = gr::trace::saturate(selections), //
+                        .kind                                 = gr::trace::Kind::selectEmpty,
+                        .workerId                             = traceWorkerId});
+                }
+            };
+
+            // Checked between the call and the retire, because the job that ran *is* the front job
+            // and is still there: no matching, no FIFO reconstruction, no way to pair a completion
+            // with the wrong release. It reads the clock itself rather than borrowing the one
+            // `traceLeave` takes, because the whole point of a separate deadline category is that it
+            // can be captured with `work` switched off.
+            //
+            // A met deadline leaves no record. Response time for those is reconstructed offline from
+            // release and work records, which is why the report prefers reconstruction wherever the
+            // capture supports it and cross-checks the two where it has both.
+            [[maybe_unused]] const auto traceDeadline = [&](std::size_t chosen) {
+                if constexpr (gr::trace::kEnabled) {
+                    if (!gr::trace::categoryEnabled(gr::trace::Category::deadline) || states[chosen].jobs.empty()) {
+                        return;
+                    }
+                    const Job& job = states[chosen].jobs.front();
+
+                    // Both cheap tests come first, so a graph that sets no deadline -- the default --
+                    // pays no clock read to discover there is nothing to report.
+                    const bool suspect = states[chosen].relativeDeadlineSeconds > kMaxRepresentableDeadlineSeconds;
+                    const bool unset   = job.absoluteDeadline == std::chrono::steady_clock::time_point::max();
+                    if (unset && !suspect) {
+                        return;
+                    }
+                    const std::chrono::steady_clock::time_point completion = std::chrono::steady_clock::now();
+
+                    // `suspect` is recomputed here rather than carried on the job: a relative deadline
+                    // larger than the clock's range makes `absoluteDeadline` the result of an
+                    // out-of-range double-to-integer conversion, which is undefined behaviour and not
+                    // a value any comparison against it can be trusted to have produced.
+                    if (!suspect && completion <= job.absoluteDeadline) {
+                        return;
+                    }
+
+                    const std::uint64_t responseNs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(completion - job.releaseTime).count());
+                    gr::trace::emit(gr::trace::Event{.startNs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(completion.time_since_epoch()).count()),
+                        // A suspect deadline yields no lateness figure at all. Reporting one computed
+                        // from undefined behaviour is exactly the laundering this flag exists to stop.
+                        .payload0 = suspect ? gr::trace::kSaturated : gr::trace::saturate(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(completion - job.absoluteDeadline).count())), //
+                        .payload1 = gr::trace::saturate(responseNs),
+                        .payload2 = gr::trace::saturate(job.batch), //
+                        .entity   = states[chosen].entityId,
+                        .kind     = gr::trace::Kind::deadlineMiss,
+                        .workerId = traceWorkerId, //
+                        .flags    = suspect ? gr::trace::flag::kDeadlineSuspect : gr::trace::flag::kDeadlineMissed});
+                }
+            };
+
             const auto runOne = [&](std::size_t chosen) -> std::optional<work::Result> {
                 running                                             = chosen;
-                const auto [requested_work, performed_work, status] = blocks[chosen]->work(states[chosen].jobs.front().batch);
+                const std::size_t   batch                           = states[chosen].jobs.front().batch;
+                const std::uint64_t entered                         = traceEnter(chosen, batch, gr::trace::LoopKind::jobDriven, gr::trace::flag::kJobBacked);
+                const auto [requested_work, performed_work, status] = blocks[chosen]->work(batch);
+                traceLeave(chosen, entered, requested_work, performed_work, status, gr::trace::LoopKind::jobDriven, gr::trace::flag::kJobBacked);
                 performedWorkAllBlocks += performed_work;
                 ++selections; // every iteration consumed a released job, successful or not
 
+                traceDeadline(chosen); // while the job that ran is still the front one
                 gr::scheduler::retireFrontJob(states[chosen]);
 
                 // Unconditional, and ahead of the DONE branch. `performed_work` cannot be used as the
@@ -1145,9 +1432,13 @@ protected:
                     // `jobs.front()` of an emptied ring. Validating here makes the loop correct
                     // however an entry came to be there.
                     if (!eligible(chosen)) {
+                        if constexpr (gr::trace::kEnabled) {
+                            staleSkipped = true;
+                        }
                         continue;
                     }
 
+                    traceSelect(chosen, heapSize + 1UZ, heapSize, gr::trace::flag::kViaHeap);
                     if (const std::optional<work::Result> failure = runOne(chosen); failure.has_value()) {
                         return *failure;
                     }
@@ -1155,13 +1446,22 @@ protected:
                         pushReady(chosen); // re-keyed to whatever job is now at its head
                     }
                 }
+                if (heapSize == 0UZ && selections < bound) {
+                    traceSelectEmpty(); // exhausted rather than bounded: the two exits are different findings
+                } else if (selections >= bound) {
+                    traceSelectionBoundHit(bound, nBlocks);
+                }
                 markUnfinished();
             } else {
                 while (selections < bound) {
-                    std::size_t chosen = nBlocks;
+                    std::size_t                  chosen     = nBlocks;
+                    [[maybe_unused]] std::size_t readyCount = 0UZ;
                     for (std::size_t i = 0UZ; i < nBlocks; ++i) {
                         if (!eligible(i)) {
                             continue;
+                        }
+                        if constexpr (gr::trace::kEnabled) {
+                            ++readyCount;
                         }
                         if (chosen == nBlocks || gr::scheduler::selectsBefore(policy, *blocks[i], states[i], *blocks[chosen], states[chosen])) {
                             chosen = i;
@@ -1169,12 +1469,17 @@ protected:
                     }
 
                     if (chosen == nBlocks) {
+                        traceSelectEmpty();
                         break; // nothing released this pass
                     }
 
+                    traceSelect(chosen, readyCount, 0UZ, 0U /* linear scan */);
                     if (const std::optional<work::Result> failure = runOne(chosen); failure.has_value()) {
                         return *failure;
                     }
+                }
+                if (selections >= bound) {
+                    traceSelectionBoundHit(bound, nBlocks);
                 }
                 markUnfinished();
             }
@@ -1313,7 +1618,7 @@ protected:
         std::vector<std::size_t> localSuccessorArena;
         std::vector<ReadyEntry>  localReadyHeap;
 
-        syncSchedStates(localBlockList, localStates);
+        syncSchedStates(localBlockList, localStates, gr::trace::workerIdOf(runnerID));
         gr::scheduler::detail::applyStaticOrder<TPolicy>(localBlockList, localStates); // no-op for RoundRobinPolicy: its key is the position itself
         if constexpr (needsReleaseTracking(TPolicy::kPriorityClass)) {
             buildReleaseStorage(localBlockList, localStates, localJobArena, localSuccessorArena, localReadyHeap);
@@ -1322,6 +1627,22 @@ protected:
         if (localBlockList.empty()) {
             return;
         }
+
+        // Placed here rather than at function entry because `localBlockList` is only known once the
+        // job list has been copied, and "how many blocks did this worker own" is the first thing a
+        // reader wants from a worker's first record.
+        [[maybe_unused]] std::size_t sweepCount = 0UZ;
+        // Previous pass's block list, by address, so a re-sync can say whether anything actually
+        // changed. Only populated when tracing is compiled in.
+        [[maybe_unused]] std::vector<const void*> traceListFingerprint;
+        if constexpr (gr::trace::kEnabled) {
+            gr::trace::emit(gr::trace::Event{.startNs = gr::trace::now(), .payload0 = static_cast<std::uint32_t>(localBlockList.size()), .payload1 = static_cast<std::uint32_t>(gr::trace::currentCpu()), .kind = gr::trace::Kind::workerStart, .workerId = gr::trace::workerIdOf(runnerID)});
+        }
+        [[maybe_unused]] on_scope_exit traceWorkerStop = [&] {
+            if constexpr (gr::trace::kEnabled) {
+                gr::trace::emit(gr::trace::Event{.startNs = gr::trace::now(), .payload0 = gr::trace::saturate(sweepCount), .payload1 = static_cast<std::uint32_t>(gr::trace::ringStats().lost), .kind = gr::trace::Kind::workerStop, .workerId = gr::trace::workerIdOf(runnerID)});
+            }
+        };
 
         const auto            initialGeneration  = gr::atomic_ref(_graphGeneration).load_acquire();
         [[maybe_unused]] auto currentProgress    = this->_graph->progress().value();
@@ -1341,6 +1662,7 @@ protected:
             const bool hasMessagesToProcess = msgToCount == 0UZ || //
                                               (runnerID == 0UZ && (this->msgIn.available() > 0UZ || _fromChildMessagePort.available() > 0UZ));
             if (hasMessagesToProcess) {
+                [[maybe_unused]] gr::trace::Scope messageScope{gr::trace::Event{.payload0 = gr::trace::saturate(msgToCount), .payload1 = static_cast<std::uint32_t>(localBlockList.size()), .kind = gr::trace::Kind::messagePhase, .workerId = gr::trace::workerIdOf(runnerID)}};
                 if (runnerID == 0UZ) {
                     this->processScheduledMessages(); // execute the scheduler- and Graph-specific message handler only once globally
                     if (initialGeneration != gr::atomic_ref(_graphGeneration).load_acquire()) {
@@ -1354,32 +1676,73 @@ protected:
                 // this block to preserve adoption/removal ordering. Some messages, such as grouping/ungrouping
                 // and emplacing and removing edges, may modify these ports while work quiescence is requested.
                 WorkGuard isWorking(this);
+                if (!isWorking) {
+                    // Not a wait: the guard denies the pass outright while a structural change is in
+                    // flight. Recorded so that a stall shows up as "quiescence was requested" rather
+                    // than as an unexplained gap between sweeps.
+                    if constexpr (gr::trace::kEnabled) {
+                        messageScope.event().flags |= gr::trace::flag::kQuiescenceDenied;
+                        gr::trace::emit(gr::trace::Event{.startNs = gr::trace::now(), .kind = gr::trace::Kind::quiescenceWait, .workerId = gr::trace::workerIdOf(runnerID)});
+                    }
+                }
                 if (isWorking) {
                     // we must always clean up removed blocks before accessing localBlockList
                     cleanupRemovedBlocks(runnerID, localBlockList);
 
                     // Zombies are cleaned per-thread, as we remove from the localBlockList as well.
                     // Cleaning zombies has low priority, so uses process_stream_to_message_ratio (a different ratio could be introduced)
-                    cleanupZombieBlocks(localBlockList);
+                    {
+                        [[maybe_unused]] gr::trace::Scope reapScope{gr::trace::Event{.payload0 = gr::trace::saturate(localBlockList.size()), .kind = gr::trace::Kind::zombieReap, .workerId = gr::trace::workerIdOf(runnerID)}};
+                        cleanupZombieBlocks(localBlockList);
+                        if constexpr (gr::trace::kEnabled) {
+                            reapScope.event().payload1 = gr::trace::saturate(localBlockList.size());
+                        }
+                    }
 
-                    adoptBlocks(runnerID, localBlockList);
+                    {
+                        [[maybe_unused]] gr::trace::Scope adoptScope{gr::trace::Event{.payload0 = gr::trace::saturate(localBlockList.size()), .kind = gr::trace::Kind::adopt, .workerId = gr::trace::workerIdOf(runnerID)}};
+                        adoptBlocks(runnerID, localBlockList);
+                        if constexpr (gr::trace::kEnabled) {
+                            adoptScope.event().payload1 = gr::trace::saturate(localBlockList.size());
+                        }
+                    }
 
                     // Removal, zombie cleanup and adoption all mutate `localBlockList`, so the
                     // parallel state must be re-derived before it is indexed again. Unconditionally:
                     // a removal and an adoption in the same pass leave the size unchanged while the
                     // *contents* differ, so a size comparison would silently hand each block its
                     // neighbour's ceiling. This runs on the house-keeping cadence, not per pass.
-                    syncSchedStates(localBlockList, localStates);
+                    // The re-sync rides the message/house-keeping cadence, not an actual mutation, and
+                    // it assigns whole states -- so it also discards every outstanding job and resets
+                    // each block's last-release time. Whether that is a real cost depends on how often
+                    // it fires with nothing having changed, which nobody had measured. The comparison
+                    // is over the block *pointers*, because a removal and an adoption in the same pass
+                    // leave the size identical while the contents differ.
+                    [[maybe_unused]] gr::trace::Scope syncScope{gr::trace::Event{.payload0 = gr::trace::saturate(localBlockList.size()), .kind = gr::trace::Kind::stateSync, .workerId = gr::trace::workerIdOf(runnerID)}};
+                    if constexpr (gr::trace::kEnabled) {
+                        std::uint64_t discarded = 0UL;
+                        for (const SchedState& state : localStates) {
+                            discarded += state.jobs.size;
+                        }
+                        syncScope.event().payload1 = gr::trace::saturate(discarded);
+                        syncScope.event().flags    = (localBlockList.size() != traceListFingerprint.size() || !std::ranges::equal(localBlockList, traceListFingerprint, {}, [](const auto& b) { return b.get(); }, [](const void* p) { return p; })) ? gr::trace::flag::kListChanged : std::uint8_t{0U};
+                        traceListFingerprint.clear();
+                        traceListFingerprint.reserve(localBlockList.size());
+                        for (const auto& block : localBlockList) {
+                            traceListFingerprint.push_back(static_cast<const void*>(block.get()));
+                        }
+                    }
 
-                    // Re-order after the mutations (the M0 obligation): adoption appends to the end
-                    // of the list, so without this a newly adopted block would run last whatever
-                    // its priority. A no-op for `RoundRobinPolicy`, whose key is the position.
+                    syncSchedStates(localBlockList, localStates, gr::trace::workerIdOf(runnerID));
+
+                    // Re-order after the mutations: adoption appends to the end of the list, so
+                    // without this a newly adopted block would run last whatever its priority. A no-op for `RoundRobinPolicy`, whose key is the position.
                     gr::scheduler::detail::applyStaticOrder<TPolicy>(localBlockList, localStates);
 
                     // N.B. `syncSchedStates()` assigns whole `SchedState`s, so this also discards
-                    // every outstanding job and resets `lastRelease`. Correct on an actual mutation
-                    // (DEVLOG_M3 §5A.8), but it rides the house-keeping cadence and so fires even
-                    // when nothing changed -- a known defect, recorded rather than papered over.
+                    // every outstanding job and resets `lastRelease`. That is correct on an actual
+                    // graph mutation, but it rides the house-keeping cadence and so fires even when
+                    // nothing changed -- a known defect, recorded rather than papered over.
                     if constexpr (needsReleaseTracking(TPolicy::kPriorityClass)) {
                         buildReleaseStorage(localBlockList, localStates, localJobArena, localSuccessorArena, localReadyHeap);
                     }
@@ -1389,8 +1752,9 @@ protected:
                     // the scheduler-driven trigger entirely (intrinsic writer-pressure path still
                     // fires inside the buffer); Aggressive's post-consume hook is a follow-up.
                     if (house_keeping_policy.value != HouseKeepPolicy::Light) {
-                        const HouseKeepPolicy policy = house_keeping_policy.value;
-                        const HouseKeepDepth  depth  = house_keeping_depth.value;
+                        const HouseKeepPolicy             policy = house_keeping_policy.value;
+                        const HouseKeepDepth              depth  = house_keeping_depth.value;
+                        [[maybe_unused]] gr::trace::Scope houseKeepScope{gr::trace::Event{.payload0 = gr::trace::saturate(localBlockList.size()), .payload1 = static_cast<std::uint32_t>(std::to_underlying(policy)), .payload2 = static_cast<std::uint32_t>(std::to_underlying(depth)), .kind = gr::trace::Kind::houseKeeping, .workerId = gr::trace::workerIdOf(runnerID)}};
                         std::ranges::for_each(localBlockList, [policy, depth](auto& b) { b->houseKeeping(policy, depth); });
                     }
                 }
@@ -1411,7 +1775,8 @@ protected:
                     cleanupRemovedBlocks(runnerID, localBlockList);
                     idleUntilAdoption = localBlockList.empty();
                     if (!idleUntilAdoption) {
-                        gr::work::Result result = traverseBlockListOnce(localBlockList, localStates, std::span<ReadyEntry>{localReadyHeap});
+                        ++sweepCount;
+                        gr::work::Result result = traverseBlockListOnce(localBlockList, localStates, std::span<ReadyEntry>{localReadyHeap}, gr::trace::workerIdOf(runnerID));
                         if (result.status == work::Status::DONE) {
                             break; // nothing happened -> shutdown this worker
                         } else if (result.status == work::Status::ERROR) {
@@ -1421,13 +1786,16 @@ protected:
                     }
                 }
                 if (idleUntilAdoption) {
+                    [[maybe_unused]] gr::trace::Scope idleScope{gr::trace::Event{.payload0 = std::to_underlying(gr::trace::IdleReason::awaitingAdoption), .kind = gr::trace::Kind::idle, .workerId = gr::trace::workerIdOf(runnerID)}};
                     std::this_thread::sleep_for(std::chrono::milliseconds(timeout_ms));
                     msgToCount = 0UZ;
                 }
             } else if (activeState == PAUSED) {
+                [[maybe_unused]] gr::trace::Scope idleScope{gr::trace::Event{.payload0 = std::to_underlying(gr::trace::IdleReason::paused), .kind = gr::trace::Kind::idle, .workerId = gr::trace::workerIdOf(runnerID)}};
                 std::this_thread::sleep_for(std::chrono::milliseconds(timeout_ms));
                 msgToCount = 0UZ;
             } else { // other states
+                [[maybe_unused]] gr::trace::Scope idleScope{gr::trace::Event{.payload0 = std::to_underlying(gr::trace::IdleReason::otherState), .kind = gr::trace::Kind::idle, .workerId = gr::trace::workerIdOf(runnerID)}};
                 std::this_thread::sleep_for(std::chrono::milliseconds(timeout_ms));
                 msgToCount = 0UZ;
             }
@@ -1445,6 +1813,7 @@ protected:
                 if (inactiveCycleCount > timeout_inactivity_count) {
                     // allow a scheduler process to wait on progress before retrying (N.B. intended to save CPU/battery power)
                     // N.B. a watchdog will periodically update the progress to check for non-responsive blocks.
+                    [[maybe_unused]] gr::trace::Scope idleScope{gr::trace::Event{.payload0 = std::to_underlying(gr::trace::IdleReason::noProgress), .payload1 = gr::trace::saturate(inactiveCycleCount), .kind = gr::trace::Kind::idle, .workerId = gr::trace::workerIdOf(runnerID)}};
                     waitUntilChanged(*progress, currentProgress, timeout_ms);
                     msgToCount = 0UZ;
                 }
@@ -1646,6 +2015,73 @@ protected:
             std::lock_guard movedBlockGuard(*movedBlockList.mutex);
 
             moveToMovedList(workList, movedBlockList);
+        }
+    }
+
+    /**
+     * @brief Starts, stops and dumps a trace capture over the message channel.
+     *
+     * `command` is one of `start`, `stop`, `dump` or `status`. `start` takes an optional
+     * `categories` mask and `stop` clears it; `dump` takes a `path` and writes the capture there.
+     * Every reply carries the live mask and the record counts, so a caller that only wants to know
+     * what is being captured sends `status`.
+     *
+     * A dump parks the workers first. Records are fixed-size but not written atomically, so a reader
+     * walking a ring while its thread is still emitting can observe a torn record; with the workers
+     * quiescent there is nothing to tear.
+     */
+    std::optional<Message> propertyCallbackTraceControl([[maybe_unused]] std::string_view propertyName, Message message) {
+        assert(propertyName == scheduler::property::kTraceControl);
+        auto&      messageData = message.data.value();
+        const auto findOr      = [&messageData](std::string_view key) -> Value {
+            auto it = messageData.find(key);
+            return it != messageData.end() ? (*it).second : Value{};
+        };
+
+        const Value       commandValue = findOr(std::string_view{"command"});
+        const std::string command(commandValue.value_or(std::string_view{"status"}));
+
+        if constexpr (!gr::trace::kEnabled) {
+            message.data = std::unexpected(Error{"trace control requested, but the trace layer was not compiled in: configure with -DGR4_ENABLE_TRACING=ON"});
+            return message;
+        } else {
+            if (command == "start") {
+                const Value      maskValue = findOr(std::string_view{"categories"});
+                const gr::Size_t mask      = maskValue.value_or(gr::Size_t{gr::trace::kAllCategories});
+                trace_categories.value     = mask;
+                gr::trace::setCategories(mask); // routed through here, so starting a capture re-anchors its clock
+            } else if (command == "stop") {
+                trace_categories.value = 0U;
+                gr::trace::setCategories(0U);
+            } else if (command == "dump") {
+                const Value       pathValue = findOr(std::string_view{"path"});
+                const std::string path(pathValue.value_or(std::string_view{}));
+                if (path.empty()) {
+                    message.data = std::unexpected(Error{"trace dump requires a non-empty 'path'"});
+                    return message;
+                }
+
+                // Parked, not merely asked: the dump reads rings that other threads own.
+                const std::expected<std::size_t, gr::Error> written = [&] {
+                    WorkQuiescenceGuard quiescence(this);
+                    return gr::trace::dump(path);
+                }();
+                if (!written) {
+                    message.data = std::unexpected(written.error());
+                    return message;
+                }
+                messageData.insert_or_assign(std::string_view{"records"}, static_cast<gr::Size_t>(*written));
+            } else if (command != "status") {
+                message.data = std::unexpected(Error{std::format("unknown trace command '{}': expected start, stop, dump or status", command)});
+                return message;
+            }
+
+            const gr::trace::RingStats stats = gr::trace::ringStats();
+            messageData.insert_or_assign(std::string_view{"categories"}, gr::trace::categories());
+            messageData.insert_or_assign(std::string_view{"recorded"}, static_cast<gr::Size_t>(stats.recorded));
+            messageData.insert_or_assign(std::string_view{"lost"}, static_cast<gr::Size_t>(stats.lost));
+            messageData.insert_or_assign(std::string_view{"rings"}, static_cast<gr::Size_t>(stats.rings));
+            return message;
         }
     }
 

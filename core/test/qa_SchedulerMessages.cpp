@@ -1151,10 +1151,10 @@ const boost::ut::suite SchedulingStateAlignmentTests = [] {
     using enum gr::message::Command;
 
     "a same-pass removal and adoption keeps each block's batch ceiling"_test = [] {
-        // DEVLOG_M1 §14.14.1. `cleanupRemovedBlocks`, `cleanupZombieBlocks` and `adoptBlocks` all
-        // run in one house-keeping pass, so a removal *and* an adoption together leave the worker's
-        // block list the same length while its contents shift. A resync guarded on size therefore
-        // does nothing, and every block past the removal point is handed its neighbour's ceiling.
+        // `cleanupRemovedBlocks`, `cleanupZombieBlocks` and `adoptBlocks` all run in one
+        // house-keeping pass, so a removal *and* an adoption together leave the worker's block list
+        // the same length while its contents shift. A resync guarded on size therefore does
+        // nothing, and every block past the removal point is handed its neighbour's ceiling.
         //
         // `victim` is inserted before the probe so removing it shifts the probe down one slot; the
         // emplaced block restores the length. With the size-guarded resync the probe inherits the
@@ -1198,9 +1198,9 @@ const boost::ut::suite AdoptedBlockSchedulingTests = [] {
     using enum gr::message::Command;
 
     "a block adopted at run time is absent from the scheduling analysis"_test = [] {
-        // DEVLOG_M1 §14.14.7 / §14.21. `refreshSchedulingAnalysis()` runs from `init()` only, and a
-        // running scheduler never re-enters it -- so a block adopted at run time stays absent from
-        // the analysis for the remainder of the run, not "until the next refresh".
+        // `refreshSchedulingAnalysis()` runs from `init()` only, and a running scheduler never
+        // re-enters it -- so a block adopted at run time stays absent from the analysis for the
+        // remainder of the run, not "until the next refresh".
         //
         // This pins the *precondition* of the adopted-block fallback. If adoption ever gains a
         // re-derivation, this test fails and points at the note explaining why the fallback exists.
