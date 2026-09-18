@@ -180,11 +180,16 @@ with the control-channel receiver placed **last** in graph order
 `class_over_deadline.pdf`; values in `numbers.json`. Single runs on a KVM
 guest: read differences below about 10 µs as noise.
 
-![](class_batch_N1024_A25.png)
 ![](class_batch_N1024_A50.png)
+![](class_batch_N1024_A50L.png)
 *Figures 12–13. Batch response time with the control-channel receiver
-(filled) first in graph order at 0.25 and 0.5 of a batch period, the
-service-channel receivers (hollow) at 1.*
+(filled) at 0.5 of a batch period and the service-channel receivers (hollow)
+at 1 — first in graph order (top) and last (bottom). `class_summary_batch.pdf`
+shows the control-channel receiver under every setting side by side.*
+
+![](class_summary_batch.png)
+*Figure 14. The control-channel receiver under each deadline setting: EDF
+is below RR only in the two-worker `A25L`/`A50L` columns.*
 
 **Batch response time of the control-channel receiver**, mean in µs and the
 fraction of its batches later than its own class deadline:
@@ -237,11 +242,30 @@ between passes, and a deadline-ordered pass under load runs up to four
 selections per block before returning to it; the arrival of a tight batch
 is therefore *detected* late, and no ordering afterwards recovers that.
 Round robin's pass is one call per block and returns to the throttle sooner.
-The setting that bounds this, `max_selections_per_pass`, was not varied
-here; a smaller value trades backstop scans for detection latency and is
-the obvious next measurement. The frame-path setting (B) had no visible
-effect on either metric at these points: once a frame is detected its
-blocks are already served promptly under every policy.
+The setting that bounds this, `max_selections_per_pass`, was then varied
+at the same point (`rx_latency4 --max-selections`, single 30 s runs,
+control channel last at 0.5):
+
+| per-pass bound | tight receiver mean | over deadline | throttle lag mean / p95 | service receiver mean |
+|---|---|---|---|---|
+| GR4 default (4 × blocks = 144) | 174 µs | 24.7 % | 91 / 197 µs | 158 µs |
+| 36 (1 × blocks) | 177 µs | 26.1 % | 94 / 199 µs | 159 µs |
+| 8 | 140 µs | 9.9 % | 34 / 86 µs | 380 µs |
+| 2 | the graph stalls: 4.0× air, three frames decoded | | | |
+| RR, for reference | 112 µs | 7.5 % | 41 / 95 µs | 89 µs |
+
+A bound of eight brings the throttle's detection lag down to RR's (34
+against 41 µs) and the tight receiver from 174 to 140 µs, at the price of
+the service receiver (380 µs: with the loop returning to the backstop every
+eight calls, the loose class drains slowly); at two the loop no longer
+advances a batch between scans and the graph stops keeping real time. Even
+at eight the tight receiver stays 28 µs behind RR's 112, which is the ten
+hops' release-and-select latency of the pipeline itself (M2). On two workers
+the bound changes nothing (EDF 171 against 174 µs at eight; RR 240) because
+there the throttles are on the lightly loaded worker and are detected
+promptly anyway. The frame-path setting (B) had no visible effect on either
+metric at these points: once a frame is detected its blocks are already
+served promptly under every policy.
 
 **RM.** With two receivers on one worker RM saturated the second receiver
 in every setting (its batch response time grew to seconds) while serving
@@ -295,7 +319,10 @@ control-channel receiver last in the graph and two workers, EDF served it in
 latency in general: EDF's per-invocation cost is negligible (M2) and its
 selection exact (M4), but a time-driven source is released only between
 passes, so under load the arrival of a tight batch is detected 60 µs later
-than round robin sees it, which on one worker outweighs the ordering. A
+than round robin sees it; shortening the pass (`max_selections_per_pass`
+of eight) recovers most of that on one worker but not all, and costs the
+loose class, so on one worker round robin's list order remains the better
+static priority. A
 class deadline shorter than the longest non-preemptible invocation (M3) is
 not meetable by any of the three policies. Rate monotonic with equal periods
 is a fixed priority assigned by accident and starves a receiver at two

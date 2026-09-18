@@ -23,8 +23,9 @@ POL = ["rr", "edf", "rm"]
 COL = {"rr": "#2a78d6", "edf": "#eb6834", "rm": "#1baf7a"}
 NAME = {"rr": "RR", "edf": "EDF", "rm": "RM"}
 INK, INK2, GRID = "#0b0b0b", "#52514e", "#e6e5e1"
-SETTINGS = ["base", "A25", "A50", "B25", "AB25"]
-SETNAME = {"base": "equal deadlines", "A25": "A: receiver 0 at 0.25", "A50": "A: receiver 0 at 0.5", "B25": "B: frame path at 0.25", "AB25": "A+B at 0.25"}
+SETTINGS = ["base", "A25", "A50", "A25L", "A50L", "B25", "AB25"]
+SETNAME = {"base": "equal deadlines", "A25": "A: control-channel receiver first in graph order, at 0.25", "A50": "A: control-channel receiver first, at 0.5",
+           "A25L": "A: control-channel receiver LAST in graph order, at 0.25", "A50L": "A: control-channel receiver LAST, at 0.5", "B25": "B: frame path at 0.25", "AB25": "A+B at 0.25"}
 plt.rcParams.update({"font.size": 9, "axes.titlesize": 10, "pdf.fonttype": 42})
 
 
@@ -62,14 +63,17 @@ def load(sweep):
         d = pts[k]
         d["reps"] += 1
         d["sat"].append(saturated(b))
+        classes = b.get("deadline_classes") or []
+        tight = [i for i, c in enumerate(classes) if c < 1]
+        tight_idx = tight[0] if tight else 0
         for pc in b["per_chain"]:
-            tgt = "c0" if pc["chain"] == 0 else "rest"
+            tgt = "c0" if pc["chain"] == tight_idx else "rest"
             d[tgt].append(pc.get("batch_rt"))
             d[tgt + "f"].append(pc.get("frame_rt"))
-            if pc["chain"] == 0 and (pc.get("batch_rt") or {}).get("over_class_deadline_ratio") is not None:
+            if pc["chain"] == tight_idx and (pc.get("batch_rt") or {}).get("over_class_deadline_ratio") is not None:
                 d["over"].append((pc["batch_rt"]["over_class_deadline_ratio"], pc["batch_rt"]["n"]))
             if pc.get("edf"):
-                d["edf0" if pc["chain"] == 0 else "edfr"].append(pc["edf"])
+                d["edf0" if pc["chain"] == tight_idx else "edfr"].append(pc["edf"])
     out = {}
     for k, d in pts.items():
         over = sum(r * n for r, n in d["over"]) / sum(n for _, n in d["over"]) if d["over"] else None
@@ -119,9 +123,9 @@ def main():
                             continue
                         x = i + (j - 1) * 0.28
                         if d[key] and not d["saturated"]:
-                            mark(ax, x - 0.06, d[key], COL[pol], True, None if pol in lab else f"{NAME[pol]} receiver 0"); lab.add(pol)
+                            mark(ax, x - 0.06, d[key], COL[pol], True, None if pol in lab else f"{NAME[pol]} control-channel rx"); lab.add(pol)
                         if d[rest] and not d["saturated"]:
-                            mark(ax, x + 0.06, d[rest], COL[pol], False, None if (pol, "r") in lab else f"{NAME[pol]} receivers 1..")
+                            mark(ax, x + 0.06, d[rest], COL[pol], False, None if (pol, "r") in lab else f"{NAME[pol]} service-channel rx")
                             lab.add((pol, "r"))
                         if d["saturated"]:
                             ax.text(x, 1.0, "sat.", ha="center", va="bottom", fontsize=7, color=INK2, transform=ax.get_xaxis_transform())
@@ -129,10 +133,10 @@ def main():
                 ax.set_yscale("log")
                 style(ax, f"{title}, N = {N}, {SETNAME.get(st, st)}", "configuration", ylabel)
                 ax.legend(loc="upper left", frameon=False, ncol=3, fontsize=7.5)
-                fig.text(0.01, 0.005, "filled = receiver 0 (the control channel), hollow = the other receivers; dot mean, bar ±1 sd, whisker min–max; 'sat.' = the graph did not keep real time", fontsize=7, color=INK2)
+                fig.text(0.01, 0.005, "filled = the control-channel receiver (the tight class; receiver 0 unless the setting says LAST), hollow = the service-channel receivers; dot mean, bar ±1 sd, whisker min–max; 'sat.' = the graph did not keep real time", fontsize=7, color=INK2)
                 fig.tight_layout(rect=(0, 0.03, 1, 1)); save(fig, a.out_dir, f"{fname}_N{N}_{st}")
     # summaries: receiver 0 mean under every setting, per point and policy
-    for key, fname, title in (("c0", "class_summary_batch", "Receiver 0 batch response time (mean, ±1 sd, min–max) under each deadline setting"), ("c0f", "class_summary_frame", "Receiver 0 frame response time under each deadline setting")):
+    for key, fname, title in (("c0", "class_summary_batch", "Control-channel receiver: batch response time (mean, ±1 sd, min–max) under each deadline setting"), ("c0f", "class_summary_frame", "Control-channel receiver: frame response time under each deadline setting")):
         fig, axes = plt.subplots(len(Ns), 1, figsize=(max(7, 1.1 * len(points) / len(Ns) * len(settings) * 0.45 + 3), 3.6 * len(Ns)), squeeze=False)
         for r, N in enumerate(Ns):
             ax = axes[r][0]; P = [p for p in points if p[0] == N]; lab = set()
@@ -163,7 +167,7 @@ def main():
                         ax.bar(base + (j - 1) * 0.27, max(d["over_c0"], 1e-6), width=0.25, color=COL[pol])
         ax.set_xticks(xt); ax.set_xticklabels(xl, fontsize=6.5); ax.set_yscale("log"); ax.set_ylim(1e-6, 1)
         style(ax, f"N = {N}", None, "fraction of receiver 0's batches over its class deadline (log)")
-    fig.suptitle("Receiver 0: batches later than the class deadline (0.25 / 0.5 / 1 batch period), RR blue, EDF orange, RM aqua", x=0.01, ha="left", fontsize=11, color=INK)
+    fig.suptitle("Control-channel receiver: batches later than its class deadline (0.25 / 0.5 / 1 batch period), RR blue, EDF orange, RM aqua", x=0.01, ha="left", fontsize=11, color=INK)
     fig.tight_layout(rect=(0, 0.01, 1, 0.96)); save(fig, a.out_dir, "class_over_deadline")
     for k, d in sorted(pts.items()):
         numbers["points"].append({"N": k[0], "workers": k[1], "receivers": k[2], "rate": k[3], "setting": k[4], "policy": k[5], **d})

@@ -84,6 +84,7 @@ struct Options {
     unsigned    sched_ratio = 0;     // process_stream_to_message_ratio; 0 = default (16)
     std::string selection   = "heap";
     unsigned    max_outstanding_jobs = 0; // 0 = default (64)
+    unsigned    max_selections = 0;      // max_selections_per_pass; 0 = GR4's auto (4 x block count)
     uint64_t    max_samples = 0;     // replay only the first M samples (0 = whole file)
     std::vector<float> deadline_classes; // per chain relative-deadline factor (modification A); missing = 1
     float       frame_deadline = 1.f;    // post-gate relative-deadline factor (modification B)
@@ -137,6 +138,8 @@ void usage() {
         "  --sched-ratio N     process_stream_to_message_ratio (default GR4's 16)\n"
         "  --selection S       EDF selector: heap (default) | scan\n"
         "  --max-outstanding-jobs N  EDF: cap on a block's admitted jobs (default GR4's 64)\n"
+        "  --max-selections N  EDF/RM: max_selections_per_pass, work() calls before the loop returns to the\n"
+        "                      backstop that releases the sources (default GR4's auto = 4 x block count)\n"
         "  --max-samples M     replay only the first M samples of the file (frames beyond are dropped from\n"
         "                      the tables), so a run lasts M/rate seconds whatever the rate; 0 = whole file\n"
         "deadline structure (fixed-batch mode; a block's relative deadline = factor x batch period):\n"
@@ -159,7 +162,7 @@ double percentile(const std::vector<double>& sorted, double q) {
 
 int main(int argc, char** argv) {
     Options opt;
-    static const struct option kOpts[] = {{"run-dir", required_argument, nullptr, 1}, {"input", required_argument, nullptr, 2}, {"out-dir", required_argument, nullptr, 3}, {"rate", required_argument, nullptr, 4}, {"chunk", required_argument, nullptr, 5}, {"chains", required_argument, nullptr, 6}, {"deadline-ms", required_argument, nullptr, 7}, {"timeout-s", required_argument, nullptr, 8}, {"record", no_argument, nullptr, 9}, {"no-check", no_argument, nullptr, 10}, {"buffer", required_argument, nullptr, 11}, {"catch-up", no_argument, nullptr, 12}, {"single", no_argument, nullptr, 13}, {"threads", required_argument, nullptr, 14}, {"batch", required_argument, nullptr, 15}, {"policy", required_argument, nullptr, 16}, {"fixed-batch", required_argument, nullptr, 17}, {"tiny-period", required_argument, nullptr, 18}, {"trace-categories", required_argument, nullptr, 19}, {"trace-buffer", required_argument, nullptr, 20}, {"trace-limit-mb", required_argument, nullptr, 21}, {"trace-out", required_argument, nullptr, 22}, {"sched-ratio", required_argument, nullptr, 23}, {"selection", required_argument, nullptr, 24}, {"max-outstanding-jobs", required_argument, nullptr, 25}, {"max-samples", required_argument, nullptr, 26}, {"deadline-classes", required_argument, nullptr, 27}, {"frame-deadline", required_argument, nullptr, 28}, {"help", no_argument, nullptr, 'h'}, {nullptr, 0, nullptr, 0}};
+    static const struct option kOpts[] = {{"run-dir", required_argument, nullptr, 1}, {"input", required_argument, nullptr, 2}, {"out-dir", required_argument, nullptr, 3}, {"rate", required_argument, nullptr, 4}, {"chunk", required_argument, nullptr, 5}, {"chains", required_argument, nullptr, 6}, {"deadline-ms", required_argument, nullptr, 7}, {"timeout-s", required_argument, nullptr, 8}, {"record", no_argument, nullptr, 9}, {"no-check", no_argument, nullptr, 10}, {"buffer", required_argument, nullptr, 11}, {"catch-up", no_argument, nullptr, 12}, {"single", no_argument, nullptr, 13}, {"threads", required_argument, nullptr, 14}, {"batch", required_argument, nullptr, 15}, {"policy", required_argument, nullptr, 16}, {"fixed-batch", required_argument, nullptr, 17}, {"tiny-period", required_argument, nullptr, 18}, {"trace-categories", required_argument, nullptr, 19}, {"trace-buffer", required_argument, nullptr, 20}, {"trace-limit-mb", required_argument, nullptr, 21}, {"trace-out", required_argument, nullptr, 22}, {"sched-ratio", required_argument, nullptr, 23}, {"selection", required_argument, nullptr, 24}, {"max-outstanding-jobs", required_argument, nullptr, 25}, {"max-samples", required_argument, nullptr, 26}, {"deadline-classes", required_argument, nullptr, 27}, {"frame-deadline", required_argument, nullptr, 28}, {"max-selections", required_argument, nullptr, 29}, {"help", no_argument, nullptr, 'h'}, {nullptr, 0, nullptr, 0}};
     int c;
     while ((c = getopt_long(argc, argv, "h", kOpts, nullptr)) != -1) {
         switch (c) {
@@ -191,6 +194,7 @@ int main(int argc, char** argv) {
         case 26: opt.max_samples = std::strtoull(optarg, nullptr, 10); break;
         case 27: opt.deadline_classes = parseFloats(optarg); break;
         case 28: opt.frame_deadline = std::strtof(optarg, nullptr); break;
+        case 29: opt.max_selections = static_cast<unsigned>(std::strtoul(optarg, nullptr, 10)); break;
         default: usage(); return 2;
         }
     }
@@ -378,6 +382,7 @@ int main(int argc, char** argv) {
         gr::property_map sset;
         if (opt.sched_ratio > 0) { sset["process_stream_to_message_ratio"] = gr::Size_t(opt.sched_ratio); }
         if (opt.max_outstanding_jobs > 0) { sset["max_outstanding_jobs"] = gr::Size_t(opt.max_outstanding_jobs); }
+        if (opt.max_selections > 0) { sset["max_selections_per_pass"] = gr::Size_t(opt.max_selections); }
         if (opt.trace_buffer > 0) { sset["trace_buffer_size"] = gr::Size_t(opt.trace_buffer); }
         if (opt.trace_mask != 0) { sset["trace_categories"] = gr::Size_t(opt.trace_mask); }
         if (!sset.empty()) {
@@ -516,7 +521,7 @@ int main(int argc, char** argv) {
     }
     std::fclose(csv);
 
-    json summary = {{"app", "rx_latency4"}, {"runtime", "gnuradio4"}, {"scheduler", sched_name}, {"policy", opt.policy}, {"policy_name", policy_name}, {"fixed_batch", opt.fixed_batch}, {"tiny_period_s", opt.fixed_batch > 0 ? opt.tiny_period : 0.f}, {"selection_strategy", opt.selection}, {"sched_ratio", opt.sched_ratio}, {"max_outstanding_jobs", opt.max_outstanding_jobs}, {"trace", trace_info}, {"max_samples", opt.max_samples}, {"frames_dropped", frames_dropped}, {"deadline_classes", opt.deadline_classes}, {"frame_deadline", opt.frame_deadline}, {"buffer", opt.buffer}, {"catch_up", opt.catch_up}, {"threads", opt.single ? 1U : pool_threads}, {"batch", opt.batch}, {"hw_threads", hw_threads}, {"chains", opt.chains}, {"order_mode", order_mode}, {"blocks_per_chain", chains[0].block_count}, {"frames", frames}, {"decoded_total", decoded_total}, {"missing_total", missing_total}, {"wrong_payload_total", opt.check ? json(wrong_total) : json(nullptr)}, {"deadline_misses_total", misses_total}, {"elapsed_s", elapsed_s}, {"latency", {{"rate", opt.rate}, {"chunk", opt.chunk}, {"deadline_ms", opt.deadline_ms}, {"stamp_bias_max_us", opt.rate > 0 ? opt.chunk / opt.rate * 1e6 : 0.0}, {"input", opt.input}}}, {"result", ok ? "ok" : (timed_out.load() ? "timeout" : "error")}, {"per_chain", per_chain}};
+    json summary = {{"app", "rx_latency4"}, {"runtime", "gnuradio4"}, {"scheduler", sched_name}, {"policy", opt.policy}, {"policy_name", policy_name}, {"fixed_batch", opt.fixed_batch}, {"tiny_period_s", opt.fixed_batch > 0 ? opt.tiny_period : 0.f}, {"selection_strategy", opt.selection}, {"sched_ratio", opt.sched_ratio}, {"max_outstanding_jobs", opt.max_outstanding_jobs}, {"max_selections_per_pass", opt.max_selections}, {"trace", trace_info}, {"max_samples", opt.max_samples}, {"frames_dropped", frames_dropped}, {"deadline_classes", opt.deadline_classes}, {"frame_deadline", opt.frame_deadline}, {"buffer", opt.buffer}, {"catch_up", opt.catch_up}, {"threads", opt.single ? 1U : pool_threads}, {"batch", opt.batch}, {"hw_threads", hw_threads}, {"chains", opt.chains}, {"order_mode", order_mode}, {"blocks_per_chain", chains[0].block_count}, {"frames", frames}, {"decoded_total", decoded_total}, {"missing_total", missing_total}, {"wrong_payload_total", opt.check ? json(wrong_total) : json(nullptr)}, {"deadline_misses_total", misses_total}, {"elapsed_s", elapsed_s}, {"latency", {{"rate", opt.rate}, {"chunk", opt.chunk}, {"deadline_ms", opt.deadline_ms}, {"stamp_bias_max_us", opt.rate > 0 ? opt.chunk / opt.rate * 1e6 : 0.0}, {"input", opt.input}}}, {"result", ok ? "ok" : (timed_out.load() ? "timeout" : "error")}, {"per_chain", per_chain}};
     {
         std::ofstream f(opt.out_dir + "/latency_summary.json");
         f << summary.dump(2) << "\n";
