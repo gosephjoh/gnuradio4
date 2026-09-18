@@ -88,6 +88,10 @@ struct Options {
     uint64_t    max_samples = 0;     // replay only the first M samples (0 = whole file)
     std::vector<float> deadline_classes; // per chain relative-deadline factor (modification A); missing = 1
     float       frame_deadline = 1.f;    // post-gate relative-deadline factor (modification B)
+    std::vector<float> rates;            // per chain throttle rate (multi-rate receivers); missing = --rate
+    double      run_s = 0;               // replay run_s seconds per chain (max_samples = run_s x chain rate)
+    unsigned    rotate = 0;              // rotate chain k's construction order by rotate x k slots
+    bool        rm_tiny_periods = false; // RM: keep the tiny periods (default: true per-receiver periods N/rate)
 };
 
 std::vector<float> parseFloats(const char* a) {
@@ -146,7 +150,15 @@ void usage() {
         "  --deadline-classes F0,F1,..  per-receiver class factor (chain k gets Fk, missing = 1): 0.25 marks the\n"
         "                      control-channel receiver, 1 a service-channel receiver\n"
         "  --frame-deadline F  factor for the frame path after the gate (dly320, sync_long, fft, eq, decode, sink)\n"
-        "                      of every receiver; a post-gate block gets min(class, frame); default 1");
+        "                      of every receiver; a post-gate block gets min(class, frame); default 1\n"
+        "multi-rate receivers (4-worker experiment):\n"
+        "  --rates R0,R1,..    per-receiver throttle rate in samples/s (missing = --rate); batch period, deadline\n"
+        "                      and RM period follow each receiver's own rate\n"
+        "  --run-s S           replay S seconds per receiver (max_samples = S x its rate); frames beyond are dropped\n"
+        "  --rotate K          rotate receiver k's block construction order by K x k slots (spreads the heavy blocks\n"
+        "                      over GR4's striped workers); 0 = graph order as built\n"
+        "  --rm-tiny-periods   RM: keep the tiny periods (default under --policy rm: each receiver's blocks carry\n"
+        "                      their true period N/rate, so RM ranks receivers by rate)");
 }
 
 double percentile(const std::vector<double>& sorted, double q) {
@@ -162,7 +174,7 @@ double percentile(const std::vector<double>& sorted, double q) {
 
 int main(int argc, char** argv) {
     Options opt;
-    static const struct option kOpts[] = {{"run-dir", required_argument, nullptr, 1}, {"input", required_argument, nullptr, 2}, {"out-dir", required_argument, nullptr, 3}, {"rate", required_argument, nullptr, 4}, {"chunk", required_argument, nullptr, 5}, {"chains", required_argument, nullptr, 6}, {"deadline-ms", required_argument, nullptr, 7}, {"timeout-s", required_argument, nullptr, 8}, {"record", no_argument, nullptr, 9}, {"no-check", no_argument, nullptr, 10}, {"buffer", required_argument, nullptr, 11}, {"catch-up", no_argument, nullptr, 12}, {"single", no_argument, nullptr, 13}, {"threads", required_argument, nullptr, 14}, {"batch", required_argument, nullptr, 15}, {"policy", required_argument, nullptr, 16}, {"fixed-batch", required_argument, nullptr, 17}, {"tiny-period", required_argument, nullptr, 18}, {"trace-categories", required_argument, nullptr, 19}, {"trace-buffer", required_argument, nullptr, 20}, {"trace-limit-mb", required_argument, nullptr, 21}, {"trace-out", required_argument, nullptr, 22}, {"sched-ratio", required_argument, nullptr, 23}, {"selection", required_argument, nullptr, 24}, {"max-outstanding-jobs", required_argument, nullptr, 25}, {"max-samples", required_argument, nullptr, 26}, {"deadline-classes", required_argument, nullptr, 27}, {"frame-deadline", required_argument, nullptr, 28}, {"max-selections", required_argument, nullptr, 29}, {"help", no_argument, nullptr, 'h'}, {nullptr, 0, nullptr, 0}};
+    static const struct option kOpts[] = {{"run-dir", required_argument, nullptr, 1}, {"input", required_argument, nullptr, 2}, {"out-dir", required_argument, nullptr, 3}, {"rate", required_argument, nullptr, 4}, {"chunk", required_argument, nullptr, 5}, {"chains", required_argument, nullptr, 6}, {"deadline-ms", required_argument, nullptr, 7}, {"timeout-s", required_argument, nullptr, 8}, {"record", no_argument, nullptr, 9}, {"no-check", no_argument, nullptr, 10}, {"buffer", required_argument, nullptr, 11}, {"catch-up", no_argument, nullptr, 12}, {"single", no_argument, nullptr, 13}, {"threads", required_argument, nullptr, 14}, {"batch", required_argument, nullptr, 15}, {"policy", required_argument, nullptr, 16}, {"fixed-batch", required_argument, nullptr, 17}, {"tiny-period", required_argument, nullptr, 18}, {"trace-categories", required_argument, nullptr, 19}, {"trace-buffer", required_argument, nullptr, 20}, {"trace-limit-mb", required_argument, nullptr, 21}, {"trace-out", required_argument, nullptr, 22}, {"sched-ratio", required_argument, nullptr, 23}, {"selection", required_argument, nullptr, 24}, {"max-outstanding-jobs", required_argument, nullptr, 25}, {"max-samples", required_argument, nullptr, 26}, {"deadline-classes", required_argument, nullptr, 27}, {"frame-deadline", required_argument, nullptr, 28}, {"max-selections", required_argument, nullptr, 29}, {"rates", required_argument, nullptr, 30}, {"run-s", required_argument, nullptr, 31}, {"rotate", required_argument, nullptr, 32}, {"rm-tiny-periods", no_argument, nullptr, 33}, {"help", no_argument, nullptr, 'h'}, {nullptr, 0, nullptr, 0}};
     int c;
     while ((c = getopt_long(argc, argv, "h", kOpts, nullptr)) != -1) {
         switch (c) {
@@ -195,6 +207,10 @@ int main(int argc, char** argv) {
         case 27: opt.deadline_classes = parseFloats(optarg); break;
         case 28: opt.frame_deadline = std::strtof(optarg, nullptr); break;
         case 29: opt.max_selections = static_cast<unsigned>(std::strtoul(optarg, nullptr, 10)); break;
+        case 30: opt.rates = parseFloats(optarg); break;
+        case 31: opt.run_s = std::atof(optarg); break;
+        case 32: opt.rotate = static_cast<unsigned>(std::strtoul(optarg, nullptr, 10)); break;
+        case 33: opt.rm_tiny_periods = true; break;
         default: usage(); return 2;
         }
     }
@@ -231,6 +247,13 @@ int main(int argc, char** argv) {
     if (!(opt.frame_deadline > 0.f)) { std::println(stderr, "rx_latency4: --frame-deadline must be > 0"); return 2; }
     if ((!opt.deadline_classes.empty() || opt.frame_deadline != 1.f) && opt.fixed_batch == 0) {
         std::println(stderr, "rx_latency4: --deadline-classes / --frame-deadline need --fixed-batch (deadlines are batch periods)");
+        return 2;
+    }
+    for (float r : opt.rates) {
+        if (!(r > 0.f)) { std::println(stderr, "rx_latency4: --rates entries must be > 0"); return 2; }
+    }
+    if ((!opt.rates.empty() || opt.run_s > 0) && opt.fixed_batch == 0) {
+        std::println(stderr, "rx_latency4: --rates / --run-s need --fixed-batch");
         return 2;
     }
     if (opt.trace_mask != 0 && !gr::trace::kEnabled) {
@@ -315,12 +338,29 @@ int main(int argc, char** argv) {
     }
 
     // ---- graph ------------------------------------------------------------
+    // per chain: its rate, how many samples it replays, and how many frames end inside that
+    std::vector<double>      chain_rate(static_cast<std::size_t>(opt.chains), opt.rate);
+    std::vector<uint64_t>    chain_max(static_cast<std::size_t>(opt.chains), opt.max_samples);
+    std::vector<std::size_t> chain_frames(static_cast<std::size_t>(opt.chains), frames);
+    for (std::size_t k = 0; k < static_cast<std::size_t>(opt.chains); k++) {
+        if (k < opt.rates.size()) { chain_rate[k] = opt.rates[k]; }
+        if (opt.run_s > 0) { chain_max[k] = static_cast<uint64_t>(opt.run_s * chain_rate[k]); }
+        if (chain_max[k] > 0) {
+            std::size_t n = 0;
+            for (const auto& fr : manifest.at("frames")) {
+                const uint64_t so = fr.at("sample_offset").get<uint64_t>(), ns = fr.at("samples").get<uint64_t>();
+                if (so + ns > chain_max[k]) { break; }
+                n++;
+            }
+            chain_frames[k] = std::min(n, frames);
+        }
+    }
     gr::Graph                 graph;
     std::vector<ChainBlocks> chains;
     for (int k = 0; k < opt.chains; k++) {
         ChainConfig cfg;
         cfg.input       = opt.input;
-        cfg.rate        = opt.rate;
+        cfg.rate        = chain_rate[static_cast<std::size_t>(k)];
         cfg.chunk       = opt.chunk;
         cfg.frequency   = frequency;
         cfg.bandwidth   = bandwidth;
@@ -333,15 +373,19 @@ int main(int argc, char** argv) {
         cfg.batch       = opt.batch;
         cfg.fixed_batch = opt.fixed_batch;
         cfg.tiny_period = opt.fixed_batch > 0 ? opt.tiny_period : 0.f;
-        cfg.max_samples = opt.max_samples;
+        cfg.max_samples = chain_max[static_cast<std::size_t>(k)];
         cfg.deadline_factor       = static_cast<std::size_t>(k) < opt.deadline_classes.size() ? opt.deadline_classes[static_cast<std::size_t>(k)] : 1.f;
         cfg.frame_deadline_factor = opt.frame_deadline;
+        cfg.rotate          = opt.rotate;
+        cfg.chain_index     = static_cast<unsigned>(k);
+        cfg.rm_true_periods = opt.policy == "rm" && !opt.rm_tiny_periods;
         ChainBlocks cb  = buildChain(graph, cfg);
-        cb.stamper->setFrames(first, last);
-        cb.sink->setFrames(frames);
+        const std::size_t fk = chain_frames[static_cast<std::size_t>(k)];
+        cb.stamper->setFrames(std::vector<uint64_t>(first.begin(), first.begin() + static_cast<std::ptrdiff_t>(fk)), std::vector<uint64_t>(last.begin(), last.begin() + static_cast<std::ptrdiff_t>(fk)));
+        cb.sink->setFrames(fk);
         cb.sink->_order_mode = order_mode;
         if (opt.check) {
-            for (std::size_t i = 0; i < frames; i++) {
+            for (std::size_t i = 0; i < fk; i++) {
                 cb.sink->_expected[i]     = payloads.data() + offsets[i];
                 cb.sink->_expected_len[i] = lengths[i];
             }
@@ -475,11 +519,12 @@ int main(int argc, char** argv) {
     const double deadline_us = opt.deadline_ms * 1000.0;
     for (std::size_t k = 0; k < chains.size(); k++) {
         const ChainBlocks& cb = chains[k];
+        const std::size_t  frames_k = chain_frames[k];
         std::vector<double> lat;
         json                missing = json::array(), wrong = json::array();
         uint64_t            missing_n = 0, misses = 0, unstamped = 0;
         double              first_us = std::nan("");
-        for (std::size_t i = 0; i < frames; i++) {
+        for (std::size_t i = 0; i < frames_k; i++) {
             const uint64_t tf = cb.stamper->_t_first[i], tl = cb.stamper->_t_last[i], td = cb.sink->_t_decode[i];
             if (tf == 0 || tl == 0) {
                 ++unstamped;
@@ -511,7 +556,7 @@ int main(int argc, char** argv) {
         const double p50 = percentile(lat, 0.50), p95 = percentile(lat, 0.95), p99 = percentile(lat, 0.99);
         const double mx = lat.empty() ? std::nan("") : lat.back(), mn = lat.empty() ? std::nan("") : lat.front();
         const ChainCounters cc = cb.counters();
-        json s = {{"chain", k}, {"frames", frames}, {"decoded", cb.sink->_count}, {"missing", missing_n}, {"missing_seqs", missing}, {"duplicates", cb.sink->_duplicates}, {"unpairable", cb.sink->_unpairable}, {"wrong_payload", opt.check ? json(cb.sink->_wrong_payload) : json(nullptr)}, {"wrong_seqs", wrong}, {"unstamped", unstamped}, {"samples_seen", cb.stamper->_items}, {"first_us", first_us}, {"min_us", mn}, {"p50_us", p50}, {"p95_us", p95}, {"p99_us", p99}, {"max_us", mx}, {"deadline_misses", misses}, {"counts", {{"sync_short_detections", cc.sync_short_detections}, {"sync_long_frames", cc.sync_long_frames}, {"signal_ok", cc.signal_ok}, {"signal_bad", cc.signal_bad}, {"frames_started", cc.frames_started}, {"frames_decoded", cc.frames_decoded}, {"crc_failed", cc.crc_failed}, {"too_large", cc.too_large}, {"sl_neg_tags", cc.sl_neg_tags}, {"sl_far_tags", cc.sl_far_tags}, {"sl_tags_seen", cc.sl_tags_seen}, {"sl_max_copy_run", cc.sl_max_copy_run}, {"sl_short_calls", cc.sl_short_calls}, {"fft_tags_in", cc.fft_tags_in}, {"fft_tags_out", cc.fft_tags_out}, {"eq_tags_in", cc.eq_tags_in}, {"src_calls", cc.src_calls}, {"src_max_read_us", cc.src_max_read_ns / 1e3}, {"src_mean_read_us", cc.src_calls ? cc.src_sum_read_ns / 1e3 / cc.src_calls : 0.0}, {"src_max_read_items", cc.src_max_read_items}, {"thr_calls", cc.thr_calls}, {"thr_max_gap_us", cc.thr_max_gap_ns / 1e3}, {"thr_mean_gap_us", cc.thr_calls ? cc.thr_sum_gap_ns / 1e3 / cc.thr_calls : 0.0}, {"thr_max_backlog_samples", cc.thr_max_backlog}, {"stamper_reentry", cc.stamper_reentry}}}};
+        json s = {{"chain", k}, {"frames", frames_k}, {"rate", chain_rate[k]}, {"max_samples", chain_max[k]}, {"decoded", cb.sink->_count}, {"missing", missing_n}, {"missing_seqs", missing}, {"duplicates", cb.sink->_duplicates}, {"unpairable", cb.sink->_unpairable}, {"wrong_payload", opt.check ? json(cb.sink->_wrong_payload) : json(nullptr)}, {"wrong_seqs", wrong}, {"unstamped", unstamped}, {"samples_seen", cb.stamper->_items}, {"first_us", first_us}, {"min_us", mn}, {"p50_us", p50}, {"p95_us", p95}, {"p99_us", p99}, {"max_us", mx}, {"deadline_misses", misses}, {"counts", {{"sync_short_detections", cc.sync_short_detections}, {"sync_long_frames", cc.sync_long_frames}, {"signal_ok", cc.signal_ok}, {"signal_bad", cc.signal_bad}, {"frames_started", cc.frames_started}, {"frames_decoded", cc.frames_decoded}, {"crc_failed", cc.crc_failed}, {"too_large", cc.too_large}, {"sl_neg_tags", cc.sl_neg_tags}, {"sl_far_tags", cc.sl_far_tags}, {"sl_tags_seen", cc.sl_tags_seen}, {"sl_max_copy_run", cc.sl_max_copy_run}, {"sl_short_calls", cc.sl_short_calls}, {"fft_tags_in", cc.fft_tags_in}, {"fft_tags_out", cc.fft_tags_out}, {"eq_tags_in", cc.eq_tags_in}, {"src_calls", cc.src_calls}, {"src_max_read_us", cc.src_max_read_ns / 1e3}, {"src_mean_read_us", cc.src_calls ? cc.src_sum_read_ns / 1e3 / cc.src_calls : 0.0}, {"src_max_read_items", cc.src_max_read_items}, {"thr_calls", cc.thr_calls}, {"thr_max_gap_us", cc.thr_max_gap_ns / 1e3}, {"thr_mean_gap_us", cc.thr_calls ? cc.thr_sum_gap_ns / 1e3 / cc.thr_calls : 0.0}, {"thr_max_backlog_samples", cc.thr_max_backlog}, {"stamper_reentry", cc.stamper_reentry}}}};
         per_chain.push_back(s);
         decoded_total += cb.sink->_count;
         missing_total += missing_n;
@@ -521,7 +566,7 @@ int main(int argc, char** argv) {
     }
     std::fclose(csv);
 
-    json summary = {{"app", "rx_latency4"}, {"runtime", "gnuradio4"}, {"scheduler", sched_name}, {"policy", opt.policy}, {"policy_name", policy_name}, {"fixed_batch", opt.fixed_batch}, {"tiny_period_s", opt.fixed_batch > 0 ? opt.tiny_period : 0.f}, {"selection_strategy", opt.selection}, {"sched_ratio", opt.sched_ratio}, {"max_outstanding_jobs", opt.max_outstanding_jobs}, {"max_selections_per_pass", opt.max_selections}, {"trace", trace_info}, {"max_samples", opt.max_samples}, {"frames_dropped", frames_dropped}, {"deadline_classes", opt.deadline_classes}, {"frame_deadline", opt.frame_deadline}, {"buffer", opt.buffer}, {"catch_up", opt.catch_up}, {"threads", opt.single ? 1U : pool_threads}, {"batch", opt.batch}, {"hw_threads", hw_threads}, {"chains", opt.chains}, {"order_mode", order_mode}, {"blocks_per_chain", chains[0].block_count}, {"frames", frames}, {"decoded_total", decoded_total}, {"missing_total", missing_total}, {"wrong_payload_total", opt.check ? json(wrong_total) : json(nullptr)}, {"deadline_misses_total", misses_total}, {"elapsed_s", elapsed_s}, {"latency", {{"rate", opt.rate}, {"chunk", opt.chunk}, {"deadline_ms", opt.deadline_ms}, {"stamp_bias_max_us", opt.rate > 0 ? opt.chunk / opt.rate * 1e6 : 0.0}, {"input", opt.input}}}, {"result", ok ? "ok" : (timed_out.load() ? "timeout" : "error")}, {"per_chain", per_chain}};
+    json summary = {{"app", "rx_latency4"}, {"runtime", "gnuradio4"}, {"scheduler", sched_name}, {"policy", opt.policy}, {"policy_name", policy_name}, {"fixed_batch", opt.fixed_batch}, {"tiny_period_s", opt.fixed_batch > 0 ? opt.tiny_period : 0.f}, {"selection_strategy", opt.selection}, {"sched_ratio", opt.sched_ratio}, {"max_outstanding_jobs", opt.max_outstanding_jobs}, {"max_selections_per_pass", opt.max_selections}, {"trace", trace_info}, {"max_samples", opt.max_samples}, {"run_s", opt.run_s}, {"rates", opt.rates}, {"rotate", opt.rotate}, {"frames_dropped", frames_dropped}, {"deadline_classes", opt.deadline_classes}, {"frame_deadline", opt.frame_deadline}, {"buffer", opt.buffer}, {"catch_up", opt.catch_up}, {"threads", opt.single ? 1U : pool_threads}, {"batch", opt.batch}, {"hw_threads", hw_threads}, {"chains", opt.chains}, {"order_mode", order_mode}, {"blocks_per_chain", chains[0].block_count}, {"frames", frames}, {"decoded_total", decoded_total}, {"missing_total", missing_total}, {"wrong_payload_total", opt.check ? json(wrong_total) : json(nullptr)}, {"deadline_misses_total", misses_total}, {"elapsed_s", elapsed_s}, {"latency", {{"rate", opt.rate}, {"chunk", opt.chunk}, {"deadline_ms", opt.deadline_ms}, {"stamp_bias_max_us", opt.rate > 0 ? opt.chunk / opt.rate * 1e6 : 0.0}, {"input", opt.input}}}, {"result", ok ? "ok" : (timed_out.load() ? "timeout" : "error")}, {"per_chain", per_chain}};
     {
         std::ofstream f(opt.out_dir + "/latency_summary.json");
         f << summary.dump(2) << "\n";
@@ -535,9 +580,9 @@ int main(int argc, char** argv) {
             const ChainCounters cc = chains[k].counters();
             json blocks = json::array();
             for (const auto& [uname, role] : chains[k].roles) { blocks.push_back({{"unique_name", uname}, {"role", role}}); }
-            jchains.push_back({{"chain", k}, {"throttle_start_ns", cc.thr_start_ns}, {"throttle_chunks", cc.thr_chunks}, {"throttle_max_chunks_per_call", cc.thr_max_chunks_per_call}, {"throttle_max_backlog_samples", cc.thr_max_backlog}, {"blocks", blocks}});
+            jchains.push_back({{"chain", k}, {"rate", chain_rate[k]}, {"max_samples", chain_max[k]}, {"frames", chain_frames[k]}, {"throttle_start_ns", cc.thr_start_ns}, {"throttle_chunks", cc.thr_chunks}, {"throttle_max_chunks_per_call", cc.thr_max_chunks_per_call}, {"throttle_max_backlog_samples", cc.thr_max_backlog}, {"blocks", blocks}});
         }
-        json meta = {{"app", "rx_latency4"}, {"run_dir", opt.run_dir}, {"input", opt.input}, {"out_dir", opt.out_dir}, {"policy", opt.policy}, {"policy_name", policy_name}, {"scheduler", sched_name}, {"threads", opt.single ? 1U : pool_threads}, {"hw_threads", hw_threads}, {"rate", opt.rate}, {"chunk", opt.chunk}, {"fixed_batch", opt.fixed_batch}, {"batch", opt.batch}, {"buffer", opt.buffer}, {"tiny_period_s", opt.fixed_batch > 0 ? opt.tiny_period : 0.f}, {"selection_strategy", opt.selection}, {"sched_ratio", opt.sched_ratio}, {"max_outstanding_jobs", opt.max_outstanding_jobs}, {"frames", frames}, {"max_samples", opt.max_samples}, {"deadline_classes", opt.deadline_classes}, {"frame_deadline", opt.frame_deadline}, {"elapsed_s", elapsed_s}, {"result", ok ? "ok" : (timed_out.load() ? "timeout" : "error")}, {"trace", trace_info}, {"chains", jchains}, {"analysis", analysis}, {"diagnostics", diagnostics}};
+        json meta = {{"app", "rx_latency4"}, {"run_dir", opt.run_dir}, {"input", opt.input}, {"out_dir", opt.out_dir}, {"policy", opt.policy}, {"policy_name", policy_name}, {"scheduler", sched_name}, {"threads", opt.single ? 1U : pool_threads}, {"hw_threads", hw_threads}, {"rate", opt.rate}, {"chunk", opt.chunk}, {"fixed_batch", opt.fixed_batch}, {"batch", opt.batch}, {"buffer", opt.buffer}, {"tiny_period_s", opt.fixed_batch > 0 ? opt.tiny_period : 0.f}, {"selection_strategy", opt.selection}, {"sched_ratio", opt.sched_ratio}, {"max_outstanding_jobs", opt.max_outstanding_jobs}, {"frames", frames}, {"max_samples", opt.max_samples}, {"run_s", opt.run_s}, {"rates", opt.rates}, {"rotate", opt.rotate}, {"rm_true_periods", opt.policy == "rm" && !opt.rm_tiny_periods}, {"deadline_classes", opt.deadline_classes}, {"frame_deadline", opt.frame_deadline}, {"elapsed_s", elapsed_s}, {"result", ok ? "ok" : (timed_out.load() ? "timeout" : "error")}, {"trace", trace_info}, {"chains", jchains}, {"analysis", analysis}, {"diagnostics", diagnostics}};
         std::ofstream f(opt.out_dir + "/trace_meta.json");
         f << meta.dump(2) << "\n";
     }

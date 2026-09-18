@@ -83,6 +83,7 @@ def main():
     summ = json.load(open(os.path.join(rd, "latency_summary.json")))
     N = int(meta["fixed_batch"])
     rate = float(meta["rate"])
+    chain_rate = [float(c.get("rate", rate)) for c in meta["chains"]]  # multi-rate receivers
     out = {"run_dir": rd, "policy": meta["policy"], "policy_name": meta.get("policy_name"), "threads": meta["threads"], "chains": len(meta["chains"]),
            "rate": rate, "fixed_batch": N, "buffer": meta["buffer"], "warmup_s": a.warmup, "window_s": a.window,
            "trace": meta.get("trace", {}), "result": meta.get("result"), "per_chain": [], "utilization": None, "edf": None, "sync": None}
@@ -100,6 +101,8 @@ def main():
     if meta.get("max_samples"):
         total_samples = min(total_samples, int(meta["max_samples"]))  # --max-samples: only that much was replayed
     out["air_s"] = total_samples / rate if rate > 0 else None
+    if meta.get("run_s"):
+        out["air_s"] = float(meta["run_s"])  # --run-s: every receiver replays that long at its own rate
     # slower than real time = the graph could not keep up = response times are unbounded (the
     # throttle publishes late because its output buffer stays full); the point is saturated
     out["realtime_ratio"] = (meta.get("elapsed_s") / out["air_s"]) if (out["air_s"] and meta.get("elapsed_s")) else None
@@ -128,7 +131,7 @@ def main():
         dec = L[L.decoded == 1]
         inwin = dec[(dec.t_last_ns >= w0) & (dec.t_last_ns < w1)]
         cf = float(classes[k]) if k < len(classes) else 1.0
-        pc = {"chain": k, "deadline_factor": cf, "frame_deadline_factor": min(cf, frame_f), "frames": int(len(L)), "decoded": int(len(dec)), "decoded_in_window": int(len(inwin)),
+        pc = {"chain": k, "rate": chain_rate[k], "batch_period_us": N / chain_rate[k] * 1e6 if (N and chain_rate[k]) else None, "deadline_factor": cf, "frame_deadline_factor": min(cf, frame_f), "frames": int(len(L)), "decoded": int(len(dec)), "decoded_in_window": int(len(inwin)),
               "frame_rt": stats(inwin.lat_last_us.to_numpy() * 1e3), "frame_rt_all": stats(dec.lat_last_us.to_numpy() * 1e3)}
         out["per_chain"].append(pc)
 
@@ -180,6 +183,8 @@ def main():
         for k, ch in enumerate(meta["chains"]):
             pc = out["per_chain"][k]
             thr_start = int(ch["throttle_start_ns"])
+            rate = chain_rate[k]                       # this receiver's rate ...
+            period_ns = N / rate * 1e9                  # ... and batch period
             I = inv[inv.chain == k]
             T = I[(I.role == "throttle") & (I["out"] > 0)].sort_values("start_ns")
             if len(T) == 0:

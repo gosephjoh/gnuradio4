@@ -74,6 +74,18 @@ struct ChainConfig {
     // 1 and 1 reproduce the equal-deadline runs.
     float       deadline_factor       = 1.f;
     float       frame_deadline_factor = 1.f;
+    // Construction order is GR4's graph order, hence the round-robin sweep
+    // order and the striping order (block i -> worker i mod T).  `rotate`
+    // rotates this chain's construction order by rotate x chain_index slots
+    // so that several receivers' heavy blocks do not all land on the same
+    // workers (with 18 blocks per chain and 4 workers they otherwise do).
+    // The receiver itself is unchanged; only the order the blocks are made in.
+    unsigned    rotate      = 0;
+    unsigned    chain_index = 0;
+    // RateMonotonic reads only `period` (no release gate): give the pipeline
+    // blocks their true period N/rate so RM ranks receivers by rate; EDF keeps
+    // the tiny period (its gate would otherwise forbid catching up).
+    bool        rm_true_periods = false;
 };
 
 struct ChainCounters {

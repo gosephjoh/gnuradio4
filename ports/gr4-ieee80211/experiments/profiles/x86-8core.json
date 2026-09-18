@@ -134,5 +134,42 @@
     ],
     "run_s": 30,
     "repeats": 2
+  },
+  "multirate": {
+    "description": "multi-rate receivers on four workers: the fastest receiver last in graph order (round robin serves it last), construction order rotated by one slot per receiver so the heavy blocks spread over the workers; implicit deadlines (each receiver's own batch period); RM gets true periods",
+    "workers": 4,
+    "N": 1024,
+    "rotate": 1,
+    "run_s": 30,
+    "repeats": 3,
+    "mixes": [
+      {
+        "name": "light",
+        "rates": [
+          1250000,
+          1250000,
+          2500000,
+          5000000
+        ]
+      },
+      {
+        "name": "mid",
+        "rates": [
+          1250000,
+          2500000,
+          2500000,
+          5000000
+        ]
+      },
+      {
+        "name": "knee",
+        "rates": [
+          2500000,
+          2500000,
+          5000000,
+          5000000
+        ]
+      }
+    ]
   }
 }
