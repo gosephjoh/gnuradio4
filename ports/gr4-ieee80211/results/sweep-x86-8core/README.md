@@ -69,6 +69,9 @@ throttle stalled so long that no batch reached the gate inside the window
 
 ## Later experiments
 
+- `prelim/REPORT.md` — the ten-minute preliminary matrix (2026-09-18): which
+  policy for which workload — RR for the simple one, EDF where receivers differ
+  and a choice must be made, RM for the fastest receiver.
 - `multirate/REPORT.md` — four workers, four receivers of different rates
   (2026-09-18): where EDF wins once the house-keeping ratio is raised, with
   the M6 pass-cost microbenchmark that explains every EDF loss in the tables

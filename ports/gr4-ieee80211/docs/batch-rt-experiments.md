@@ -46,6 +46,7 @@ Python 3 with `numpy`, `pandas` and `matplotlib` for the analysis and plots.
 | `scripts/rt-paper-figs.py` | | the range figures of a sweep as PDF + PNG, and the numbers they show |
 | `scripts/rt-class-figs.py` | | the range figures of the deadline-structure sweep (receiver 0 against the rest, per setting) |
 | `scripts/rt-microbench4`, `scripts/trace-edf-oracle.py`, `apps/microbench4.cpp` | | the microbenchmarks M1–M6: isolated block costs, scheduler cost per invocation, blocking bound, EDF selection oracle, trace overhead, scheduler pass cost on four workers (the house-keeping re-sync) |
+| `scripts/rt-prelim4`, `scripts/rt-prelim-figs.py` | | the ten-minute preliminary matrix (simple workloads and the three multi-rate mixes, one short run per cell) and its range figures |
 | `scripts/rt-multirate-figs.py`, `scripts/rt-multirate-compare.py` | | the range figures of the multi-rate receivers experiment (one sweep), and two sweeps of it side by side (e.g. two `process_stream_to_message_ratio` values) |
 | `experiments/profiles/*.json` | | per-machine parameters: `x86-8core.json`, `pi5.json`; `x86-8core-r4096.json` is the same with `sched_ratio` 4096 (every run gets `--sched-ratio 4096`) |
 
@@ -174,6 +175,13 @@ or `pi5.json`.
     --b <cell>/runs4/sweep-x86-8core-r4096-multirate --b-label "ratio 4096" --out-dir results/sweep-<name>/multirate/compare
 #    M6 alone (six 20 s runs, ~5 min): the pass-cost table of MICRO.md
 ./scripts/rt-microbench4 --out-dir results/sweep-<name>/micro --only M6
+```
+
+```
+# 8. the preliminary "which policy for which workload" matrix (~10 min): five workloads x RR/EDF/RM,
+#    one 8 s run each, ratio 4096, small rings -> results/sweep-<name>/prelim/REPORT.md
+./scripts/rt-prelim4 --out-dir <cell>/runs4/prelim-<name>
+./scripts/rt-prelim-figs.py <cell>/runs4/prelim-<name> --out-dir results/sweep-<name>/prelim
 ```
 
 A multi-rate run is `rx_latency4 --chains 4 --threads 4 --fixed-batch 1024
@@ -355,6 +363,14 @@ published 5–14 µs after nominal on average.
   one worker every admitted job runs within its pass.
 - EDF at saturation missed 21 % of its implicit deadlines; RR and RM have no
   deadlines to miss.
+
+**The preliminary matrix (2026-09-18)** — `results/sweep-x86-8core/prelim/REPORT.md`
+(one 8 s run per cell, ratio 4096 for all): RR for one receiver (67 vs EDF 69
+vs RM 101 µs; EDF = FIFO plus bookkeeping); EDF where receivers differ and RR
+cannot prioritise or RM would starve the slow receivers (5 Msps receiver late
+2.0 % vs RR 12.7 % in the light mix; at the knee RM's 2.5 Msps receivers 30 %
+late vs EDF 3–10 %); RM for the fastest receiver in every mix (110 vs 117 µs
+light, 164 vs 203 knee).
 
 **The multi-rate experiment (2026-09-18)** — `results/sweep-x86-8core/multirate/REPORT.md`:
 four receivers at 1.25–5 Msps on four workers, three mixes × RR/EDF/RM ×

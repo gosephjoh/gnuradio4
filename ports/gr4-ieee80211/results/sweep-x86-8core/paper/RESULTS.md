@@ -299,6 +299,14 @@ still on the fastest receiver but starves the 2.5 Msps receivers at the knee
 EDF number in §3 and in `../README.md` was measured at ratio 16 and is an
 upper bound.
 
+## 3c. The preliminary which-policy-for-which-workload matrix
+
+`../prelim/REPORT.md` (one 8 s run per cell, ratio 4096 for all policies)
+states the three findings in one place with range figures: round robin for
+the simple workload, EDF where the receivers differ and round robin cannot
+prioritise or rate monotonic would starve the slow receivers, rate monotonic
+for the fastest receiver.
+
 ## 4. Threats to validity
 
 - **The platform is a virtual machine.** All timings are from a KVM/QEMU
