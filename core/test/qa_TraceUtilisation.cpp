@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <format>
 #include <map>
+#include <set>
 #include <span>
 #include <string>
 #include <vector>
@@ -422,6 +423,68 @@ const boost::ut::suite<"TraceUtilisationLive"> traceUtilisationLiveTests = [] {
         expect(eq(first.front().lifetimeNs, second.front().lifetimeNs));
         expect(eq(first.front().blockNs(), second.front().blockNs()));
         expect(eq(first.front().occupancy, second.front().occupancy));
+    };
+
+    "several real workers are each described on their own terms"_test = [] {
+        // The first test in this milestone to run the worker loop on pool threads rather than the
+        // calling one. Values are not asserted -- with several threads they are not even stable in
+        // shape, since the job split depends on the pool size -- but the relationships must hold for
+        // every worker independently, and the attribution must not blur between them.
+        reset();
+        setCategories(categoryMask(Category::work, Category::schedulerLoop, Category::lifecycle));
+
+        gr::Graph graph;
+        auto&     src = graph.emplaceBlock<gr::testing::ConstantSource<float>>({{"name", std::string("src")}, {"n_samples_max", gr::Size_t{200000U}}});
+        auto&     a   = graph.emplaceBlock<gr::testing::Copy<float>>({{"name", std::string("a")}});
+        auto&     b   = graph.emplaceBlock<gr::testing::Copy<float>>({{"name", std::string("b")}});
+        auto&     snk = graph.emplaceBlock<gr::testing::NullSink<float>>({{"name", std::string("snk")}});
+        std::ignore   = graph.connect<"out", "in">(src, a);
+        std::ignore   = graph.connect<"out", "in">(a, b);
+        std::ignore   = graph.connect<"out", "in">(b, snk);
+
+        gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multiThreaded> scheduler;
+        std::ignore = scheduler.exchange(std::move(graph));
+        std::ignore = scheduler.runAndWait();
+
+        std::vector<Event> events;
+        std::ignore = forEachEvent([](const Event& e, void* user) noexcept { static_cast<std::vector<Event>*>(user)->push_back(e); }, &events);
+        setCategories(0U);
+
+        const std::vector<WorkerUtilisation> all = workerUtilisation(events, 0UL);
+        expect(gt(all.size(), 0UZ) >> fatal) << "a pool-driven run must produce at least one worker";
+
+        std::set<std::uint8_t> ids;
+        std::size_t            computed = 0UZ;
+        for (const WorkerUtilisation& w : all) {
+            expect(ids.insert(w.workerId).second) << "worker ids must be distinct -- one entry each, never merged";
+            expect(neq(w.workerId, kWorkerOverflow)) << "the saturation bucket names no single thread";
+            if (!w.computed) {
+                continue; // a worker that emitted nothing but its own bracket is not a fault
+            }
+            ++computed;
+            // F1 - every per-worker invariant holds for each worker independently.
+            expect(le(w.blockNs(), w.sweepNs)) << "worker " << w.workerId << ": blocks run inside sweeps";
+            expect(le(w.messagePhaseNs + w.sweepNs + w.idleNs, w.lifetimeNs)) << "worker " << w.workerId;
+            expect(ge(w.occupancy, 0.0) and le(w.occupancy, 1.0)) << "worker " << w.workerId;
+            if (w.hasThreadCpuTime) {
+                expect(le(w.threadCpuNs, w.lifetimeNs)) << "worker " << w.workerId << ": on-core cannot exceed alive";
+            }
+        }
+        expect(gt(computed, 0UZ) >> fatal) << "at least one worker must have a usable decomposition";
+
+        // F4 - each block belongs to one job set, so its records must come from one worker. A block
+        // surfacing under two means the identity or the worker attribution is wrong, which is the
+        // thing arguing-from-the-code could establish but never observe under real concurrency.
+        std::map<EntityId, std::set<std::uint8_t>> workersPerBlock;
+        for (const Event& event : events) {
+            if (event.kind == Kind::workEnd && event.entity != kNoEntity) {
+                workersPerBlock[event.entity].insert(event.workerId);
+            }
+        }
+        expect(gt(workersPerBlock.size(), 0UZ) >> fatal) << "block records must be attributed to blocks";
+        for (const auto& [entity, workers] : workersPerBlock) {
+            expect(eq(workers.size(), 1UZ)) << "entity " << entity << " ran under " << workers.size() << " workers; a block belongs to exactly one job set";
+        }
     };
 
     "per-block execution sums to the worker's productive total"_test = [] {
