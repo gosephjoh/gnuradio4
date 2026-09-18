@@ -45,8 +45,9 @@ Python 3 with `numpy`, `pandas` and `matplotlib` for the analysis and plots.
 | `scripts/rt-plot4.py` | | a sweep → `batch_rt.png`, `frame_rt.png`, `frame_batch_rt.png`, `edf_misses.png`, `summary.csv` |
 | `scripts/rt-paper-figs.py` | | the range figures of a sweep as PDF + PNG, and the numbers they show |
 | `scripts/rt-class-figs.py` | | the range figures of the deadline-structure sweep (receiver 0 against the rest, per setting) |
-| `scripts/rt-microbench4`, `scripts/trace-edf-oracle.py`, `apps/microbench4.cpp` | | the microbenchmarks: isolated block costs, scheduler cost per invocation, blocking bound, EDF selection oracle, trace overhead |
-| `experiments/profiles/*.json` | | per-machine parameters: `x86-8core.json`, `pi5.json` |
+| `scripts/rt-microbench4`, `scripts/trace-edf-oracle.py`, `apps/microbench4.cpp` | | the microbenchmarks M1–M6: isolated block costs, scheduler cost per invocation, blocking bound, EDF selection oracle, trace overhead, scheduler pass cost on four workers (the house-keeping re-sync) |
+| `scripts/rt-multirate-figs.py`, `scripts/rt-multirate-compare.py` | | the range figures of the multi-rate receivers experiment (one sweep), and two sweeps of it side by side (e.g. two `process_stream_to_message_ratio` values) |
+| `experiments/profiles/*.json` | | per-machine parameters: `x86-8core.json`, `pi5.json`; `x86-8core-r4096.json` is the same with `sched_ratio` 4096 (every run gets `--sched-ratio 4096`) |
 
 ### What one run does
 
@@ -161,7 +162,31 @@ or `pi5.json`.
 
 # 6. the paper-style figures of the main sweep (PDF + PNG) and their numbers
 ./scripts/rt-paper-figs.py <cell>/runs4/sweep-<name> --out-dir results/sweep-<name>/paper --gr3 <GR3 run dir>
+
+# 7. the multi-rate receivers experiment (profile["multirate"]: 4 workers, mixes x policies x repeats,
+#    30 s runs, per-receiver rates, rotated construction order, RM with true periods): ~1 h for 27 runs
+./scripts/rt-sweep4 $PROFILE --multirate
+./scripts/rt-multirate-figs.py <cell>/runs4/sweep-<name>-multirate --out-dir results/sweep-<name>/multirate
+#    the same at process_stream_to_message_ratio 4096 (profile x86-8core-r4096.json), and both side by side
+./scripts/rt-sweep4 experiments/profiles/x86-8core-r4096.json --multirate
+./scripts/rt-multirate-figs.py <cell>/runs4/sweep-x86-8core-r4096-multirate --out-dir results/sweep-<name>/multirate-r4096
+./scripts/rt-multirate-compare.py --a <cell>/runs4/sweep-<name>-multirate --a-label "ratio 16" \
+    --b <cell>/runs4/sweep-x86-8core-r4096-multirate --b-label "ratio 4096" --out-dir results/sweep-<name>/multirate/compare
+#    M6 alone (six 20 s runs, ~5 min): the pass-cost table of MICRO.md
+./scripts/rt-microbench4 --out-dir results/sweep-<name>/micro --only M6
 ```
+
+A multi-rate run is `rx_latency4 --chains 4 --threads 4 --fixed-batch 1024
+--rates 1250000,1250000,2500000,5000000 --run-s 30 --rotate 1 --policy …`:
+every receiver has its own throttle rate (its batch period N/rate is its
+implicit deadline; the heaviest receiver last in graph order, where round
+robin serves it last), `--rotate 1` rotates receiver k's construction order
+by k slots so the heavy blocks of the receivers land on different workers,
+and RM gets the true per-receiver periods on the pipeline blocks (the
+default now; `--rm-tiny-periods` restores the tiny ones). `--sched-ratio`
+sets the scheduler's `process_stream_to_message_ratio`, the number of
+passes between two house-keeping rounds (default 16): §5 says why it
+matters to EDF.
 
 `--smoke` (with `--cell data/rt_300_300_10000_QPSK_1_2_s1`, a 5.8 s cell
 `gen4` makes in four seconds) runs the probes and a one-point, one-repeat
@@ -330,6 +355,22 @@ published 5–14 µs after nominal on average.
   one worker every admitted job runs within its pass.
 - EDF at saturation missed 21 % of its implicit deadlines; RR and RM have no
   deadlines to miss.
+
+**The multi-rate experiment (2026-09-18)** — `results/sweep-x86-8core/multirate/REPORT.md`:
+four receivers at 1.25–5 Msps on four workers, three mixes × RR/EDF/RM ×
+3 repeats, twice: at the scheduler's default `process_stream_to_message_ratio`
+of 16 EDF was the worst policy on every receiver; **M6 found why**: the
+house-keeping re-sync every 16 passes rebuilds EDF's release storage:
+45 µs per round and 29 % of an EDF worker's time against 6.5 µs under RR/RM
+(it discarded no jobs in these runs; the cost is the time and the halved
+pass rate). At ratio 4096 (profile `x86-8core-r4096.json`,
+all three policies) EDF's response times fall by 75–170 µs and it gives the
+tightest-deadline receiver fewer late batches than RR in every mix, while
+RM with true periods is faster still on that receiver but starves the slow
+ones at the knee. **Compare policies at the same ratio, and do not read the
+ratio-16 EDF numbers above as EDF's best.** The ratio also sets how often
+message ports are served (every 4096 passes ≈ 20–40 ms here); every frame
+was still decoded.
 
 ## 6. Traps already paid for
 

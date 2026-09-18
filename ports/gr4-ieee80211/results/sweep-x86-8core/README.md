@@ -67,6 +67,15 @@ throttle stalled so long that no batch reached the gate inside the window
 | 4096 | 6 | 3 | 5 | 0.56 | 437 / 137 / 2892 | 472 / 133 / 1828 | 381 / 210 / 9265 | 0.0000 |
 | 4096 | 6 | 3 | 10 | 0.97 | no batch completed | saturated | no batch completed | 0.0013 |
 
+## Later experiments
+
+- `multirate/REPORT.md` — four workers, four receivers of different rates
+  (2026-09-18): where EDF wins once the house-keeping ratio is raised, with
+  the M6 pass-cost microbenchmark that explains every EDF loss in the tables
+  below (all measured at ratio 16).
+- `paper/RESULTS.md` — the paper-style write-up (microbenchmarks, the
+  deadline-structure experiment, §3b the multi-rate summary).
+
 ## What it says
 
 - Where the graph keeps up, **RR and EDF sit within tens of µs of each

@@ -276,6 +276,29 @@ last on two workers it was the slowest for that receiver in every setting.
 Rate-monotonic ranks without informative periods are a fixed priority
 assigned by accident, and the experiment shows what that costs.
 
+
+## 3b. Four workers, four receivers of different rates: the multi-rate experiment
+
+Reported in full in `../multirate/REPORT.md` (figures, tables, threats). In
+short: four receivers at 1.25 to 5 Msps on four workers, each receiver's
+batch period its implicit deadline, the fastest receiver last in graph order,
+construction order rotated so the heavy blocks spread over the workers, RM
+with true per-receiver periods. At the scheduler's default
+`process_stream_to_message_ratio` of 16 EDF was the worst policy on every
+receiver of every mix, by 95 to 250 µs. Microbenchmark M6 (`../micro/MICRO.md`)
+found the cause: the house-keeping re-sync every 16 passes rebuilds EDF's
+release storage, costing 45 µs per round and 29 % of every EDF worker's time
+(and halving its pass rate), against 6.5 µs under RR and RM. With the
+ratio at 4096 for all three policies EDF's response times fall by 75 to 170 µs
+and the ordering becomes the textbook one: EDF gives the tightest-deadline
+receiver fewer late batches than round robin in every mix (8.5 % vs 14.6 %,
+5.0 % vs 36.4 %, 15.9 % vs 49.4 %) and charges the loosest-deadline receivers
+about 30 µs for it; rate monotonic with true periods is 20 to 50 µs better
+still on the fastest receiver but starves the 2.5 Msps receivers at the knee
+(21 % late, maxima of 3 and 16 ms) where EDF keeps them at 2 to 5 %. Every
+EDF number in §3 and in `../README.md` was measured at ratio 16 and is an
+upper bound.
+
 ## 4. Threats to validity
 
 - **The platform is a virtual machine.** All timings are from a KVM/QEMU
@@ -306,8 +329,13 @@ assigned by accident, and the experiment shows what that costs.
   time exceeded that same figure most of the time. GR4's release model has
   no end-to-end deadline; a per-stage split of an end-to-end budget was not
   attempted.
-- **RM was left with uninformative periods on purpose**, so the three
-  policies see the same graph and only EDF uses the added information.
+- **RM was left with uninformative periods on purpose** in §3, so the three
+  policies see the same graph and only EDF uses the added information; §3b
+  gives RM its true periods.
+- **Every EDF run in §1–§3 used `process_stream_to_message_ratio` 16**,
+  whose house-keeping re-sync costs EDF 29 % of each worker (M6,
+  §3b). The EDF columns of §3 and of `../README.md` are therefore upper
+  bounds; RR and RM are unaffected by the ratio.
 
 ## 5. Summary
 
@@ -327,3 +355,10 @@ class deadline shorter than the longest non-preemptible invocation (M3) is
 not meetable by any of the three policies. Rate monotonic with equal periods
 is a fixed priority assigned by accident and starves a receiver at two
 thirds of a core.
+
+Where the workload has receivers of different rates and the scheduler's
+house-keeping cadence is lengthened so that it stops discarding EDF's jobs
+(§3b), the picture is the classic one: EDF protects the tightest deadline
+better than round robin in every mix and distributes lateness under overload
+more evenly than rate monotonic, which is faster still on the highest-rate
+receiver but starves the others at the knee.

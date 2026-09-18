@@ -108,3 +108,51 @@ N = 4096: batch-path floor (sum of mean costs, throttle excluded) 97.8 µs; long
 | rr | 304 | 307 | +3 | 180 | 180 | 1.001 | 1.008 |
 | edf | 301 | 309 | +7 | 180 | 180 | 1.001 | 1.015 |
 | rm | 320 | 356 | +36 | 180 | 180 | 1.001 | 1.015 |
+
+## M6 — scheduler pass cost on four workers (light mix 1.25/1.25/2.5/5 Msps, N = 1024, rotation 1, 20 s, every category traced)
+
+Batch response time per receiver (mean µs, and the fraction of batches later than the receiver's own period):
+
+| policy | ratio | rx 0 | rx 1 | rx 2 | rx 3 (5 Msps) | EDF pipeline misses |
+|---|---|---|---|---|---|---|
+| rr | 16 | 160 (0.1%) | 160 (0.1%) | 150 (0.2%) | 173 (22.0%) | - |
+| edf | 16 | 295 (0.0%) | 325 (0.0%) | 261 (2.7%) | 207 (47.1%) | 3 |
+| rm | 16 | 154 (0.0%) | 187 (0.0%) | 138 (0.0%) | 114 (0.8%) | - |
+| rr | 4096 | 135 (0.0%) | 123 (0.0%) | 145 (0.0%) | 152 (13.5%) | - |
+| edf | 4096 | 154 (0.0%) | 206 (0.0%) | 130 (0.1%) | 133 (4.6%) | 3 |
+| rm | 4096 | 174 (0.0%) | 148 (0.0%) | 119 (0.0%) | 104 (0.7%) | - |
+
+Scheduler events per worker inside the window (rate, mean and p99 duration, share of the worker's time):
+
+| policy | ratio | event | per s | mean µs | p99 µs | busy % |
+|---|---|---|---|---|---|---|
+| rr | 16 | sweep | 88779 | 10.0 | 72.0 | 89.0 |
+| rr | 16 | stateSync | 5549 | 6.5 | 16.5 | 3.6 |
+| rr | 16 | messagePhase | 5549 | 7.5 | 17.9 | 4.2 |
+| rr | 16 | workProbe | 1463376 | 0.0 | 0.0 | 0.0 |
+| edf | 16 | sweep | 101442 | 5.8 | 66.9 | 59.2 |
+| edf | 16 | stateSync | 6340 | 45.4 | 66.9 | 28.8 |
+| edf | 16 | messagePhase | 6340 | 46.8 | 68.7 | 29.6 |
+| edf | 16 | releaseScan | 227138 | 0.6 | 1.8 | 14.1 |
+| edf | 16 | workProbe | 81874 | 0.0 | 0.0 | 0.0 |
+| rm | 16 | sweep | 77712 | 11.6 | 99.3 | 90.4 |
+| rm | 16 | stateSync | 4857 | 6.4 | 16.1 | 3.1 |
+| rm | 16 | messagePhase | 4857 | 7.4 | 17.3 | 3.6 |
+| rm | 16 | workProbe | 1315592 | 0.0 | 0.0 | 0.0 |
+| rr | 4096 | sweep | 94939 | 9.6 | 66.8 | 91.2 |
+| rr | 4096 | stateSync | 23 | 28.3 | 47.0 | 0.1 |
+| rr | 4096 | messagePhase | 23 | 30.1 | 49.0 | 0.1 |
+| rr | 4096 | workProbe | 1569123 | 0.0 | 0.0 | 0.0 |
+| edf | 4096 | sweep | 206869 | 3.9 | 36.9 | 79.7 |
+| edf | 4096 | stateSync | 51 | 88.5 | 247.7 | 0.4 |
+| edf | 4096 | messagePhase | 51 | 90.3 | 249.2 | 0.5 |
+| edf | 4096 | releaseScan | 392979 | 0.7 | 1.6 | 28.3 |
+| edf | 4096 | workProbe | 142278 | 0.0 | 0.0 | 0.0 |
+| rm | 4096 | sweep | 81612 | 11.4 | 93.6 | 92.7 |
+| rm | 4096 | stateSync | 20 | 31.2 | 42.8 | 0.1 |
+| rm | 4096 | messagePhase | 20 | 32.9 | 44.3 | 0.1 |
+| rm | 4096 | workProbe | 1386992 | 0.0 | 0.0 | 0.0 |
+
+Jobs discarded by the re-sync (EDF only tracks jobs; mean per re-sync, max, share of re-syncs that discarded any): rr r16: 0.00, 0, 0%; edf r16: 0.00, 0, 0%; rm r16: 0.00, 0, 0%; rr r4096: 0.00, 0, 0%; edf r4096: 0.00, 0, 0%; rm r4096: 0.00, 0, 0%
+
+Mean gap between consecutive passes of a worker (µs, one value per worker): rr r16: 1.3, 1.1, 1.2, 1.3; edf r16: 3.7, 3.9, 4.3, 4.3; rm r16: 1.3, 1.2, 1.3, 1.2; rr r4096: 0.8, 0.8, 1.0, 1.1; edf r4096: 0.9, 0.9, 1.0, 1.0; rm r4096: 0.8, 0.8, 1.0, 1.1
