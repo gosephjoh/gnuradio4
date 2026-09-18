@@ -1635,12 +1635,32 @@ protected:
         // Previous pass's block list, by address, so a re-sync can say whether anything actually
         // changed. Only populated when tracing is compiled in.
         [[maybe_unused]] std::vector<const void*> traceListFingerprint;
+
+        // Read unconditionally rather than behind the live category, because a capture may be started
+        // *during* a worker's life and would then have no opening reading to difference against. Two
+        // syscalls per worker thread for the whole of its existence is not a cost worth optimising.
+        [[maybe_unused]] std::optional<std::uint64_t> traceCpuAtStart;
         if constexpr (gr::trace::kEnabled) {
+            traceCpuAtStart = gr::trace::threadCpuNow();
             gr::trace::emit(gr::trace::Event{.startNs = gr::trace::now(), .payload0 = static_cast<std::uint32_t>(localBlockList.size()), .payload1 = static_cast<std::uint32_t>(gr::trace::currentCpu()), .kind = gr::trace::Kind::workerStart, .workerId = gr::trace::workerIdOf(runnerID)});
         }
         [[maybe_unused]] on_scope_exit traceWorkerStop = [&] {
             if constexpr (gr::trace::kEnabled) {
-                gr::trace::emit(gr::trace::Event{.startNs = gr::trace::now(), .payload0 = gr::trace::saturate(sweepCount), .payload1 = static_cast<std::uint32_t>(gr::trace::ringStats().lost), .kind = gr::trace::Kind::workerStop, .workerId = gr::trace::workerIdOf(runnerID)});
+                // The *delta*, in microseconds. A payload word is 32 bits, so nanoseconds would
+                // overflow after 4.295 s; microseconds carry 71 minutes of CPU at a resolution finer
+                // than the question needs. An absolute reading would be wrong outright under
+                // `singleThreaded`, where this loop runs on the caller's thread -- one that may have
+                // accumulated hours of CPU time before the scheduler ever started.
+                std::uint32_t cpuMicros   = 0U;
+                std::uint8_t  workerFlags = 0U;
+                if (traceCpuAtStart.has_value()) {
+                    const std::optional<std::uint64_t> cpuAtStop = gr::trace::threadCpuNow();
+                    if (cpuAtStop.has_value() && *cpuAtStop >= *traceCpuAtStart) {
+                        cpuMicros   = gr::trace::saturate((*cpuAtStop - *traceCpuAtStart) / 1000UL);
+                        workerFlags = gr::trace::flag::kThreadCpuValid;
+                    }
+                }
+                gr::trace::emit(gr::trace::Event{.startNs = gr::trace::now(), .payload0 = gr::trace::saturate(sweepCount), .payload1 = static_cast<std::uint32_t>(gr::trace::ringStats().lost), .payload2 = cpuMicros, .kind = gr::trace::Kind::workerStop, .workerId = gr::trace::workerIdOf(runnerID), .flags = workerFlags});
             }
         };
 

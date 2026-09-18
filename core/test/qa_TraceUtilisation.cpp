@@ -1,12 +1,17 @@
 #include <boost/ut.hpp>
 
 #include <cstdint>
+#include <map>
 #include <span>
 #include <string>
 #include <vector>
 
+#include <gnuradio-4.0/Graph.hpp>
+#include <gnuradio-4.0/Scheduler.hpp>
 #include <gnuradio-4.0/Trace.hpp>
 #include <gnuradio-4.0/TraceReport.hpp>
+
+#include <gnuradio-4.0/testing/NullSources.hpp>
 
 using namespace boost::ut;
 using namespace gr::trace;
@@ -289,6 +294,141 @@ const boost::ut::suite<"TraceUtilisation"> traceUtilisationTests = [] {
         expect(!w.hasThreadCpuTime) << "the flag is clear, so the reading must not be believed";
         expect(eq(w.threadCpuNs, 0UL));
         expect(eq(w.preemptionNs, 0UL)) << "and no preemption may be inferred from a reading that does not exist";
+    };
+};
+
+/**
+ * A real worker loop, which `externalStep` cannot provide: `step()` runs on the caller's thread, so
+ * there is no worker whose lifetime a fraction could be taken of.
+ *
+ * `singleThreaded` runs the *same* loop as the thread pool, just on the calling thread — so the
+ * mechanism is fully exercised with no second thread to race. Durations vary between runs, so
+ * nothing here asserts a value: these are relationships that must hold however the machine behaves.
+ */
+namespace {
+
+using LiveScheduler = gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded>;
+
+[[nodiscard]] std::vector<Event> runLive(std::uint32_t categories, gr::Size_t nSamples) {
+    reset();
+    setCategories(categories);
+
+    gr::Graph graph;
+    auto&     src = graph.emplaceBlock<gr::testing::ConstantSource<float>>({{"name", std::string("src")}, {"n_samples_max", nSamples}});
+    auto&     mid = graph.emplaceBlock<gr::testing::Copy<float>>({{"name", std::string("mid")}});
+    auto&     snk = graph.emplaceBlock<gr::testing::NullSink<float>>({{"name", std::string("snk")}});
+    std::ignore   = graph.connect<"out", "in">(src, mid);
+    std::ignore   = graph.connect<"out", "in">(mid, snk);
+
+    LiveScheduler scheduler;
+    std::ignore = scheduler.exchange(std::move(graph));
+    std::ignore = scheduler.runAndWait();
+
+    std::vector<Event> events;
+    std::ignore = forEachEvent([](const Event& e, void* user) noexcept { static_cast<std::vector<Event>*>(user)->push_back(e); }, &events);
+    setCategories(0U);
+    return events;
+}
+
+} // namespace
+
+const boost::ut::suite<"TraceUtilisationLive"> traceUtilisationLiveTests = [] {
+    if constexpr (!kEnabled) {
+        return;
+    }
+
+    "a real worker loop yields a decomposition that holds together"_test = [] {
+        const std::vector<Event>             events = runLive(categoryMask(Category::work, Category::schedulerLoop, Category::lifecycle), gr::Size_t{200000U});
+        const std::vector<WorkerUtilisation> all    = workerUtilisation(events, 0UL);
+        expect(eq(all.size(), 1UZ) >> fatal) << "singleThreaded runs exactly one worker";
+
+        const WorkerUtilisation& w = all.front();
+        expect(w.computed >> fatal) << w.reason;
+
+        // A · containment. These are exact, not approximate: the markers are structurally nested, so
+        // there is no skew to absorb and a violation by one nanosecond is a genuine fault.
+        expect(le(w.blockNs(), w.sweepNs)) << "blocks run inside sweeps";
+        expect(le(w.messagePhaseNs + w.sweepNs + w.idleNs, w.lifetimeNs)) << "the loop's phases fit inside the life";
+        expect(ge(w.unaccountedNs, 0UL));
+        expect(ge(w.occupancy, 0.0) and le(w.occupancy, 1.0)) << "a fraction of a life cannot exceed it";
+        if (w.hasUtilisation) {
+            expect(ge(w.utilisation, 0.0) and le(w.utilisation, 1.0));
+        }
+
+        // B · tightness. Containment is blind to a term going missing -- these are what notice.
+        expect(gt(w.lifetimeNs, 0UL));
+        expect(gt(w.blockProductiveNs, 0UL)) << "a run that moved 200k samples must show block time";
+        expect(gt(w.sweepNs, 0UL));
+        expect(ge(w.sweepNs, w.blockNs()));
+        const std::uint64_t accounted = w.messagePhaseNs + w.sweepNs + w.idleNs;
+        expect(ge(accounted * 2UL, w.lifetimeNs)) << "a busy run accounts for well over half its life; far less means a term was dropped";
+    };
+
+    "the two clocks agree with each other and with the wall"_test = [] {
+        const std::vector<Event> events = runLive(categoryMask(Category::work, Category::schedulerLoop, Category::lifecycle), gr::Size_t{200000U});
+        const WorkerUtilisation& w      = workerUtilisation(events, 0UL).front();
+        expect(w.computed >> fatal) << w.reason;
+        expect(w.hasThreadCpuTime >> fatal) << "this platform has CLOCK_THREAD_CPUTIME_ID, so the reading must be present";
+
+        // D1 · the strongest single assertion available: exact, universal, load-independent, and it
+        // relates two measurements taken by entirely different mechanisms.
+        expect(le(w.threadCpuNs, w.lifetimeNs)) << "a single thread cannot consume more CPU-seconds than wall-seconds elapsed";
+        expect(gt(w.threadCpuNs, 0UL)) << "a run that did work must have held a core";
+        expect(ge(w.preemptionNs, 0UL));
+        expect(!w.preemptionClamped) << "the clamp firing means idle exceeded off-core, so an assumption bent";
+    };
+
+    "occupancy responds to the work actually done"_test = [] {
+        // C4 · the differential. Every other invariant is satisfied by a constant; only this notices
+        // that the metric moves with the thing it claims to measure.
+        const std::uint32_t      mask         = categoryMask(Category::work, Category::schedulerLoop, Category::lifecycle);
+        const std::vector<Event> small        = runLive(mask, gr::Size_t{20000U});
+        const std::uint64_t      smallBlockNs = workerUtilisation(small, 0UL).front().blockNs();
+        const std::vector<Event> large        = runLive(mask, gr::Size_t{200000U});
+        const std::uint64_t      largeBlockNs = workerUtilisation(large, 0UL).front().blockNs();
+
+        expect(gt(smallBlockNs, 0UL) >> fatal);
+        expect(gt(largeBlockNs, smallBlockNs * 3UL)) << "ten times the samples must show as substantially more block time, not a constant";
+    };
+
+    "the analysis is deterministic for a given capture"_test = [] {
+        // C5 · whatever the run did, reading it twice must say the same thing.
+        const std::vector<Event>             events = runLive(categoryMask(Category::work, Category::schedulerLoop, Category::lifecycle), gr::Size_t{50000U});
+        const std::vector<WorkerUtilisation> first  = workerUtilisation(events, 0UL);
+        const std::vector<WorkerUtilisation> second = workerUtilisation(events, 0UL);
+        expect(eq(first.size(), second.size()) >> fatal);
+        expect(eq(first.front().lifetimeNs, second.front().lifetimeNs));
+        expect(eq(first.front().blockNs(), second.front().blockNs()));
+        expect(eq(first.front().occupancy, second.front().occupancy));
+    };
+
+    "per-block execution sums to the worker's productive total"_test = [] {
+        // E5 · the two sides are built from the same records via different keys -- one grouped by
+        // worker, the other by block -- so a mismatch means the two attributions disagree, which is
+        // a direct check on the identity plumbing.
+        const std::vector<Event> events = runLive(categoryMask(Category::work, Category::schedulerLoop, Category::lifecycle), gr::Size_t{50000U});
+        const WorkerUtilisation& w      = workerUtilisation(events, 0UL).front();
+        expect(w.computed >> fatal) << w.reason;
+
+        std::map<EntityId, std::uint64_t> byBlock;
+        std::uint64_t                     unattributed = 0UL;
+        for (const Event& event : events) {
+            if (event.kind != Kind::workEnd) {
+                continue;
+            }
+            if (event.entity == kNoEntity) {
+                unattributed += event.durationNs;
+                continue;
+            }
+            byBlock[event.entity] += event.durationNs;
+        }
+        std::uint64_t summed = unattributed;
+        for (const auto& [entity, ns] : byBlock) {
+            summed += ns;
+        }
+        expect(eq(summed, w.blockProductiveNs)) << "grouping by block and by worker must reach the same total";
+        expect(eq(unattributed, 0UL)) << "every invocation must name its block, or the identity was never pushed down";
+        expect(gt(byBlock.size(), 1UZ)) << "a three-block chain must show more than one block running";
     };
 };
 

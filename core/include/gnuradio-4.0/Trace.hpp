@@ -8,6 +8,7 @@
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string_view>
 #include <type_traits>
 #include <utility>
@@ -498,6 +499,19 @@ inline constexpr std::size_t kDefaultRingCapacity = 65536UZ;
 /// The CPU this thread is running on, or -1 where the platform cannot say. Read once per worker at
 /// start-up and never on the hot path: it is the thread-to-core mapping a report needs in order to
 /// explain why two workers that ought to be independent are not.
+/**
+ * The calling thread's consumed CPU time in nanoseconds, or nothing where the platform cannot say.
+ *
+ * Distinct from `now()` in both meaning and cost. `now()` is wall-clock and reads from the vDSO in
+ * ~25 ns; this is the time the thread actually spent **on a core**, and on Linux it is a real
+ * syscall — hundreds of nanoseconds. It is therefore read exactly **twice per worker thread, ever**,
+ * at the ends of the worker loop, and never on a marker path.
+ *
+ * Empty rather than zero when unavailable: a zero would be indistinguishable from a thread that
+ * consumed no CPU, which is the one reading that would mislead a reader into seeing total preemption.
+ */
+[[nodiscard]] std::optional<std::uint64_t> threadCpuNow() noexcept;
+
 [[nodiscard]] std::int32_t currentCpu() noexcept;
 
 void                        setCategories(std::uint32_t mask) noexcept;
