@@ -81,7 +81,7 @@ enum class Category : std::uint32_t {
     /// Exact per-invocation sample counts from inside `work()`. Appended rather than slotted next to
     /// `workPhases`, because `categoryMask` is written into the `.gr4trace` header: renumbering a bit
     /// would silently change what an already-written capture's mask means, with no version to signal it.
-    workExact     = 1U << 8
+    workExact = 1U << 8
 };
 
 /// One past the last `Kind`, so a test can walk every enumerator. `categoryOf`'s own completeness is
@@ -175,16 +175,19 @@ namespace flag {
 /// cannot silently compare a round-robin trace against an EDF one.
 inline constexpr std::uint8_t kLoopKindMask = 0b0000'0011U;
 
-inline constexpr std::uint8_t kIsSource         = 1U << 2; /// `Kind::workEnd`: performed_work is processedOut
-inline constexpr std::uint8_t kJobBacked        = 1U << 3; /// `Kind::work*`: ran against a released job
-inline constexpr std::uint8_t kBoundHit         = 1U << 0; /// `Kind::sweep`: the selection bound was reached
-inline constexpr std::uint8_t kViaStep          = 1U << 1; /// `Kind::sweep`: `externalStep`, not a pool worker
-inline constexpr std::uint8_t kDidAdopt         = 1U << 0; /// `Kind::messagePhase`
-inline constexpr std::uint8_t kDidRemove        = 1U << 1; /// `Kind::messagePhase`
-inline constexpr std::uint8_t kDidReap          = 1U << 2; /// `Kind::messagePhase`
-inline constexpr std::uint8_t kDidHouseKeep     = 1U << 3; /// `Kind::messagePhase`
-inline constexpr std::uint8_t kDidStateSync     = 1U << 4; /// `Kind::messagePhase`
-inline constexpr std::uint8_t kListChanged      = 1U << 0; /// `Kind::stateSync`: the block list actually moved
+inline constexpr std::uint8_t kIsSource     = 1U << 2; /// `Kind::workEnd`: performed_work is processedOut
+inline constexpr std::uint8_t kJobBacked    = 1U << 3; /// `Kind::work*`: ran against a released job
+inline constexpr std::uint8_t kBoundHit     = 1U << 0; /// `Kind::sweep`: the selection bound was reached
+inline constexpr std::uint8_t kViaStep      = 1U << 1; /// `Kind::sweep`: `externalStep`, not a pool worker
+inline constexpr std::uint8_t kDidAdopt     = 1U << 0; /// `Kind::messagePhase`
+inline constexpr std::uint8_t kDidRemove    = 1U << 1; /// `Kind::messagePhase`
+inline constexpr std::uint8_t kDidReap      = 1U << 2; /// `Kind::messagePhase`
+inline constexpr std::uint8_t kDidHouseKeep = 1U << 3; /// `Kind::messagePhase`
+inline constexpr std::uint8_t kDidStateSync = 1U << 4; /// `Kind::messagePhase`
+inline constexpr std::uint8_t kListChanged  = 1U << 0; /// `Kind::stateSync`: the block list actually moved
+/// `Kind::workerStop`: `payload2` holds a real on-core time. Distinguishes a platform with no
+/// thread-CPU clock from a worker that consumed nothing -- a bare zero would read as total preemption.
+inline constexpr std::uint8_t kThreadCpuValid   = 1U << 0;
 inline constexpr std::uint8_t kQuiescenceDenied = 1U << 5; /// `Kind::messagePhase`: the work guard refused the pass
 
 /// `Kind::jobRelease`. Clear means the per-sweep backstop released it; set means the event-driven

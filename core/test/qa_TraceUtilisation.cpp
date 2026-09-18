@@ -1,0 +1,295 @@
+#include <boost/ut.hpp>
+
+#include <cstdint>
+#include <span>
+#include <string>
+#include <vector>
+
+#include <gnuradio-4.0/Trace.hpp>
+#include <gnuradio-4.0/TraceReport.hpp>
+
+using namespace boost::ut;
+using namespace gr::trace;
+
+/**
+ * Worker CPU utilisation, built from hand-made records.
+ *
+ * The decomposition is arithmetic over a set of intervals, so it is testable without a scheduler at
+ * all — and it must be, because a real worker produces different durations on every run. The
+ * timing-dependent half of this feature is covered separately by invariants; here every answer is
+ * known by construction.
+ */
+namespace {
+
+[[nodiscard]] Event started(std::uint8_t worker, std::uint64_t atNs) { return Event{.startNs = atNs, .kind = Kind::workerStart, .workerId = worker}; }
+
+[[nodiscard]] Event stopped(std::uint8_t worker, std::uint64_t atNs) { return Event{.startNs = atNs, .kind = Kind::workerStop, .workerId = worker}; }
+
+/// `cpuUs` is the on-core time the worker loop consumed, as the emitter records it.
+[[nodiscard]] Event stoppedWithCpu(std::uint8_t worker, std::uint64_t atNs, std::uint32_t cpuUs) { return Event{.startNs = atNs, .payload2 = cpuUs, .kind = Kind::workerStop, .workerId = worker, .flags = flag::kThreadCpuValid}; }
+
+[[nodiscard]] Event interval(std::uint8_t worker, Kind kind, std::uint64_t atNs, std::uint32_t durationNs) { return Event{.startNs = atNs, .durationNs = durationNs, .kind = kind, .workerId = worker}; }
+
+[[nodiscard]] Event probe(std::uint8_t worker, std::uint32_t count, std::uint32_t probeNs, EntityId entity = EntityId{1U}) { return Event{.payload0 = count, .payload1 = probeNs, .entity = entity, .kind = Kind::workProbe, .workerId = worker}; }
+
+/// A worker whose life divides exactly: 1000 ns long, 600 sweeping (of which 400 productive and 100
+/// probing), 100 in messages, 200 idle, leaving 100 unaccounted.
+[[nodiscard]] std::vector<Event> knownWorker(std::uint8_t worker = 0U) {
+    return {
+        started(worker, 1000UL),                            //
+        interval(worker, Kind::messagePhase, 1000UL, 100U), //
+        interval(worker, Kind::sweep, 1100UL, 600U),        //
+        interval(worker, Kind::workEnd, 1150UL, 400U),      //
+        probe(worker, 3U, 100U),                            //
+        interval(worker, Kind::idle, 1700UL, 200U),         //
+        stopped(worker, 2000UL),                            //
+    };
+}
+
+[[nodiscard]] const WorkerUtilisation& only(const std::vector<WorkerUtilisation>& all) {
+    expect(eq(all.size(), 1UZ) >> fatal) << "expected exactly one worker in the capture";
+    return all.front();
+}
+
+} // namespace
+
+const boost::ut::suite<"TraceUtilisation"> traceUtilisationTests = [] {
+    "a worker's life decomposes into terms that are each recoverable"_test = [] {
+        const WorkerUtilisation w = only(workerUtilisation(knownWorker(), 0UL));
+        expect(w.computed >> fatal) << w.reason;
+
+        expect(eq(w.lifetimeNs, 1000UL));
+        expect(eq(w.messagePhaseNs, 100UL));
+        expect(eq(w.sweepNs, 600UL));
+        expect(eq(w.idleNs, 200UL));
+        expect(eq(w.blockProductiveNs, 400UL));
+        expect(eq(w.blockProbeNs, 100UL));
+        expect(eq(w.blockNs(), 500UL));
+        expect(eq(w.unaccountedNs, 100UL)) << "1000 - (100 message + 600 sweep + 200 idle)";
+    };
+
+    "productive and probe time are separate terms, and both are block execution"_test = [] {
+        // Probing is time spent inside work() that produced nothing. It is not scheduler overhead --
+        // folding it there would understate what the blocks cost and overstate the scheduler.
+        const WorkerUtilisation w = only(workerUtilisation(knownWorker(), 0UL));
+        expect(w.computed >> fatal);
+        expect(eq(w.blockProductiveNs, 400UL));
+        expect(eq(w.blockProbeNs, 100UL));
+        expect(eq(w.blockNs(), w.blockProductiveNs + w.blockProbeNs));
+        expect(neq(w.blockProbeNs, 0UL)) << "a capture with probes must not report them as zero";
+    };
+
+    "occupancy and utilisation use different denominators"_test = [] {
+        const WorkerUtilisation w = only(workerUtilisation(knownWorker(), 0UL));
+        expect(w.computed >> fatal);
+
+        // 500 of 1000 ns alive; 500 of the 800 ns it was not deliberately waiting.
+        expect(eq(w.occupancy, 0.5)) << "block time over the whole life";
+        expect(w.hasUtilisation >> fatal);
+        expect(eq(w.utilisation, 0.625)) << "block time over the life minus idle";
+        expect(gt(w.utilisation, w.occupancy)) << "excluding idle can only raise the ratio";
+    };
+
+    "utilisation is refused for a worker that only ever idled"_test = [] {
+        // Occupancy of 0 % is true and meaningful. "Share of active time" has no meaning when there
+        // was no active time, and reporting it as 0 % would present an idle worker as a busy one
+        // that achieved nothing.
+        const std::vector<Event> allIdle{
+            started(0U, 0UL),                     //
+            interval(0U, Kind::idle, 0UL, 1000U), //
+            stopped(0U, 1000UL),                  //
+        };
+        const WorkerUtilisation w = only(workerUtilisation(allIdle, 0UL));
+        expect(w.computed >> fatal) << w.reason;
+        expect(eq(w.occupancy, 0.0));
+        expect(!w.hasUtilisation) << "the denominator would be zero, so the ratio is undefined rather than zero";
+        expect(eq(w.idleNs, 1000UL));
+    };
+
+    "the two clocks give on-core time and preemption"_test = [] {
+        // Alive 1000 ns, on-core for 700, of which 200 was deliberate waiting -- so 100 ns was taken
+        // away involuntarily.
+        // Scaled so the microsecond field lands exactly: a 1 000 000 ns life, 700 000 ns on-core.
+        const std::vector<Event> scaled{
+            started(0U, 0UL),                               //
+            interval(0U, Kind::messagePhase, 0UL, 100000U), //
+            interval(0U, Kind::sweep, 100000UL, 600000U),   //
+            interval(0U, Kind::workEnd, 150000UL, 400000U), //
+            probe(0U, 3U, 100000U),                         //
+            interval(0U, Kind::idle, 700000UL, 200000U),    //
+            stoppedWithCpu(0U, 1000000UL, 700000U / 1000U), //
+        };
+        const WorkerUtilisation w = only(workerUtilisation(scaled, 0UL));
+        expect(w.computed >> fatal) << w.reason;
+        expect(w.hasThreadCpuTime >> fatal);
+        expect(eq(w.threadCpuNs, 700000UL));
+        expect(eq(w.preemptionNs, 100000UL)) << "off-core 300000 ns, of which 200000 was idle";
+        expect(!w.preemptionClamped);
+    };
+
+    "idle time is not counted as preemption"_test = [] {
+        // A worker that slept most of its life and was never preempted must report zero preemption,
+        // not the whole of its off-core time.
+        const std::vector<Event> sleepy{
+            started(0U, 0UL),                               //
+            interval(0U, Kind::sweep, 0UL, 100000U),        //
+            interval(0U, Kind::workEnd, 0UL, 100000U),      //
+            interval(0U, Kind::idle, 100000UL, 900000U),    //
+            stoppedWithCpu(0U, 1000000UL, 100000U / 1000U), // on-core only while sweeping
+        };
+        const WorkerUtilisation w = only(workerUtilisation(sleepy, 0UL));
+        expect(w.computed >> fatal) << w.reason;
+        expect(eq(w.idleNs, 900000UL));
+        expect(eq(w.preemptionNs, 0UL)) << "off-core 900000 ns is exactly the idle, so none of it was involuntary";
+        expect(!w.preemptionClamped);
+    };
+
+    "a capture that lost records is refused outright"_test = [] {
+        // The terms would cover a truncated window while the lifetime spans the whole run, so every
+        // ratio understates by an unknowable amount. Refusing here also removes the interval-clipping
+        // problem: a clipped capture can no longer reach the arithmetic at all.
+        const WorkerUtilisation w = only(workerUtilisation(knownWorker(), 17UL));
+        expect(!w.computed) << "a wrapped ring cannot be divided into percentages";
+        expect(w.reason.find("17 records were lost") != std::string::npos) << w.reason;
+    };
+
+    "a capture with no worker loop is refused, naming externalStep"_test = [] {
+        // step() runs on the caller's thread, so there is no worker whose lifetime this could be a
+        // fraction of. The condition is the missing pair; the reason consults the sweep flag so the
+        // message names the policy rather than the symptom.
+        const std::vector<Event> stepped{
+            Event{.startNs = 0UL, .durationNs = 500U, .kind = Kind::sweep, .workerId = 0U, .flags = flag::kViaStep},
+            interval(0U, Kind::workEnd, 100UL, 300U),
+        };
+        const WorkerUtilisation w = only(workerUtilisation(stepped, 0UL));
+        expect(!w.computed) << "there is no worker thread to describe";
+        expect(w.reason.find("externalStep") != std::string::npos) << "the refusal must name the policy: " << w.reason;
+
+        // ... and without that flag the refusal still fires, just less specifically.
+        const std::vector<Event> noPair{interval(0U, Kind::sweep, 0UL, 500U)};
+        const WorkerUtilisation  v = only(workerUtilisation(noPair, 0UL));
+        expect(!v.computed);
+        expect(v.reason.find("lifecycle") != std::string::npos) << v.reason;
+    };
+
+    "a reversed or duplicated lifetime is refused"_test = [] {
+        const std::vector<Event> backwards{started(0U, 2000UL), stopped(0U, 1000UL)};
+        const WorkerUtilisation  b = only(workerUtilisation(backwards, 0UL));
+        expect(!b.computed) << "an unsigned subtraction would otherwise give an enormous plausible lifetime";
+        expect(b.reason.find("does not follow") != std::string::npos) << b.reason;
+
+        const std::vector<Event> twice{started(0U, 0UL), started(0U, 10UL), stopped(0U, 1000UL)};
+        const WorkerUtilisation  t = only(workerUtilisation(twice, 0UL));
+        expect(!t.computed) << "two starts means the pair is ambiguous";
+        expect(t.reason.find("exactly one") != std::string::npos) << t.reason;
+
+        const std::vector<Event> zero{started(0U, 1000UL), stopped(0U, 1000UL)};
+        const WorkerUtilisation  z = only(workerUtilisation(zero, 0UL));
+        expect(!z.computed) << "a zero lifetime would divide by zero";
+    };
+
+    "a containment violation is refused, and the reason carries the numbers"_test = [] {
+        // The markers are structurally nested, so this cannot happen by measurement skew -- only by
+        // overlapping scopes, a nesting change, mixed workers, or a bug here. A bare "refused" would
+        // be indistinguishable from an over-eager check, so the arithmetic goes in the message.
+        const std::vector<Event> tooMuchBlock{
+            started(0U, 0UL),                       //
+            interval(0U, Kind::sweep, 0UL, 100U),   //
+            interval(0U, Kind::workEnd, 0UL, 400U), // cannot exceed its own sweep
+            stopped(0U, 1000UL),                    //
+        };
+        const WorkerUtilisation b = only(workerUtilisation(tooMuchBlock, 0UL));
+        expect(!b.computed);
+        expect(b.reason.find("exceeds") != std::string::npos) << b.reason;
+        expect(b.reason.find("400") != std::string::npos) << "the offending block total must appear: " << b.reason;
+        expect(b.reason.find("100") != std::string::npos) << "and the sweep total it broke: " << b.reason;
+
+        const std::vector<Event> tooMuchTotal{
+            started(0U, 0UL),                              //
+            interval(0U, Kind::sweep, 0UL, 600U),          //
+            interval(0U, Kind::messagePhase, 600UL, 600U), // 600 + 600 > 1000
+            stopped(0U, 1000UL),                           //
+        };
+        const WorkerUtilisation t = only(workerUtilisation(tooMuchTotal, 0UL));
+        expect(!t.computed);
+        expect(t.reason.find("1000 ns lifetime") != std::string::npos) << t.reason;
+    };
+
+    "a saturated interval is refused rather than summed"_test = [] {
+        // Saturation makes a term a lower bound. It can never cause a false containment failure --
+        // it only shrinks a sum -- but every percentage derived from it understates, so it is caught
+        // by name rather than indirectly by an invariant that would report the wrong cause.
+        const std::vector<Event> saturated{
+            started(0U, 0UL),                           //
+            interval(0U, Kind::sweep, 0UL, kSaturated), //
+            stopped(0U, 10'000'000'000UL),              //
+        };
+        const WorkerUtilisation w = only(workerUtilisation(saturated, 0UL));
+        expect(!w.computed);
+        expect(w.reason.find("4.295") != std::string::npos) << w.reason;
+
+        const std::vector<Event> saturatedProbe{
+            started(0U, 0UL),                      //
+            interval(0U, Kind::sweep, 0UL, 1000U), //
+            probe(0U, 1U, kSaturated),             //
+            stopped(0U, 10'000'000'000UL),         //
+        };
+        expect(!only(workerUtilisation(saturatedProbe, 0UL)).computed) << "a clipped probe total is equally unusable";
+    };
+
+    "on-core time exceeding the lifetime is refused"_test = [] {
+        // No single thread can consume more CPU-seconds than wall-seconds elapsed, so this is either
+        // the two clocks swapped or a delta against the wrong anchor.
+        const std::vector<Event> impossible{
+            started(0U, 0UL),                     //
+            stoppedWithCpu(0U, 1000000UL, 5000U), // 5 ms of CPU in a 1 ms life
+        };
+        const WorkerUtilisation w = only(workerUtilisation(impossible, 0UL));
+        expect(!w.computed);
+        expect(w.reason.find("no single thread can do") != std::string::npos) << w.reason;
+    };
+
+    "the saturation bucket names no thread and is refused"_test = [] {
+        const std::vector<Event> folded{started(kWorkerOverflow, 0UL), stopped(kWorkerOverflow, 1000UL)};
+        const WorkerUtilisation  w = only(workerUtilisation(folded, 0UL));
+        expect(!w.computed);
+        expect(w.reason.find("saturation bucket") != std::string::npos) << w.reason;
+    };
+
+    "workers are reported separately, not averaged"_test = [] {
+        std::vector<Event> two = knownWorker(0U);
+        for (const Event& e : knownWorker(1U)) {
+            two.push_back(e);
+        }
+        const std::vector<WorkerUtilisation> all = workerUtilisation(two, 0UL);
+        expect(eq(all.size(), 2UZ) >> fatal) << "one entry per worker";
+        expect(eq(all[0].workerId, std::uint8_t{0U}));
+        expect(eq(all[1].workerId, std::uint8_t{1U}));
+        for (const WorkerUtilisation& w : all) {
+            expect(w.computed >> fatal) << w.reason;
+            expect(eq(w.lifetimeNs, 1000UL)) << "each worker's own lifetime, not a shared one";
+            expect(eq(w.blockNs(), 500UL));
+        }
+    };
+
+    "one refused worker does not invalidate the others"_test = [] {
+        std::vector<Event> mixed = knownWorker(0U);
+        mixed.push_back(started(1U, 2000UL)); // worker 1 never stopped
+        const std::vector<WorkerUtilisation> all = workerUtilisation(mixed, 0UL);
+        expect(eq(all.size(), 2UZ) >> fatal);
+        expect(all[0].computed) << "a sound worker must still be reported: " << all[0].reason;
+        expect(!all[1].computed) << "and the unsound one refused on its own";
+    };
+
+    "an absent thread-CPU clock is absent, not zero"_test = [] {
+        // A zero on-core time would read as "100 % preempted", which is the most misleading value
+        // the field could take on a platform that simply cannot measure it.
+        const WorkerUtilisation w = only(workerUtilisation(knownWorker(), 0UL));
+        expect(w.computed >> fatal);
+        expect(!w.hasThreadCpuTime) << "the flag is clear, so the reading must not be believed";
+        expect(eq(w.threadCpuNs, 0UL));
+        expect(eq(w.preemptionNs, 0UL)) << "and no preemption may be inferred from a reading that does not exist";
+    };
+};
+
+int main() { /* suites run via registration */ }
