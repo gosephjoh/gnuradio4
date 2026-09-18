@@ -9,7 +9,8 @@ them) and draws, one panel per batch size N and one line per policy:
   batch_rt.png       batch response time (0036 item 16): mean with a +-1 std-dev
                      band and min/max whiskers, against the *measured* utilization
                      of the busiest worker (--x total: cores busy; --x receivers /
-                     rate: the raw knob)
+                     rate: the raw knob); points where the graph did not keep real
+                     time are left out and counted in the footer
   edf_misses.png     EDF deadline-miss ratio against the same x
   frame_rt.png       the backup: frame response time (0035's last sample -> decoded
                      packet), same layout; --gr3 adds GR3 runs as a fourth series
@@ -42,7 +43,7 @@ def load_points(sweep_dir):
             continue
         u = b.get("utilization") or {}
         pts.append({"dir": os.path.dirname(p), "N": b["fixed_batch"], "policy": b["policy"], "threads": b["threads"], "chains": b["chains"], "rate": b["rate"],
-                    "traced": bool(b.get("trace", {}).get("written")), "u_max": u.get("max_worker"), "u_total": u.get("total_cores_busy"),
+                    "traced": bool(b.get("trace", {}).get("written")), "u_max": u.get("max_worker"), "u_total": u.get("total_cores_busy"), "saturated": bool(b.get("saturated")),
                     "per_chain": b["per_chain"], "edf": b.get("edf"), "lost": (b.get("trace_header") or {}).get("lost_count", 0), "batch_period_us": b.get("batch_period_us")})
     return pts
 
@@ -139,7 +140,7 @@ def main():
         N, pol, T, R, rate, traced = k
         chains = [c for p in ps for c in p["per_chain"]]
         xs = [p[xkey] for p in ps if p.get(xkey) is not None]
-        g = {"N": N, "policy": pol, "threads": T, "chains": R, "rate": rate / 1e6 if a.x == "rate" else rate, "traced": traced, "repeats": len(ps),
+        g = {"N": N, "policy": pol, "threads": T, "chains": R, "rate": rate / 1e6 if a.x == "rate" else rate, "traced": traced, "repeats": len(ps), "saturated": any(p["saturated"] for p in ps),
              "x": float(np.mean(xs)) if xs else None, "batch": pooled(chains, "batch_rt"), "frame": pooled(chains, "frame_rt"), "frame_batch": pooled(chains, "frame_batch_rt"),
              "lost": sum(p["lost"] or 0 for p in ps), "batch_period_us": ps[0]["batch_period_us"]}
         if a.x == "rate":
@@ -156,10 +157,16 @@ def main():
     Ns = sorted({g["N"] for g in rows})
     policies = [p for p in ("rr", "edf", "rm") if any(g["policy"] == p for g in rows)]
 
-    def figure(ykey, title, ylabel, fname, extra=None):
+    def figure(ykey, title, ylabel, fname, extra=None, drop_saturated=False, logy=False):
         fig, axes = plt.subplots(1, len(Ns), figsize=(5.2 * len(Ns), 4.2), squeeze=False, sharey=False)
+        dropped = 0
         for ax, N in zip(axes[0], Ns):
             gs = [dict(g, **{"_x": g["x"]}) for g in rows if g["N"] == N and g["x"] is not None]
+            if drop_saturated:
+                dropped += sum(1 for g in gs if g["saturated"])
+                gs = [g for g in gs if not g["saturated"]]
+            if logy:
+                ax.set_yscale("log")
             for g in gs:
                 g[xkey if xkey in g else "x"] = g["x"]
             draw(ax, [dict(g, **{xkey: g["x"]}) for g in gs], xkey, ykey, policies)
@@ -170,16 +177,19 @@ def main():
                 extra(ax, gs)
         axes[0][0].legend(loc="upper left", frameon=False, fontsize=9)
         fig.suptitle(title, x=0.01, ha="left", fontsize=13, color=INK)
-        fig.text(0.01, 0.005, "mean, ±1 std-dev band, min–max whiskers over all batches of the pooled repeats; x = " + xlabel, fontsize=8, color=INK2)
+        note = "mean, ±1 std-dev band, min–max whiskers over all batches of the pooled repeats; x = " + xlabel
+        if drop_saturated and dropped:
+            note += f"; {dropped} saturated points (the graph did not keep real time) left out — their response times are unbounded"
+        fig.text(0.01, 0.005, note, fontsize=8, color=INK2)
         fig.tight_layout(rect=(0, 0.03, 1, 0.95))
         path = os.path.join(out_dir, fname)
         fig.savefig(path, dpi=150, facecolor="#fcfcfb")
         plt.close(fig)
         print("rt-plot4: wrote " + path)
 
-    figure("batch", "Batch response time — nominal arrival of batch j to sync_short consuming it", "µs", "batch_rt.png")
-    figure("frame", "Frame response time (backup metric) — last sample released to decoded packet", "µs", "frame_rt.png")
-    figure("frame_batch", "Frame response time anchored at the batch release", "µs", "frame_batch_rt.png")
+    figure("batch", "Batch response time — nominal arrival of batch j to sync_short consuming it", "µs", "batch_rt.png", drop_saturated=True)
+    figure("frame", "Frame response time (backup metric) — last sample released to decoded packet", "µs (log)", "frame_rt.png", logy=True)
+    figure("frame_batch", "Frame response time anchored at the batch release", "µs", "frame_batch_rt.png", drop_saturated=True)
 
     # EDF miss ratio
     if any(g.get("miss_ratio") is not None for g in rows):
@@ -216,10 +226,10 @@ def main():
 
     with open(os.path.join(out_dir, "summary.csv"), "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["N", "policy", "threads", "receivers", "rate", "traced", "repeats", "x", "batch_n", "batch_mean_us", "batch_std_us", "batch_min_us", "batch_max_us", "frame_n", "frame_mean_us", "frame_std_us", "frame_min_us", "frame_max_us", "edf_miss_ratio", "lost_records"])
+        w.writerow(["N", "policy", "threads", "receivers", "rate", "traced", "repeats", "saturated", "x", "batch_n", "batch_mean_us", "batch_std_us", "batch_min_us", "batch_max_us", "frame_n", "frame_mean_us", "frame_std_us", "frame_min_us", "frame_max_us", "edf_miss_ratio", "lost_records"])
         for g in sorted(rows, key=lambda g: (g["N"], g["policy"], g["x"] or 0)):
             b, fr = g["batch"] or {}, g["frame"] or {}
-            w.writerow([g["N"], g["policy"], g["threads"], g["chains"], g["rate"], g["traced"], g["repeats"], g["x"], b.get("n"), b.get("mean"), b.get("std"), b.get("min"), b.get("max"), fr.get("n"), fr.get("mean"), fr.get("std"), fr.get("min"), fr.get("max"), g.get("miss_ratio"), g["lost"]])
+            w.writerow([g["N"], g["policy"], g["threads"], g["chains"], g["rate"], g["traced"], g["repeats"], g["saturated"], g["x"], b.get("n"), b.get("mean"), b.get("std"), b.get("min"), b.get("max"), fr.get("n"), fr.get("mean"), fr.get("std"), fr.get("min"), fr.get("max"), g.get("miss_ratio"), g["lost"]])
     print("rt-plot4: wrote " + os.path.join(out_dir, "summary.csv"))
 
 

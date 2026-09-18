@@ -219,7 +219,21 @@ translation unit takes about 2.4 GB.
 | `sweep_index.csv`, `plan.json` | `rt-sweep4`, `rt-plan4` | copy under `results/` |
 | `*.png`, `summary.csv` | `rt-plot4.py` | yes, under `results/` |
 
-## 5. What the first runs showed (development machine, 2026-09-17)
+## 5. What the runs showed (development machine, 2026-09-17/18)
+
+**The full sweep** — `results/sweep-x86-8core/` (README with the tables,
+figures, `summary.csv`, `plan.json`, `sweep_index.csv`): 40 planned points
+× RR / EDF / RM × 3 repeats plus 27 controls, 389 runs, 14.4 h. In short:
+where the graph keeps real time, RR and EDF are within tens of µs of each
+other (EDF pays 10–40 µs of release bookkeeping at N = 1024 and misses no
+pipeline deadline); RM is the outlier under load, starving the throttle's
+readers at two workers / three receivers where the other two keep up, and
+carrying the longest tails at six workers; two workers barely help because
+the heavy blocks of every chain land on the same worker; one receiver at
+10 Msps saturates one worker under every policy. Full numbers in the
+results README.
+
+The verification point that preceded it:
 
 The verification point, once the corrections of §6 were in: one receiver,
 one worker, N = 1024 at 5 Msps (204.8 µs per batch), every trace category
