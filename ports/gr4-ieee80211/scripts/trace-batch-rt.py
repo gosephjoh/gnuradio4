@@ -119,11 +119,16 @@ def main():
 
     # ---- frame response times (no trace needed)
     lat = pd.read_csv(os.path.join(rd, "latency.csv"))
+    classes = meta.get("deadline_classes") or []
+    frame_f = float(meta.get("frame_deadline", 1.0) or 1.0)
+    out["deadline_classes"] = classes
+    out["frame_deadline"] = frame_f
     for k, ch in enumerate(meta["chains"]):
         L = lat[lat.chain == k]
         dec = L[L.decoded == 1]
         inwin = dec[(dec.t_last_ns >= w0) & (dec.t_last_ns < w1)]
-        pc = {"chain": k, "frames": int(len(L)), "decoded": int(len(dec)), "decoded_in_window": int(len(inwin)),
+        cf = float(classes[k]) if k < len(classes) else 1.0
+        pc = {"chain": k, "deadline_factor": cf, "frame_deadline_factor": min(cf, frame_f), "frames": int(len(L)), "decoded": int(len(dec)), "decoded_in_window": int(len(inwin)),
               "frame_rt": stats(inwin.lat_last_us.to_numpy() * 1e3), "frame_rt_all": stats(dec.lat_last_us.to_numpy() * 1e3)}
         out["per_chain"].append(pc)
 
@@ -225,12 +230,20 @@ def main():
             pc["batches_in_window"] = int(J.size)
             pc["batches_matched"] = int(np.isfinite(rt).sum())
             pc["batch_rt"] = stats(rt, period_ns)
+            # against this receiver's own class deadline (factor x period): the batch is late for its class
+            if period_ns:
+                dl = period_ns * pc["deadline_factor"]
+                fin = rt[np.isfinite(rt)]
+                pc["batch_rt"]["over_class_deadline"] = int((fin > dl).sum())
+                pc["batch_rt"]["over_class_deadline_ratio"] = float((fin > dl).mean()) if fin.size else None
+                pc["class_deadline_us"] = dl / 1e3
             pc["batch_rt_from_publish"] = stats(rt_pub, period_ns)
             pc["throttle_lag"] = stats(PUB - REL)  # publish - nominal: how late the arrival point itself was
             # a run can finish within 1.05x its air time and still carry a backlog of hundreds of
             # batches (a 0.4 s lag is 0.7 % of a 60 s run): the throttle publishing ten periods late
             # at the 95th percentile is the saturation criterion that matches what the plot shows
-            if period_ns and pc["throttle_lag"].get("n") and pc["throttle_lag"]["p95_us"] * 1e3 > 10 * period_ns:
+            pc["saturated"] = bool(period_ns and pc["throttle_lag"].get("n") and pc["throttle_lag"]["p95_us"] * 1e3 > 10 * period_ns)
+            if pc["saturated"]:
                 out["saturated"] = True
                 out["saturation_reason"] = f"throttle lag p95 {pc['throttle_lag']['p95_us']:.0f} us > 10 batch periods (chain {k})"
             pc["per_block_done"] = {role: stats(done[role] - REL) for role in PRE_GATE}
@@ -326,9 +339,19 @@ def main():
             pipe = ~Rn.role.isin(["fsrc", "throttle"])
             pipe_m = ~Mn.role.isin(["fsrc", "throttle"]) if len(Mn) > 0 else pipe[:0]
             n_rel_p, n_mis_p = int(pipe.sum()), int(pipe_m.sum()) if len(Mn) > 0 else 0
+            per_chain_edf = {}
+            for x in per:
+                if x["role"] in ("fsrc", "throttle"):
+                    continue
+                d = per_chain_edf.setdefault(x["chain"], {"releases": 0, "misses": 0})
+                d["releases"] += x["releases"]; d["misses"] += x["misses"]
+            for ch, d in per_chain_edf.items():
+                d["miss_ratio"] = d["misses"] / d["releases"] if d["releases"] else None
+                if 0 <= ch < len(out["per_chain"]):
+                    out["per_chain"][ch]["edf"] = d
             out["edf"] = {"releases": int(len(Rn)), "misses": int(len(Mn)), "miss_ratio_all": float(len(Mn) / len(Rn)) if len(Rn) else None,
                           "releases_pipeline": n_rel_p, "misses_pipeline": n_mis_p, "miss_ratio": float(n_mis_p / n_rel_p) if n_rel_p else None,
-                          "job_response": stats(Mn[pipe_m].response_ns.to_numpy()) if n_mis_p else {"n": 0}, "per_block": per}
+                          "job_response": stats(Mn[pipe_m].response_ns.to_numpy()) if n_mis_p else {"n": 0}, "per_block": per, "per_chain": per_chain_edf}
         if len(S) > 0:
             Sn = S[(S.start_ns >= w0) & (S.start_ns < w1)]
             out["sync"] = {"resyncs": int(len(Sn)), "jobs_discarded": int(Sn.discarded.sum()), "list_changed": int((Sn["flags"] & 1).sum())}

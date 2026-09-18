@@ -62,6 +62,18 @@ struct ChainConfig {
     // Replay only the first `max_samples` of the file (0 = all): a run of
     // fixed length whatever the rate (FileSourceRaw::max_items).
     uint64_t    max_samples = 0;
+    // Deadline structure (the EDF-benefit experiment).  Every block's
+    // relative deadline is one batch period times a factor:
+    //   deadline_factor        this receiver's class: 0.25 = the control-channel
+    //                          receiver whose frames are safety messages, 1 = a
+    //                          service-channel receiver (modification A)
+    //   frame_deadline_factor  the frame path after the gate (dly320, sync_long,
+    //                          fft, eq, decode, sink): the deadline-bearing work
+    //                          of the receiver (modification B); a post-gate
+    //                          block gets min(deadline_factor, frame_deadline_factor)
+    // 1 and 1 reproduce the equal-deadline runs.
+    float       deadline_factor       = 1.f;
+    float       frame_deadline_factor = 1.f;
 };
 
 struct ChainCounters {

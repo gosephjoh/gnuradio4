@@ -5,6 +5,7 @@
     ./scripts/rt-sweep4 PROFILE.json --plan PLAN.json   # the sweep: every point x policy x repeat, plus controls
     ./scripts/rt-sweep4 PROFILE.json --plan PLAN.json --dry-run   # print the commands only
     ./scripts/rt-sweep4 PROFILE.json --smoke            # a one-repeat mini matrix to prove the pipeline (run_s of the profile)
+    ./scripts/rt-sweep4 PROFILE.json --classes          # the deadline-structure sweep (profile["classes"]: points, settings, run_s, repeats)
 
 Every run lands in <cell>/runs4/sweep-<profile>/<tag>/ with latency.csv,
 latency_summary.json, trace_meta.json, the capture (trace.gr4trace, gitignored)
@@ -48,10 +49,12 @@ def ensure_cell(prof, dry):
 
 
 
-def one_run(prof, cell, sweep_dir, point, policy, rep, traced, run_s, a):
+def one_run(prof, cell, sweep_dir, point, policy, rep, traced, run_s, a, setting=None):
     N, T, R, rate = point["N"], point["workers"], point["receivers"], point["rate"]
     kind = point.get("kind", "point")
     tag = f"{kind}_N{N}_t{T}_r{R}_rate{int(rate)}_{policy}_{'trace' if traced else 'notrace'}_rep{rep}"
+    if setting:
+        tag = f"cls-{setting['name']}_" + tag
     out = os.path.join(sweep_dir, tag)
     os.makedirs(out, exist_ok=True)
     # a run of run_s seconds whatever the rate: replay the first run_s x rate samples
@@ -61,6 +64,13 @@ def one_run(prof, cell, sweep_dir, point, policy, rep, traced, run_s, a):
            "--fixed-batch", str(N), "--timeout-s", str(prof.get("timeout_s", 300))]
     if max_samples:
         cmd += ["--max-samples", str(max_samples)]
+    if setting:
+        # modification A: chain 0 is the control-channel receiver with the tight class factor
+        if setting.get("tight"):
+            cmd += ["--deadline-classes", ",".join([str(setting["tight"])] + ["1"] * (R - 1))]
+        # modification B: the frame path of every receiver
+        if setting.get("frame"):
+            cmd += ["--frame-deadline", str(setting["frame"])]
     if prof.get("sched_ratio"):
         cmd += ["--sched-ratio", str(prof["sched_ratio"])]
     if traced:
@@ -85,7 +95,7 @@ def one_run(prof, cell, sweep_dir, point, policy, rep, traced, run_s, a):
     else:
         rc2 = 0
     return {"tag": tag, "dir": out, "N": N, "workers": T, "receivers": R, "rate": rate, "policy": policy, "traced": traced, "rep": rep,
-            "target": point.get("target"), "kind": point.get("kind"), "rc": rc, "analysis_rc": rc2, "wall_s": round(time.time() - t0, 1)}
+            "target": point.get("target"), "kind": point.get("kind"), "setting": setting["name"] if setting else "", "rc": rc, "analysis_rc": rc2, "wall_s": round(time.time() - t0, 1)}
 
 
 def main():
@@ -93,6 +103,7 @@ def main():
     ap.add_argument("profile")
     ap.add_argument("--probe", action="store_true")
     ap.add_argument("--plan")
+    ap.add_argument("--classes", action="store_true", help="the deadline-structure sweep of profile['classes']: points x settings x policies x repeats")
     ap.add_argument("--smoke", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--policies", help="comma list overriding the profile's")
@@ -110,7 +121,7 @@ def main():
         if not os.path.exists(b) and not a.dry_run:
             sys.exit(f"rt-sweep4: {b} missing -- cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build --target rx_latency4 gen4 trace_export")
     cell = ensure_cell(prof, a.dry_run)
-    sweep_dir = os.path.join(cell, "runs4", f"sweep-{prof['name']}" + ("-smoke" if a.smoke else ""))
+    sweep_dir = os.path.join(cell, "runs4", f"sweep-{prof['name']}" + ("-smoke" if a.smoke else "") + ("-classes" if a.classes else ""))
     os.makedirs(sweep_dir, exist_ok=True)
     policies = a.policies.split(",") if a.policies else prof["policies"]
     repeats = a.repeats or (1 if a.smoke else prof["repeats"])
@@ -146,6 +157,16 @@ def main():
                     top = max((p for p in pts if p["N"] == N), key=lambda p: p["u_max_worker"])
                     for pol in policies:
                         index.append(one_run(prof, cell, sweep_dir, top, pol, rep, False, prof["run_s"], a))
+    if a.classes:
+        cls = prof["classes"]
+        run_s = cls.get("run_s", prof["run_s"])
+        reps_c = a.repeats or cls.get("repeats", prof["repeats"])
+        for rep in range(a.rep_start, reps_c):
+            for pt in cls["points"]:
+                pt = dict(pt, kind="cls")
+                for st in cls["settings"]:
+                    for pol in policies:
+                        index.append(one_run(prof, cell, sweep_dir, pt, pol, rep, True, run_s, a, setting=st))
     if index and not a.dry_run:
         path = os.path.join(sweep_dir, "sweep_index.csv")
         new = not os.path.exists(path)

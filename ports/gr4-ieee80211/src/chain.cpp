@@ -79,7 +79,12 @@ ChainBlocks buildChain(gr::Graph& g, const ChainConfig& cfg) {
         }
         return m;
     };
-    auto TP = [&](gr::property_map m) { return T(std::move(m), tp, batch_period_s); }; // a pipeline block
+    // a pre-gate block (and the gate, and the stamper): the receiver's class deadline
+    const float pre_deadline_s  = batch_period_s * cfg.deadline_factor;
+    // a post-gate block: the frame path, the tighter of the class and the frame factor
+    const float post_deadline_s = batch_period_s * std::min(cfg.deadline_factor, cfg.frame_deadline_factor);
+    auto TP  = [&](gr::property_map m) { return T(std::move(m), tp, pre_deadline_s); };
+    auto TPO = [&](gr::property_map m) { return T(std::move(m), tp, post_deadline_s); };
 
     // GR4's BasicFileSource delivered no samples on this tree under either
     // scheduler (apps/probe.cpp modes "fsrc"); FileSourceRaw is GR3's
@@ -110,7 +115,7 @@ ChainBlocks buildChain(gr::Graph& g, const ChainConfig& cfg) {
         cb.block_count++;
         R(thr, "throttle");
     }
-    auto& stamper = g.emplaceBlock<ArrivalStamper>(S(T({{"name", nm("stamp")}}, 0.75f * tp, batch_period_s)));
+    auto& stamper = g.emplaceBlock<ArrivalStamper>(S(T({{"name", nm("stamp")}}, 0.75f * tp, pre_deadline_s)));
     cb.block_count++;
     R(stamper, "stamp");
 
@@ -126,11 +131,11 @@ ChainBlocks buildChain(gr::Graph& g, const ChainConfig& cfg) {
     gr::property_map ssm{{"name", nm("syncshort")}, {"threshold", cfg.sensitivity}, {"min_plateau", Size_t(2)}};
     if (N > 0) { ssm.insert_or_assign("max_batch_size", Size_t(2U * N)); } // the gate's ceiling is 2N (see below)
     auto& ss     = g.emplaceBlock<SyncShort>(S(TP(ssm), N == 0));
-    auto& dly320 = g.emplaceBlock<SampleDelay<cf>>(S(TP({{"name", nm("dly320")}, {"delay", Size_t(320)}})));
-    auto& sl     = g.emplaceBlock<SyncLong>(S(TP({{"name", nm("synclong")}, {"sync_length", Size_t(320)}})));
-    auto& fft    = g.emplaceBlock<Fft64>(S(TP({{"name", nm("fft")}})));
-    auto& eq     = g.emplaceBlock<FrameEqualizer>(S(TP({{"name", nm("eq")}, {"freq", cfg.frequency}, {"bw", cfg.bandwidth}})));
-    auto& dec    = g.emplaceBlock<DecodeMac>(S(TP({{"name", nm("decode")}})));
+    auto& dly320 = g.emplaceBlock<SampleDelay<cf>>(S(TPO({{"name", nm("dly320")}, {"delay", Size_t(320)}})));
+    auto& sl     = g.emplaceBlock<SyncLong>(S(TPO({{"name", nm("synclong")}, {"sync_length", Size_t(320)}})));
+    auto& fft    = g.emplaceBlock<Fft64>(S(TPO({{"name", nm("fft")}})));
+    auto& eq     = g.emplaceBlock<FrameEqualizer>(S(TPO({{"name", nm("eq")}, {"freq", cfg.frequency}, {"bw", cfg.bandwidth}})));
+    auto& dec    = g.emplaceBlock<DecodeMac>(S(TPO({{"name", nm("decode")}})));
     cb.block_count += 14;
     R(mag2, "mag2"); R(avgpow, "avgpow"); R(dly16, "dly16"); R(conj, "conj"); R(mult, "mul"); R(avgcor, "avgcor"); R(mag, "mag"); R(div, "div");
     R(ss, "syncshort"); R(dly320, "dly320"); R(sl, "synclong"); R(fft, "fft"); R(eq, "eq"); R(dec, "decode");
@@ -148,7 +153,7 @@ ChainBlocks buildChain(gr::Graph& g, const ChainConfig& cfg) {
         ss.in_cor.max_samples = 2UZ * N;
     }
 
-    auto& sink = g.emplaceBlock<LatencySink>(S(TP({{"name", nm("latsink")}})));
+    auto& sink = g.emplaceBlock<LatencySink>(S(TPO({{"name", nm("latsink")}})));
     cb.block_count += 1;
     R(sink, "latsink");
 

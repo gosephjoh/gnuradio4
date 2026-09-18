@@ -57,5 +57,82 @@
   "controls": "top",
   "timeout_s": 180,
   "probe_rate": 2500000,
-  "ring_note": "with every category live an idle worker emits ~7 M records/s (its probing of blocks with no work); the ring keeps the most recent records, so the analysis window is whatever the ring holds and trace-batch-rt.py reports window_covered_s"
+  "ring_note": "with every category live an idle worker emits ~7 M records/s (its probing of blocks with no work); the ring keeps the most recent records, so the analysis window is whatever the ring holds and trace-batch-rt.py reports window_covered_s",
+  "classes": {
+    "description": "the EDF-benefit experiment: chain 0 is the control-channel receiver (modification A: its class factor), the frame path of every receiver carries the frame factor (modification B); factors multiply one batch period; settings base = the equal-deadline runs",
+    "points": [
+      {
+        "N": 1024,
+        "workers": 1,
+        "receivers": 2,
+        "rate": 2500000
+      },
+      {
+        "N": 1024,
+        "workers": 2,
+        "receivers": 2,
+        "rate": 2500000
+      },
+      {
+        "N": 1024,
+        "workers": 2,
+        "receivers": 3,
+        "rate": 2500000
+      },
+      {
+        "N": 1024,
+        "workers": 6,
+        "receivers": 3,
+        "rate": 5000000
+      },
+      {
+        "N": 2048,
+        "workers": 1,
+        "receivers": 2,
+        "rate": 2500000
+      },
+      {
+        "N": 2048,
+        "workers": 2,
+        "receivers": 2,
+        "rate": 2500000
+      },
+      {
+        "N": 2048,
+        "workers": 2,
+        "receivers": 3,
+        "rate": 2500000
+      },
+      {
+        "N": 2048,
+        "workers": 6,
+        "receivers": 3,
+        "rate": 5000000
+      }
+    ],
+    "settings": [
+      {
+        "name": "base"
+      },
+      {
+        "name": "A25",
+        "tight": 0.25
+      },
+      {
+        "name": "A50",
+        "tight": 0.5
+      },
+      {
+        "name": "B25",
+        "frame": 0.25
+      },
+      {
+        "name": "AB25",
+        "tight": 0.25,
+        "frame": 0.25
+      }
+    ],
+    "run_s": 30,
+    "repeats": 2
+  }
 }

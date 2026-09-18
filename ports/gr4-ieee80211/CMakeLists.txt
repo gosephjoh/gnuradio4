@@ -86,6 +86,11 @@ target_include_directories(gen4 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(gen4 PRIVATE gr4json)
 target_compile_options(gen4 PRIVATE -O2 ${GR4WIFI_SIMD_FLAGS})
 
+# microbench4: the scheduler's per-invocation cost on a synthetic copy graph
+add_executable(microbench4 apps/microbench4.cpp)
+target_link_libraries(microbench4 PRIVATE gnuradio4::gnuradio-core gnuradio4::gnuradio-blocklib-core gnuradio4::gr-testing)
+target_link_options(microbench4 PRIVATE -Wl,--no-as-needed)
+
 # trace_export: a .gr4trace capture -> CSV tables for scripts/trace-batch-rt.py
 add_executable(trace_export apps/trace_export.cpp)
 target_link_libraries(trace_export PRIVATE gnuradio4::gnuradio-core gnuradio4::gnuradio-blocklib-core gr4json)
