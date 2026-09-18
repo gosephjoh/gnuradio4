@@ -104,6 +104,7 @@ def main():
     # throttle publishes late because its output buffer stays full); the point is saturated
     out["realtime_ratio"] = (meta.get("elapsed_s") / out["air_s"]) if (out["air_s"] and meta.get("elapsed_s")) else None
     out["saturated"] = bool(out["realtime_ratio"] and out["realtime_ratio"] > 1.05)
+    out["saturation_reason"] = "slower than 1.05x real time" if out["saturated"] else None
     if out["saturated"]:
         print(f"trace-batch-rt: WARNING the run took {out['realtime_ratio']:.2f}x its air time: the graph did not keep up; batch response times are unbounded here", file=sys.stderr)
 
@@ -226,6 +227,12 @@ def main():
             pc["batch_rt"] = stats(rt, period_ns)
             pc["batch_rt_from_publish"] = stats(rt_pub, period_ns)
             pc["throttle_lag"] = stats(PUB - REL)  # publish - nominal: how late the arrival point itself was
+            # a run can finish within 1.05x its air time and still carry a backlog of hundreds of
+            # batches (a 0.4 s lag is 0.7 % of a 60 s run): the throttle publishing ten periods late
+            # at the 95th percentile is the saturation criterion that matches what the plot shows
+            if period_ns and pc["throttle_lag"].get("n") and pc["throttle_lag"]["p95_us"] * 1e3 > 10 * period_ns:
+                out["saturated"] = True
+                out["saturation_reason"] = f"throttle lag p95 {pc['throttle_lag']['p95_us']:.0f} us > 10 batch periods (chain {k})"
             pc["per_block_done"] = {role: stats(done[role] - REL) for role in PRE_GATE}
             pc["per_block_begin"] = {role: stats(begin[role] - REL) for role in PRE_GATE}
             # frame-anchored batch response time: decode instant minus the release of the batch holding the frame's last sample

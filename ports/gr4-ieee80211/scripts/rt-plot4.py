@@ -42,8 +42,17 @@ def load_points(sweep_dir):
         if not b.get("per_chain"):
             continue
         u = b.get("utilization") or {}
+        # saturation: the run's own flag, or the throttle publishing ten batch periods late at the
+        # 95th percentile (runs analysed before that rule was added carry only the first flag)
+        per_us = b.get("batch_period_us")
+        sat = bool(b.get("saturated"))
+        if per_us:
+            for pc in b["per_chain"]:
+                tl = pc.get("throttle_lag") or {}
+                if tl.get("n") and tl.get("p95_us", 0) > 10 * per_us:
+                    sat = True
         pts.append({"dir": os.path.dirname(p), "N": b["fixed_batch"], "policy": b["policy"], "threads": b["threads"], "chains": b["chains"], "rate": b["rate"],
-                    "traced": bool(b.get("trace", {}).get("written")), "u_max": u.get("max_worker"), "u_total": u.get("total_cores_busy"), "saturated": bool(b.get("saturated")),
+                    "traced": bool(b.get("trace", {}).get("written")), "u_max": u.get("max_worker"), "u_total": u.get("total_cores_busy"), "saturated": sat,
                     "per_chain": b["per_chain"], "edf": b.get("edf"), "lost": (b.get("trace_header") or {}).get("lost_count", 0), "batch_period_us": b.get("batch_period_us")})
     return pts
 
