@@ -947,6 +947,16 @@ inline constexpr std::uint64_t kThreadCpuScaleNs = 1000UL;
         w.unaccountedNs = w.lifetimeNs - accounted;
 
         if ((stopped->flags & flag::kThreadCpuValid) != 0U) {
+            // The same rule the interval terms follow: a clipped reading is a lower bound, not a
+            // value. Believing it would report the gap between the true on-core time and the clipped
+            // one as preemption that never happened. Reachable without the lost-records refusal
+            // intervening -- a long run with only `lifecycle` live emits two records per worker, so
+            // the ring never wraps and the 71-minute ceiling is what gives way first.
+            if (stopped->payload2 == kSaturated) {
+                w.reason = std::format("the on-core time exceeded the {} minutes the field can hold, so it is a lower bound rather than a value", (std::uint64_t{kSaturated} * kThreadCpuScaleNs) / 60'000'000'000UL);
+                out.push_back(std::move(w));
+                continue;
+            }
             w.hasThreadCpuTime = true;
             w.threadCpuNs      = static_cast<std::uint64_t>(stopped->payload2) * kThreadCpuScaleNs;
             if (w.threadCpuNs > w.lifetimeNs) {

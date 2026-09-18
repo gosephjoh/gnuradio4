@@ -290,6 +290,38 @@ const boost::ut::suite<"TraceUtilisation"> traceUtilisationTests = [] {
         expect(!all[1].computed) << "and the unsound one refused on its own";
     };
 
+    "a saturated on-core reading is refused, not believed"_test = [] {
+        // The CPU delta is stored in microseconds in a 32-bit word, so it saturates past 71 minutes.
+        // A saturated reading is a lower bound like any other, and believing it would report the
+        // difference between the true CPU time and the clipped one as preemption that never happened.
+        //
+        // Reachable without the lost-records refusal intervening: a long run with only
+        // Category::lifecycle live emits two records per worker, so the ring never wraps.
+        const std::vector<Event> longRun{
+            started(0U, 0UL),                                    //
+            stoppedWithCpu(0U, 7'200'000'000'000UL, kSaturated), // two hours alive, CPU clipped
+        };
+        const WorkerUtilisation w = only(workerUtilisation(longRun, 0UL));
+        expect(!w.computed) << "a clipped on-core reading cannot be divided into percentages";
+        expect(w.reason.find("on-core") != std::string::npos) << "the refusal must name what was clipped: " << w.reason;
+    };
+
+    "the preemption clamp fires and says so"_test = [] {
+        // Idling is a blocking wait, so on-core time plus idle should not exceed the lifetime. Where
+        // it does, an assumption behind the preemption figure has bent -- an idle reason that spins
+        // rather than blocks, or clock skew -- and that is recorded rather than hidden behind the
+        // clamp. Without a test that provokes it, the flag is indistinguishable from one never set.
+        const std::vector<Event> spinning{
+            started(0U, 0UL),                               //
+            interval(0U, Kind::idle, 0UL, 900000U),         // claims 900 us of waiting ...
+            stoppedWithCpu(0U, 1000000UL, 950000U / 1000U), // ... while holding a core for 950 us
+        };
+        const WorkerUtilisation w = only(workerUtilisation(spinning, 0UL));
+        expect(w.computed >> fatal) << w.reason;
+        expect(w.preemptionClamped) << "off-core (50 us) is less than the idle claimed (900 us), so the clamp must fire";
+        expect(eq(w.preemptionNs, 0UL)) << "and the reported value must be clamped rather than wrapping negative";
+    };
+
     "an absent thread-CPU clock is absent, not zero"_test = [] {
         // A zero on-core time would read as "100 % preempted", which is the most misleading value
         // the field could take on a platform that simply cannot measure it.
