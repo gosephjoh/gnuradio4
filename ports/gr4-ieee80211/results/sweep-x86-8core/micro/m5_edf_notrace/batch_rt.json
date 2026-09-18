@@ -1,0 +1,70 @@
+{
+  "run_dir": "results/sweep-x86-8core/micro/m5_edf_notrace",
+  "policy": "edf",
+  "policy_name": "EarliestDeadlineFirst",
+  "threads": 1,
+  "chains": 1,
+  "rate": 2500000.0,
+  "fixed_batch": 1024,
+  "buffer": 16384,
+  "warmup_s": 5.0,
+  "window_s": 20.0,
+  "trace": {
+    "compiled_in": true,
+    "mask": 0,
+    "buffer_records": 0,
+    "limit_mb": 0,
+    "recorded": 0,
+    "lost": 0,
+    "rings": 0,
+    "path": null,
+    "written": null
+  },
+  "result": "ok",
+  "per_chain": [
+    {
+      "chain": 0,
+      "deadline_factor": 1.0,
+      "frame_deadline_factor": 1.0,
+      "frames": 12866,
+      "decoded": 12866,
+      "decoded_in_window": 8578,
+      "frame_rt": {
+        "n": 8578,
+        "min_us": 151.806,
+        "max_us": 671.873,
+        "mean_us": 301.3527469107018,
+        "std_us": 179.9124776640859,
+        "p50_us": 182.516,
+        "p95_us": 574.34735,
+        "p99_us": 589.4037
+      },
+      "frame_rt_all": {
+        "n": 12866,
+        "min_us": 151.806,
+        "max_us": 671.873,
+        "mean_us": 301.4797480957563,
+        "std_us": 179.9310729617194,
+        "p50_us": 182.527,
+        "p95_us": 574.43925,
+        "p99_us": 588.61315
+      }
+    }
+  ],
+  "utilization": null,
+  "edf": null,
+  "sync": null,
+  "batch_period_us": 409.6,
+  "elapsed_s": 30.035370298,
+  "air_s": 30.0,
+  "realtime_ratio": 1.0011790099333333,
+  "saturated": false,
+  "saturation_reason": null,
+  "window_ns": [
+    91913369089838,
+    91933369089838
+  ],
+  "deadline_classes": [],
+  "frame_deadline": 1.0,
+  "note": "no capture (or no fixed batch): frame response times only"
+}

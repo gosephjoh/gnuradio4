@@ -59,7 +59,7 @@
   "probe_rate": 2500000,
   "ring_note": "with every category live an idle worker emits ~7 M records/s (its probing of blocks with no work); the ring keeps the most recent records, so the analysis window is whatever the ring holds and trace-batch-rt.py reports window_covered_s",
   "classes": {
-    "description": "the EDF-benefit experiment: chain 0 is the control-channel receiver (modification A: its class factor), the frame path of every receiver carries the frame factor (modification B); factors multiply one batch period; settings base = the equal-deadline runs; the 2-worker 3-receiver point at 2.5 Msps sits at the knee (demand 0.75-0.88 on the busiest worker, saturating run to run), the one at 2.0 Msps is the same contention kept schedulable",
+    "description": "QUICK indicative subset of the class experiment: two contention points, one repeat",
     "points": [
       {
         "N": 1024,
@@ -72,67 +72,21 @@
         "workers": 2,
         "receivers": 3,
         "rate": 2000000
-      },
-      {
-        "N": 1024,
-        "workers": 2,
-        "receivers": 3,
-        "rate": 2500000
-      },
-      {
-        "N": 1024,
-        "workers": 6,
-        "receivers": 3,
-        "rate": 5000000
-      },
-      {
-        "N": 2048,
-        "workers": 1,
-        "receivers": 2,
-        "rate": 2500000
-      },
-      {
-        "N": 2048,
-        "workers": 2,
-        "receivers": 3,
-        "rate": 2000000
-      },
-      {
-        "N": 2048,
-        "workers": 2,
-        "receivers": 3,
-        "rate": 2500000
-      },
-      {
-        "N": 2048,
-        "workers": 6,
-        "receivers": 3,
-        "rate": 5000000
       }
     ],
     "settings": [
       {
-        "name": "base"
-      },
-      {
-        "name": "A25",
-        "tight": 0.25
-      },
-      {
-        "name": "A50",
-        "tight": 0.5
-      },
-      {
-        "name": "B25",
-        "frame": 0.25
-      },
-      {
-        "name": "AB25",
+        "name": "A25L",
         "tight": 0.25,
-        "frame": 0.25
+        "tight_index": -1
+      },
+      {
+        "name": "A50L",
+        "tight": 0.5,
+        "tight_index": -1
       }
     ],
     "run_s": 30,
-    "repeats": 2
+    "repeats": 1
   }
 }

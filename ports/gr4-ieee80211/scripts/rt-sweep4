@@ -56,6 +56,9 @@ def one_run(prof, cell, sweep_dir, point, policy, rep, traced, run_s, a, setting
     if setting:
         tag = f"cls-{setting['name']}_" + tag
     out = os.path.join(sweep_dir, tag)
+    if a.skip_existing and os.path.exists(os.path.join(out, "batch_rt.json")):
+        print("skip (exists) " + tag, flush=True)
+        return None
     os.makedirs(out, exist_ok=True)
     # a run of run_s seconds whatever the rate: replay the first run_s x rate samples
     max_samples = int(run_s * rate) if run_s else 0
@@ -67,7 +70,12 @@ def one_run(prof, cell, sweep_dir, point, policy, rep, traced, run_s, a, setting
     if setting:
         # modification A: chain 0 is the control-channel receiver with the tight class factor
         if setting.get("tight"):
-            cmd += ["--deadline-classes", ",".join([str(setting["tight"])] + ["1"] * (R - 1))]
+            # tight_index: which receiver is the control channel (default 0 = first in graph order;
+            # -1 = last, the receiver round robin's list order serves last)
+            idx = setting.get("tight_index", 0) % R
+            cls = ["1"] * R
+            cls[idx] = str(setting["tight"])
+            cmd += ["--deadline-classes", ",".join(cls)]
         # modification B: the frame path of every receiver
         if setting.get("frame"):
             cmd += ["--frame-deadline", str(setting["frame"])]
@@ -112,6 +120,7 @@ def main():
     ap.add_argument("--keep-tables", action="store_true", help="keep the per-record CSV tables after analysis (default: deleted; hundreds of MB per run)")
     ap.add_argument("--rep-start", type=int, default=0, help="first repeat index to run (resume a sweep)")
     ap.add_argument("--cell", help="override the profile's cell (e.g. a short one for --smoke)")
+    ap.add_argument("--skip-existing", action="store_true", help="skip a run whose directory already holds batch_rt.json (resume after an interruption)")
     a = ap.parse_args()
     prof = json.load(open(a.profile))
     if a.cell:
@@ -167,6 +176,7 @@ def main():
                 for st in cls["settings"]:
                     for pol in policies:
                         index.append(one_run(prof, cell, sweep_dir, pt, pol, rep, True, run_s, a, setting=st))
+    index = [r for r in index if r]
     if index and not a.dry_run:
         path = os.path.join(sweep_dir, "sweep_index.csv")
         new = not os.path.exists(path)

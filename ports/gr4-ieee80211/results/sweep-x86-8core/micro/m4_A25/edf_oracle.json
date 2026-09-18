@@ -1,0 +1,94 @@
+{
+  "run_dir": "results/sweep-x86-8core/micro/m4_A25",
+  "window_ns": [
+    91663518874196,
+    91675825210830
+  ],
+  "starts": 2200101,
+  "starts_without_release": 0,
+  "inversions": 0,
+  "inversion_ratio": 0.0,
+  "inversions_waiting_job_tighter_class": 0,
+  "pipeline_starts": 1674576,
+  "pipeline_inversions": 0,
+  "pipeline_inversion_ratio": 0.0,
+  "inverted_wait_us": {
+    "n": 0,
+    "mean": null,
+    "max": null
+  },
+  "per_role": {
+    "throttle": {
+      "starts": 437940,
+      "inversions": 0
+    },
+    "mul": {
+      "starts": 90136,
+      "inversions": 0
+    },
+    "eq": {
+      "starts": 93375,
+      "inversions": 0
+    },
+    "mag": {
+      "starts": 90135,
+      "inversions": 0
+    },
+    "syncshort": {
+      "starts": 104771,
+      "inversions": 0
+    },
+    "synclong": {
+      "starts": 120479,
+      "inversions": 0
+    },
+    "mag2": {
+      "starts": 90135,
+      "inversions": 0
+    },
+    "dly16": {
+      "starts": 100168,
+      "inversions": 0
+    },
+    "latsink": {
+      "starts": 15834,
+      "inversions": 0
+    },
+    "dly320": {
+      "starts": 104564,
+      "inversions": 0
+    },
+    "div": {
+      "starts": 88951,
+      "inversions": 0
+    },
+    "fft": {
+      "starts": 96968,
+      "inversions": 0
+    },
+    "fsrc": {
+      "starts": 87585,
+      "inversions": 0
+    },
+    "stamp": {
+      "starts": 88952,
+      "inversions": 0
+    },
+    "avgpow": {
+      "starts": 332035,
+      "inversions": 0
+    },
+    "conj": {
+      "starts": 88952,
+      "inversions": 0
+    },
+    "decode": {
+      "starts": 80171,
+      "inversions": 0
+    },
+    "avgcor": {
+      "starts": 88950,
+      "inversions": 0
+    }
+  }
+}

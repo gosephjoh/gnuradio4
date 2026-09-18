@@ -43,6 +43,9 @@ Python 3 with `numpy`, `pandas` and `matplotlib` for the analysis and plots.
 | `scripts/rt-sweep4` | | the matrix from a machine profile: probes, plan, sweep, controls; `sweep_index.csv` |
 | `scripts/rt-plan4.py` | | probes → predicted utilization grid → the points nearest the targets (`plan.json`) |
 | `scripts/rt-plot4.py` | | a sweep → `batch_rt.png`, `frame_rt.png`, `frame_batch_rt.png`, `edf_misses.png`, `summary.csv` |
+| `scripts/rt-paper-figs.py` | | the range figures of a sweep as PDF + PNG, and the numbers they show |
+| `scripts/rt-class-figs.py` | | the range figures of the deadline-structure sweep (receiver 0 against the rest, per setting) |
+| `scripts/rt-microbench4`, `scripts/trace-edf-oracle.py`, `apps/microbench4.cpp` | | the microbenchmarks: isolated block costs, scheduler cost per invocation, blocking bound, EDF selection oracle, trace overhead |
 | `experiments/profiles/*.json` | | per-machine parameters: `x86-8core.json`, `pi5.json` |
 
 ### What one run does
@@ -67,6 +70,16 @@ Python 3 with `numpy`, `pandas` and `matplotlib` for the analysis and plots.
   as a minimum separation between releases, which forbids catching up (§6);
 - the source and throttle are excluded from the batch ceiling so they can
   run ahead / catch up.
+
+**Deadline structure** (the EDF-benefit experiment; workload settings, no
+scheduler change): `--deadline-classes F0,F1,…` gives receiver *k* a relative
+deadline of F*k* batch periods on its blocks before the gate — receiver 0 is
+the 802.11p control-channel receiver whose frames are safety messages
+(0.25 or 0.5), the others service-channel receivers (1); `--frame-deadline F`
+gives the frame path after the gate (`dly320`, `sync_long`, FFT, equaliser,
+decoder, sink) of every receiver min(class, F) batch periods. Both default
+to 1, which is the equal-deadline sweep. Source and throttle keep their tiny
+deadlines. RM is unchanged by either (its ranks come from the tiny periods).
 
 `--policy edf|rm` instantiates `Simple<multiThreaded, null::Profiler,
 EdfPolicy|RateMonotonicPolicy>`; `--selection heap` (default) is the EDF
@@ -135,6 +148,19 @@ or `pi5.json`.
 # 3. the figures
 ./scripts/rt-plot4.py <cell>/runs4/sweep-<name> --out-dir results/sweep-<name>
 ./scripts/rt-plot4.py <cell>/runs4/sweep-<name> --x receivers --gr3 <GR3 run dirs...>   # the backup comparison
+```
+
+```
+# 4. the deadline-structure sweep (profile["classes"]: points x settings x policies x repeats, 30 s runs)
+./scripts/rt-sweep4 $PROFILE --classes
+./scripts/rt-class-figs.py <cell>/runs4/sweep-<name>-classes --out-dir results/sweep-<name>/paper
+
+# 5. the microbenchmarks (machine otherwise idle, ~12 min): results/sweep-<name>/micro/MICRO.md
+./scripts/rt-microbench4 --out-dir results/sweep-<name>/micro
+./scripts/trace-edf-oracle.py <run dir with tables>          # EDF selection check on one run
+
+# 6. the paper-style figures of the main sweep (PDF + PNG) and their numbers
+./scripts/rt-paper-figs.py <cell>/runs4/sweep-<name> --out-dir results/sweep-<name>/paper --gr3 <GR3 run dir>
 ```
 
 `--smoke` (with `--cell data/rt_300_300_10000_QPSK_1_2_s1`, a 5.8 s cell
@@ -306,6 +332,14 @@ published 5–14 µs after nominal on average.
   deadlines to miss.
 
 ## 6. Traps already paid for
+
+- **The development machine is a virtual machine.** `/proc/cpuinfo` reports
+  "QEMU Virtual CPU version 2.5+", there is no cpufreq interface, 8 vCPUs.
+  Every timing figure here carries the host's scheduling noise; a point
+  whose busiest worker is above about 0.75 demand can saturate in one run
+  and not in the next (the 2-worker, 3-receiver, 2.5 Msps EDF point:
+  0.77 demand and 366 µs in the sweep, 0.87 and saturated in the oracle run
+  minutes later). Say "QEMU guest" in every setup section.
 
 - **A derived period is a speed limit.** With the derived period N/rate on
   every block (0036 items 7–8 as first written), EDF at 5 Msps on one
