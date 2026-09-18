@@ -1641,8 +1641,17 @@ protected:
         // syscalls per worker thread for the whole of its existence is not a cost worth optimising.
         [[maybe_unused]] std::optional<std::uint64_t> traceCpuAtStart;
         if constexpr (gr::trace::kEnabled) {
-            traceCpuAtStart = gr::trace::threadCpuNow();
-            gr::trace::emit(gr::trace::Event{.startNs = gr::trace::now(), .payload0 = static_cast<std::uint32_t>(localBlockList.size()), .payload1 = static_cast<std::uint32_t>(gr::trace::currentCpu()), .kind = gr::trace::Kind::workerStart, .workerId = gr::trace::workerIdOf(runnerID)});
+            // Wall first, then CPU -- and at the other end, CPU first, then wall. That nests the
+            // on-core interval strictly *inside* the wall lifetime, which is what makes
+            // `cpu <= lifetime` true rather than merely usually true.
+            //
+            // Reading the CPU clock first instead costs about its own syscall, ~235 ns, consumed
+            // on-core before the wall clock starts counting. On a millisecond run that hides inside
+            // the natural gap between the two; on a short one it makes the on-core time exceed the
+            // lifetime, which no single thread can do.
+            const std::uint64_t startedAtNs = gr::trace::now();
+            traceCpuAtStart                 = gr::trace::threadCpuNow();
+            gr::trace::emit(gr::trace::Event{.startNs = startedAtNs, .payload0 = static_cast<std::uint32_t>(localBlockList.size()), .payload1 = static_cast<std::uint32_t>(gr::trace::currentCpu()), .kind = gr::trace::Kind::workerStart, .workerId = gr::trace::workerIdOf(runnerID)});
         }
         [[maybe_unused]] on_scope_exit traceWorkerStop = [&] {
             if constexpr (gr::trace::kEnabled) {

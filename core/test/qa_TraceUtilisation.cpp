@@ -1,6 +1,8 @@
 #include <boost/ut.hpp>
 
 #include <cstdint>
+#include <cstdlib>
+#include <format>
 #include <map>
 #include <span>
 #include <string>
@@ -9,6 +11,7 @@
 #include <gnuradio-4.0/Graph.hpp>
 #include <gnuradio-4.0/Scheduler.hpp>
 #include <gnuradio-4.0/Trace.hpp>
+#include <gnuradio-4.0/TraceFile.hpp>
 #include <gnuradio-4.0/TraceReport.hpp>
 
 #include <gnuradio-4.0/testing/NullSources.hpp>
@@ -326,6 +329,9 @@ using LiveScheduler = gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::sing
 
     std::vector<Event> events;
     std::ignore = forEachEvent([](const Event& e, void* user) noexcept { static_cast<std::vector<Event>*>(user)->push_back(e); }, &events);
+    if (const char* directory = std::getenv("GR4_TRACE_ARTEFACT_DIR"); directory != nullptr) {
+        std::ignore = gr::trace::dump(std::format("{}/t4h-utilisation.gr4trace", directory));
+    }
     setCategories(0U);
     return events;
 }
@@ -376,6 +382,22 @@ const boost::ut::suite<"TraceUtilisationLive"> traceUtilisationLiveTests = [] {
         expect(gt(w.threadCpuNs, 0UL)) << "a run that did work must have held a core";
         expect(ge(w.preemptionNs, 0UL));
         expect(!w.preemptionClamped) << "the clamp firing means idle exceeded off-core, so an assumption bent";
+    };
+
+    "a short-lived worker still cannot consume more CPU than it was alive"_test = [] {
+        // D1 on the tightest margin available. The clocks must be read so that the on-core interval
+        // nests strictly *inside* the wall lifetime -- wall first at the start, wall last at the stop.
+        // Reading the CPU clock first instead adds its own syscall, ~235 ns, to the on-core side only;
+        // a millisecond run absorbs that in the natural gap between the two clocks, and a run this
+        // short does not. The longer scenarios above passed with that fault present.
+        for (const gr::Size_t samples : {gr::Size_t{64U}, gr::Size_t{256U}, gr::Size_t{1024U}}) {
+            const std::vector<Event>             events = runLive(categoryMask(Category::work, Category::schedulerLoop, Category::lifecycle), samples);
+            const std::vector<WorkerUtilisation> all    = workerUtilisation(events, 0UL);
+            expect(eq(all.size(), 1UZ) >> fatal);
+            const WorkerUtilisation& w = all.front();
+            expect(w.computed >> fatal) << "at " << samples << " samples: " << w.reason;
+            expect(le(w.threadCpuNs, w.lifetimeNs)) << "at " << samples << " samples the on-core time must still fit inside the life";
+        }
     };
 
     "occupancy responds to the work actually done"_test = [] {

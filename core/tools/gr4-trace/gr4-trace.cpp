@@ -72,6 +72,7 @@ int usage() {
     std::println(stderr, "            naming a source-to-sink chain adds latency flow arrows");
     std::println(stderr, "            --lockstep  assume one invocation per successor invocation,");
     std::println(stderr, "                        instead of walking recorded stream positions");
+    std::println(stderr, "  utilisation <capture>          per worker: where its time went, and how much it held a core");
     std::println(stderr, "  summary   <capture>            header fields and a record census");
     return 2;
 }
@@ -185,6 +186,58 @@ int commandReport(const Capture& capture) {
     return chain;
 }
 
+int commandUtilisation(const Capture& capture) {
+    const std::vector<WorkerUtilisation> workers = workerUtilisation(capture.events, capture.header.lostCount);
+    if (workers.empty()) {
+        std::println("no workers in this capture");
+        return 0;
+    }
+
+    for (const WorkerUtilisation& w : workers) {
+        std::println("");
+        std::println("worker {}", w.workerId);
+        if (!w.computed) {
+            std::println("  not computed: {}", w.reason);
+            continue;
+        }
+
+        const auto percent = [&w](std::uint64_t ns) { return 100.0 * static_cast<double>(ns) / static_cast<double>(w.lifetimeNs); };
+        const auto line    = [&percent](std::string_view label, std::uint64_t ns) { std::println("  {:<26} {:>10.3f} ms {:>7.1f} %", label, static_cast<double>(ns) / 1e6, percent(ns)); };
+
+        std::println("  {:<26} {:>10.3f} ms", "alive", static_cast<double>(w.lifetimeNs) / 1e6);
+        line("block execution", w.blockNs());
+        line("  of which productive", w.blockProductiveNs);
+        line("  of which polling", w.blockProbeNs);
+        line("scheduler within sweeps", w.sweepNs - w.blockNs());
+        line("messages, house-keeping", w.messagePhaseNs);
+        line("idle (waiting by choice)", w.idleNs);
+        line("unaccounted", w.unaccountedNs);
+
+        if (w.hasThreadCpuTime) {
+            line("on a core", w.threadCpuNs);
+            line("preempted", w.preemptionNs);
+            if (w.preemptionClamped) {
+                std::println("  note: idle exceeded the time off core, so preemption was clamped to zero -- one of the assumptions behind it does not hold here");
+            }
+        } else {
+            std::println("  {:<26} {:>10}", "on a core", "unknown on this platform");
+        }
+
+        std::println("");
+        std::println("  block occupancy  {:>6.1f} %   (of the whole life)", 100.0 * w.occupancy);
+        if (w.hasUtilisation) {
+            std::println("  block utilisation{:>6.1f} %   (of the time it was trying to work)", 100.0 * w.utilisation);
+        } else {
+            std::println("  block utilisation  n/a       (this worker only ever waited, so there was no active time to be a fraction of)");
+        }
+
+        // Stated rather than left silent: a check that passed and a check that was skipped look
+        // identical otherwise, and the slack is the evidence the decomposition was actually evaluated.
+        std::println("  terms fit within the lifetime, with {:.1f} % unaccounted", percent(w.unaccountedNs));
+    }
+    return 0;
+}
+
 int commandCatapult(const Capture& capture, const std::string& outputPath, std::span<const EntityId> chain, LatencyMode mode) {
     std::ofstream out(outputPath, std::ios::binary | std::ios::trunc);
     if (!out.is_open()) {
@@ -241,6 +294,9 @@ int main(int argc, char** argv) {
     }
     if (command == "report") {
         return commandReport(*capture);
+    }
+    if (command == "utilisation") {
+        return commandUtilisation(*capture);
     }
     if (command == "catapult") {
         if (args.size() < 4UZ) {
