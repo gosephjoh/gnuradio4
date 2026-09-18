@@ -147,18 +147,29 @@ def main():
             print(f"trace-batch-rt: WARNING {hdr['lost_count']} records were lost (ring too small); every figure below understates", file=sys.stderr)
         inv = pd.read_csv(inv_csv, dtype={"role": str})
         inv = inv[inv.chain >= 0]
-        # the ring keeps the most recent records: when the capture starts after the window
-        # would, slide the window to the retained span (warm-up is then already behind us)
-        earliest = int(inv.start_ns.min()) if len(inv) else w0
+        # the rings keep the most recent records, and every worker's ring retains a different
+        # span (a spinning worker overwrites faster): the window must lie inside the span that
+        # *every* block of the batch path still has records for, or a batch published by the
+        # throttle finds no consumer records (or the reverse).  Intersect the retained spans of
+        # the throttle and the pre-gate blocks over all chains; slide/shrink the window into it.
+        path = inv[inv.role.isin(["throttle"] + PRE_GATE)]
+        spans = path.groupby(["chain", "role"]).start_ns.agg(["min", "max"]) if len(path) else None
         out["window_shifted"] = False
-        if earliest > w0:
-            shift = earliest + int(0.2e9) - w0
-            w0 += shift
-            if a.window > 0:
-                w1 += shift
-            out["window_shifted"] = True
-            out["window_ns"] = [int(w0), None if a.window <= 0 else int(w1)]
-            print(f"trace-batch-rt: NOTE the capture's earliest record is {(earliest - t0)/1e9:.1f} s after the throttle start; window moved to start {(w0 - t0)/1e9:.1f} s after it", file=sys.stderr)
+        if spans is not None and len(spans):
+            span_start = int(spans["min"].max()) + int(0.2e9)
+            span_end   = int(spans["max"].min())
+            out["retained_span_ns"] = [span_start, span_end]
+            # slide the window to the retained span, keep its length where the span allows
+            new_w0 = max(w0, span_start)
+            new_w1 = (new_w0 + int(a.window * 1e9)) if a.window > 0 else span_end
+            new_w1 = min(new_w1, span_end)
+            if new_w0 != w0 or new_w1 != w1:
+                out["window_shifted"] = True
+                print(f"trace-batch-rt: NOTE the rings' common retained span starts {(span_start - t0)/1e9:.1f} s after the throttle start and ends at {(span_end - t0)/1e9:.1f} s; window set to [{(new_w0 - t0)/1e9:.1f}, {(new_w1 - t0)/1e9:.1f}] s", file=sys.stderr)
+            w0, w1 = new_w0, new_w1
+            out["window_ns"] = [int(w0), int(w1)]
+            if w1 <= w0:
+                die("the rings' retained spans do not overlap inside the window; enlarge trace_buffer or shorten the window")
         rows = []
         for k, ch in enumerate(meta["chains"]):
             pc = out["per_chain"][k]

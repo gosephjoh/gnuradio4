@@ -148,8 +148,9 @@ def main():
             g["x"] = R
         e = [p["edf"] for p in ps if p.get("edf")]
         if e:
-            rel = sum(x["releases"] for x in e)
-            mis = sum(x["misses"] for x in e)
+            # pipeline blocks only: the source and throttle carry a 1 us deadline on purpose
+            rel = sum(x.get("releases_pipeline", x["releases"]) for x in e)
+            mis = sum(x.get("misses_pipeline", x["misses"]) for x in e)
             g["miss_ratio"] = mis / rel if rel else None
         rows.append(g)
     Ns = sorted({g["N"] for g in rows})

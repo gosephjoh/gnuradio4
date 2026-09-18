@@ -151,8 +151,10 @@ would take four minutes.
 Disk: a traced run leaves about 1 GB of capture and several hundred MB of
 per-record CSV; the driver deletes both after the analysis unless
 `--keep-captures` / `--keep-tables` are given (the smoke keeps nothing
-either). `batch_rt.json`, `batch_rt.csv`, the header, the census, the
-entities and the EDF / re-sync tables stay. `--rep-start K` resumes a
+either). `batch_rt.json`, `batch_rt.csv`, the header, the census and the
+entities stay; the EDF release and miss tables go too (a 60 s EDF run
+releases millions of jobs — hundreds of MB), their summaries are in
+`batch_rt.json`. `--rep-start K` resumes a
 sweep at repeat K; the index file is appended.
 
 Time: the x86 plan is 43 points × 3 policies × 3 repeats plus 27 controls

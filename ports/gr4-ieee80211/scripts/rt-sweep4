@@ -76,8 +76,9 @@ def one_run(prof, cell, sweep_dir, point, policy, rep, traced, run_s, a):
                 os.remove(cap)
         if traced and not a.keep_tables:
             # the per-record tables are hundreds of MB per run; batch_rt.json/csv, the header,
-            # the census, the entities and the small EDF/sync tables stay
-            for f in ("trace_invocations.csv", "trace_work.csv", "trace_probes.csv", "trace_events.csv", "trace_sweeps.csv"):
+            # the census and the entities stay (batch_rt.json holds the EDF and re-sync summaries)
+            # (the EDF release/miss tables are hundreds of MB too: a 60 s EDF run releases millions of jobs)
+            for f in ("trace_invocations.csv", "trace_work.csv", "trace_probes.csv", "trace_events.csv", "trace_sweeps.csv", "trace_releases.csv", "trace_misses.csv", "trace_sync.csv"):
                 fp = os.path.join(out, f)
                 if os.path.exists(fp):
                     os.remove(fp)
