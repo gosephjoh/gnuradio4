@@ -22,7 +22,7 @@ spec = importlib.util.spec_from_file_location("full", os.path.join(HERE, "rt-ful
 
 POL = ["rr", "edf", "rm"]; NAME = {"rr": "RR", "edf": "EDF", "rm": "RM"}
 FILL = {"rr": "#c6dbef", "edf": "#fdd0a2", "rm": "#c7e9c0"}
-plt.rcParams.update({"font.size": 9, "axes.titlesize": 10, "axes.labelsize": 9.5, "pdf.fonttype": 42, "ps.fonttype": 42, "font.family": "DejaVu Sans"})
+plt.rcParams.update({"font.size": 13.5, "axes.titlesize": 15, "axes.labelsize": 14, "xtick.labelsize": 13, "ytick.labelsize": 13, "legend.fontsize": 13, "pdf.fonttype": 42, "ps.fonttype": 42, "font.family": "DejaVu Sans"})
 YLABEL = "Batch Response Time, µs (log)"
 
 
@@ -57,7 +57,7 @@ def draw_group(ax, groups, S, width=0.22):
 
 def legend(fig):
     handles = [Patch(facecolor=FILL[p], edgecolor="black", label=NAME[p]) for p in POL] + [Line2D([0], [0], color="black", linewidth=1.2, label="Median"), Line2D([0], [0], color="red", linewidth=1.2, linestyle="--", label="Mean")]
-    fig.legend(handles=handles, loc="lower center", ncol=5, frameon=False, fontsize=8.5, handlelength=1.8, columnspacing=1.6)
+    fig.legend(handles=handles, loc="lower center", ncol=5, frameon=False, handlelength=1.8, columnspacing=1.4)
 
 
 def ticks(ax, lo, hi):
@@ -67,7 +67,7 @@ def ticks(ax, lo, hi):
 
 
 def finish(fig, leg):
-    if leg: legend(fig); fig.tight_layout(rect=(0, 0.07, 1, 1))
+    if leg: legend(fig); fig.tight_layout(rect=(0, 0.09, 1, 1))
     else: fig.tight_layout()
 
 
@@ -84,11 +84,11 @@ def main():
 
     # fig 1: the simple workloads (full sweep)
     for leg in (True, False):
-        fig, axes = plt.subplots(1, 2, figsize=(7.2, 3.4), gridspec_kw={"width_ratios": [1, 1.7]})
+        fig, axes = plt.subplots(1, 2, figsize=(10.0, 4.8), gridspec_kw={"width_ratios": [1, 1.7]})
         draw_group(axes[0], [("Rx 0", lambda p: ("simple1", p, 0))], SF)
-        axes[0].set_title("One Receiver, One Worker, 2.5 Msps"); axes[0].set_ylabel(YLABEL)
+        axes[0].set_title("One Receiver, One Worker,\n2.5 Msps"); axes[0].set_ylabel(YLABEL)
         draw_group(axes[1], [("Rx 0", lambda p: ("simple2", p, 0)), ("Rx 1", lambda p: ("simple2", p, 1))], SF)
-        axes[1].set_title("Two Equal Receivers, Two Workers, 2.5 Msps Each")
+        axes[1].set_title("Two Equal Receivers, Two Workers,\n2.5 Msps Each")
         lo = min(SF[k]["min"] for k in SF if k[0] in ("simple1", "simple2")); hi = max(SF[k]["max"] for k in SF if k[0] in ("simple1", "simple2"))
         for ax in axes: ticks(ax, lo, hi)
         finish(fig, leg); emit(fig, a.out_dir, f"fig1_simple_{'legend' if leg else 'nolegend'}", a.png)
@@ -97,7 +97,7 @@ def main():
     ref = next(metaP[("light", p)]["chains"] for p in POL if ("light", p) in metaP)
     groups = [(f"Rx {c['chain']}\n{c['rate']/1e6:g} Msps\n{c['period_us']:.0f} µs", (lambda p, c=c["chain"]: ("light", p, c))) for c in ref]
     for leg in (True, False):
-        fig, ax = plt.subplots(figsize=(7.2, 3.6))
+        fig, ax = plt.subplots(figsize=(9.0, 4.8))
         draw_group(ax, groups, SP)
         ax.set_title("Four Receivers, Four Workers"); ax.set_ylabel(YLABEL)
         lo = min(SP[k]["min"] for k in SP if k[0] == "light"); hi = max(SP[k]["max"] for k in SP if k[0] == "light"); ticks(ax, lo, hi)
@@ -111,7 +111,7 @@ def main():
         last = max(r, key=lambda x: (x["rate"] or 0, x["chain"]))["chain"]
         groups.append((f"{label[mix]}\n5 Msps", (lambda p, m=mix, c=last: (m, p, c))))
     for leg in (True, False):
-        fig, ax = plt.subplots(figsize=(5.6, 3.6))
+        fig, ax = plt.subplots(figsize=(7.0, 4.8))
         draw_group(ax, groups, SF)
         ax.set_title("High Rate Receivers Only"); ax.set_ylabel(YLABEL)
         keys = [g[1](p) for g in groups for p in POL]
