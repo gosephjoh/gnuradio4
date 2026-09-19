@@ -69,6 +69,9 @@ throttle stalled so long that no batch reached the gate inside the window
 
 ## Later experiments
 
+- `full/REPORT.md` — the full version of the preliminary matrix (2026-09-19,
+  10 repeats × 30 s, 150 runs): box plots with the whole-process-stall
+  filter; the three findings with repeat spreads.
 - `prelim/REPORT.md` — the ten-minute preliminary matrix (2026-09-18): which
   policy for which workload — RR for the simple one, EDF where receivers differ
   and a choice must be made, RM for the fastest receiver.

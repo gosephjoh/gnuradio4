@@ -2,18 +2,20 @@
 """rt-prelim4 -- the preliminary "which policy for which workload" matrix, in about ten minutes.
 
     ./scripts/rt-prelim4 --out-dir DIR [--cell CELL] [--run-s 8] [--ratio 4096] [--policies rr,edf,rm]
+    ./scripts/rt-prelim4 --out-dir DIR --repeats 10 --run-s 30 --ring 33554432 --warmup 5 --window 20   # the full sweep (~6 h)
 
-Five workloads x RR/EDF/RM, one repeat, RUN_S seconds each, N = 1024, every trace
-category live, small rings (8 M records per worker), process_stream_to_message_ratio
-RATIO for every policy:
+Five workloads x RR/EDF/RM x REPEATS (repeat index outermost, so an interrupted sweep is
+balanced; --skip-existing resumes one), RUN_S seconds each, N = 1024, every trace category
+live, RING records per worker, process_stream_to_message_ratio RATIO for every policy:
   simple1   one receiver, one worker, 2.5 Msps           (nothing to prioritise: EDF = FIFO)
   simple2   two equal receivers, two workers, 2.5 Msps   (equal deadlines: EDF = FIFO across receivers)
   light     1.25 / 1.25 / 2.5 / 5 Msps, four workers     (multi-rate mixes of the multi-rate
   mid       1.25 / 2.5 / 2.5 / 5 Msps, four workers       experiment: fastest receiver last,
   knee      2.5 / 2.5 / 5 / 5 Msps, four workers          rotation 1, RM with true periods)
-Each run goes to DIR/<workload>_<policy>/ (batch_rt.json, batch_rt.csv, latency_summary.json,
-trace_meta.json; capture and per-record tables deleted).  DIR/index.json lists the runs.
-scripts/rt-prelim-figs.py draws the range figures from DIR.
+Each run goes to DIR/<workload>_<policy>[_rep<k>]/ (batch_rt.json, batch_rt.csv -- one row per
+batch, kept for the pooled quantiles --, latency_summary.json, trace_meta.json; capture and
+per-record tables deleted).  DIR/index.json lists the runs.  scripts/rt-prelim-figs.py draws the
+range figures of a one-repeat matrix, scripts/rt-full-figs.py the box plots of a full sweep.
 """
 import argparse, json, os, subprocess, sys, time, glob
 
@@ -39,14 +41,19 @@ def main():
     ap.add_argument("--policies", default="rr,edf,rm")
     ap.add_argument("--ring", type=int, default=8388608, help="trace records per worker")
     ap.add_argument("--only", help="comma list of workload names")
+    ap.add_argument("--repeats", type=int, default=1, help="repeats per cell; >1 tags the run directories _rep<k>")
+    ap.add_argument("--rep-start", type=int, default=0)
+    ap.add_argument("--skip-existing", action="store_true", help="skip a run whose directory already holds batch_rt.json")
     a = ap.parse_args()
     os.chdir(HERE); os.makedirs(a.out_dir, exist_ok=True)
     index = []
-    for w in WORKLOADS:
-        if a.only and w["name"] not in a.only.split(","):
-            continue
-        for pol in a.policies.split(","):
-            d = os.path.join(a.out_dir, f"{w['name']}_{pol}"); os.makedirs(d, exist_ok=True)
+    cells = [(w, pol) for w in WORKLOADS if not a.only or w["name"] in a.only.split(",") for pol in a.policies.split(",")]
+    for rep in range(a.rep_start, a.repeats):
+        for w, pol in cells:
+            d = os.path.join(a.out_dir, f"{w['name']}_{pol}" + (f"_rep{rep}" if a.repeats > 1 else ""))
+            if a.skip_existing and os.path.exists(os.path.join(d, "batch_rt.json")):
+                print("skip (exists) " + d, flush=True); continue
+            os.makedirs(d, exist_ok=True)
             cmd = [RX, "--run-dir", a.cell, "--out-dir", d, "--threads", str(w["threads"]), "--policy", pol, "--fixed-batch", "1024",
                    "--sched-ratio", str(a.ratio), "--timeout-s", str(int(a.run_s * 6 + 60)), "--rotate", str(w.get("rotate", 0)),
                    "--trace-categories", "all", "--trace-buffer", str(a.ring), "--trace-limit-mb", "1024", "--trace-out", os.path.join(d, "trace.gr4trace")]
@@ -60,9 +67,11 @@ def main():
             for f in glob.glob(os.path.join(d, "trace_*.csv")) + [os.path.join(d, "trace.gr4trace")]:
                 if os.path.exists(f) and not f.endswith(("trace_header.json", "trace_kinds.csv", "trace_entities.csv")):
                     os.remove(f)
-            index.append({"workload": w["name"], "policy": pol, "dir": d, "threads": w["threads"], "rates": w.get("rates") or [w["rate"]] * w["chains"], "rc": rc, "analysis_rc": rc2, "wall_s": round(time.time() - t0, 1), "ratio": a.ratio, "run_s": a.run_s})
-            print(f"  {w['name']} {pol}: rc {rc}/{rc2} in {index[-1]['wall_s']} s", flush=True)
-    json.dump(index, open(os.path.join(a.out_dir, "index.json"), "w"), indent=1)
+            index.append({"workload": w["name"], "policy": pol, "rep": rep, "dir": d, "threads": w["threads"], "rates": w.get("rates") or [w["rate"]] * w["chains"], "rc": rc, "analysis_rc": rc2, "wall_s": round(time.time() - t0, 1), "ratio": a.ratio, "run_s": a.run_s})
+            print(f"  {w['name']} {pol} rep{rep}: rc {rc}/{rc2} in {index[-1]['wall_s']} s", flush=True)
+            ip = os.path.join(a.out_dir, "index.json")
+            old = json.load(open(ip)) if os.path.exists(ip) else []
+            json.dump(old + [index[-1]], open(ip, "w"), indent=1)
     print("wrote", os.path.join(a.out_dir, "index.json"))
 
 

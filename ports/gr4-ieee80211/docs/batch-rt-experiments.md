@@ -46,7 +46,7 @@ Python 3 with `numpy`, `pandas` and `matplotlib` for the analysis and plots.
 | `scripts/rt-paper-figs.py` | | the range figures of a sweep as PDF + PNG, and the numbers they show |
 | `scripts/rt-class-figs.py` | | the range figures of the deadline-structure sweep (receiver 0 against the rest, per setting) |
 | `scripts/rt-microbench4`, `scripts/trace-edf-oracle.py`, `apps/microbench4.cpp` | | the microbenchmarks M1–M6: isolated block costs, scheduler cost per invocation, blocking bound, EDF selection oracle, trace overhead, scheduler pass cost on four workers (the house-keeping re-sync) |
-| `scripts/rt-prelim4`, `scripts/rt-prelim-figs.py` | | the ten-minute preliminary matrix (simple workloads and the three multi-rate mixes, one short run per cell) and its range figures |
+| `scripts/rt-prelim4`, `scripts/rt-prelim-figs.py`, `scripts/rt-full-figs.py` | | the which-policy-for-which-workload matrix (simple workloads and the three multi-rate mixes): the driver (one short run per cell, or `--repeats` for the full sweep), the range figures of the preliminary run, the box plots with the stall filter of the full sweep |
 | `scripts/rt-multirate-figs.py`, `scripts/rt-multirate-compare.py` | | the range figures of the multi-rate receivers experiment (one sweep), and two sweeps of it side by side (e.g. two `process_stream_to_message_ratio` values) |
 | `experiments/profiles/*.json` | | per-machine parameters: `x86-8core.json`, `pi5.json`; `x86-8core-r4096.json` is the same with `sched_ratio` 4096 (every run gets `--sched-ratio 4096`) |
 
@@ -183,6 +183,23 @@ or `pi5.json`.
 ./scripts/rt-prelim4 --out-dir <cell>/runs4/prelim-<name>
 ./scripts/rt-prelim-figs.py <cell>/runs4/prelim-<name> --out-dir results/sweep-<name>/prelim
 ```
+
+```
+# 9. the full version of 8 (~6 h): 10 repeats x 30 s, 1 GB rings; box plots with the stall filter
+#    -> results/sweep-<name>/full/REPORT.md
+./scripts/rt-prelim4 --out-dir <cell>/runs4/full-<name> --repeats 10 --run-s 30 --ring 33554432 --warmup 5 --window 20
+./scripts/rt-full-figs.py <cell>/runs4/full-<name> --out-dir results/sweep-<name>/full
+```
+
+`rt-full-figs.py` pools the batches of every repeat per cell and draws box
+plots (25th–75th percentile, median, mean, min–max). Its **stall filter**
+excludes a batch only when it is more than 5× its cell's median *and* every
+other receiver of the same run has such a batch within 2 ms: the whole
+process stopped, which is the host, not the policy. One-receiver runs use
+10× the median instead. Excluded batches are counted in `TABLE.md` and the
+raw maximum is drawn as a cross; a policy effect that hits one receiver (RM
+starving a slow one) is never cut. On the x86 sweep it removed 0.007 % of
+7.6 M batches.
 
 A multi-rate run is `rx_latency4 --chains 4 --threads 4 --fixed-batch 1024
 --rates 1250000,1250000,2500000,5000000 --run-s 30 --rotate 1 --policy …`:
@@ -363,6 +380,15 @@ published 5–14 µs after nominal on average.
   one worker every admitted job runs within its pass.
 - EDF at saturation missed 21 % of its implicit deadlines; RR and RM have no
   deadlines to miss.
+
+**The full matrix (2026-09-19)** — `results/sweep-x86-8core/full/REPORT.md`:
+the preliminary matrix at 10 repeats × 30 s (150 runs, 5.8 h, none
+saturated). The three findings hold with per-repeat spreads of 3–9 µs:
+one receiver RR 67 / EDF 69 / RM 101 µs; the 5 Msps receiver late 13.3 %
+under RR against 2.7 % under EDF (light), 23.0 vs 5.8 % (mid), 48.6 vs
+17.5 % (knee); at the knee RM's 2.5 Msps receivers are 21.5 % and 16.9 %
+late (maxima 6.2 and 3.9 ms) against 2.8 % and 5.8 % under EDF; RM serves
+the 5 Msps receiver in 112 / 123 / 158 µs against EDF's 126 / 138 / 212.
 
 **The preliminary matrix (2026-09-18)** — `results/sweep-x86-8core/prelim/REPORT.md`
 (one 8 s run per cell, ratio 4096 for all): RR for one receiver (67 vs EDF 69

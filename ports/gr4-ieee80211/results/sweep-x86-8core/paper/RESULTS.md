@@ -301,8 +301,9 @@ upper bound.
 
 ## 3c. The preliminary which-policy-for-which-workload matrix
 
-`../prelim/REPORT.md` (one 8 s run per cell, ratio 4096 for all policies)
-states the three findings in one place with range figures: round robin for
+`../full/REPORT.md` (10 repeats × 30 s per cell, ratio 4096 for all
+policies, box plots with a whole-process-stall filter; `../prelim/REPORT.md`
+is its ten-minute preview) states the three findings in one place: round robin for
 the simple workload, EDF where the receivers differ and round robin cannot
 prioritise or rate monotonic would starve the slow receivers, rate monotonic
 for the fastest receiver.
