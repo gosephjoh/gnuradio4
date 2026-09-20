@@ -302,11 +302,12 @@ public:
     Annotated<std::size_t, "max_work_items", Doc<"number of work items per work scheduling interval (controls latency)">>                                                                                                                                                      max_work_items                  = std::numeric_limits<std::size_t>::max(); // TODO: check whether we can keep this std::size_t or more consistently to gr::Size_t
     Annotated<property_map, "sched_settings", Doc<"scheduler implementation specific settings">>                                                                                                                                                                               sched_settings{};
 
-    Annotated<gr::Size_t, "max_selections_per_pass", Doc<"priority-class policies: cap on successful work() calls before returning to house-keeping (0: auto = 4 x block count)">>                        max_selections_per_pass = 0U;
-    Annotated<SelectionStrategy, "selection_strategy", Doc<"dynamic-key policies: how the next block is picked -- linearScan (O(n), no auxiliary state) or readyHeap (O(log n), heap rebuilt per pass)">> selection_strategy      = SelectionStrategy::linearScan;
-    Annotated<gr::Size_t, "max_outstanding_jobs", Doc<"release-tracking policies: cap on a block's outstanding jobs, clamping the buffer-derived bound (0: uncapped)">>                                   max_outstanding_jobs    = kDefaultMaxOutstandingJobs;
+    Annotated<gr::Size_t, "max_selections_per_pass", Doc<"priority-class policies: cap on successful work() calls before returning to house-keeping (0: auto = 4 x block count)">>                                                         max_selections_per_pass = 0U;
+    Annotated<SelectionStrategy, "selection_strategy", Doc<"dynamic-key policies: how the next block is picked -- linearScan (O(n), no auxiliary state) or readyHeap (O(log n), heap rebuilt per pass)">>                                  selection_strategy      = SelectionStrategy::linearScan;
+    Annotated<TieBreak, "tie_break", Doc<"task-level fixed-priority policies (FP, RM): ordering where keys tie -- registrationOrder (job-list position), upstreamFirst or downstreamFirst (data-topological); applied at init()/reset()">> tie_break               = TieBreak::registrationOrder;
+    Annotated<gr::Size_t, "max_outstanding_jobs", Doc<"release-tracking policies: cap on a block's outstanding jobs, clamping the buffer-derived bound (0: uncapped)">>                                                                    max_outstanding_jobs    = kDefaultMaxOutstandingJobs;
 
-    GR_MAKE_REFLECTABLE(SchedulerBase, timeout_ms, watchdog_timeout, timeout_inactivity_count, process_stream_to_message_ratio, house_keeping_policy, house_keeping_depth, max_work_items, max_selections_per_pass, max_outstanding_jobs, selection_strategy, poolName, sched_settings);
+    GR_MAKE_REFLECTABLE(SchedulerBase, timeout_ms, watchdog_timeout, timeout_inactivity_count, process_stream_to_message_ratio, house_keeping_policy, house_keeping_depth, max_work_items, max_selections_per_pass, max_outstanding_jobs, selection_strategy, tie_break, poolName, sched_settings);
 
     constexpr static block::Category blockCategory = block::Category::ScheduledBlockGroup;
 
@@ -355,15 +356,20 @@ public:
     /// scheduler's own ceiling, which is what every block received before per-block batches existed.
     void syncSchedStates(const std::vector<std::shared_ptr<BlockModel>>& blocks, std::vector<SchedState>& states) const {
         states.resize(blocks.size());
+        // A block the analysis does not know sorts after every block it does, in registration order,
+        // so the fallback needs to know how many are known (§ `TieBreak`).
+        const std::size_t rankedBlocks = _schedulingAnalysis.perBlock.size();
         for (std::size_t i = 0UZ; i < blocks.size(); ++i) {
             // The user's own declaration is block-local, so it survives adoption intact -- which is
             // what makes an *absolute* priority scheme exact for adopted blocks where a
             // rate-monotonic one cannot be.
             const std::int32_t userPriority = static_cast<std::int32_t>(gr::scheduler::detail::settingAsDouble(*blocks[i], "sched_priority", 0.0));
 
+            const DerivedAttributes* attributes = _schedulingAnalysis.find(*blocks[i]);
+
             std::size_t  ceiling  = kUnboundedBatch;
             std::int32_t priority = userPriority; // a derived rank needs the graph; absent one, the user's value or 0
-            if (const DerivedAttributes* attributes = _schedulingAnalysis.find(*blocks[i]); attributes != nullptr) {
+            if (attributes != nullptr) {
                 ceiling  = attributes->executionCeiling;
                 priority = attributes->priority;
             } else {
@@ -377,14 +383,30 @@ public:
                 // blocks whose configuration arrived most recently.
                 ceiling = _batchStrategy->resolve(*blocks[i], static_cast<std::size_t>(max_work_items)).executionCeiling;
             }
-            states[i] = SchedState{.index = i, .batchCeiling = ceiling, .priority = priority, .userPriority = userPriority};
+            // Only a task-level fixed-priority policy can be given anything but the position: it is
+            // the only class whose list is pre-sorted, and round robin keys on the position itself.
+            // Every other policy keeps `tieBreak == index`, which is what it compares today.
+            std::size_t tieBreak = i;
+            if constexpr (TPolicy::kPriorityClass == PriorityClass::fixedTask) {
+                if (tie_break != TieBreak::registrationOrder) {
+                    if (attributes == nullptr) {
+                        tieBreak = rankedBlocks + i; // adopted: after every ranked block, in registration order
+                    } else if (tie_break == TieBreak::upstreamFirst) {
+                        tieBreak = attributes->topologicalIndex;
+                    } else {
+                        tieBreak = rankedBlocks - 1UZ - attributes->topologicalIndex; // drain before refilling
+                    }
+                }
+            }
+
+            states[i] = SchedState{.index = i, .tieBreak = tieBreak, .batchCeiling = ceiling, .priority = priority, .userPriority = userPriority};
 
             if constexpr (needsReleaseTracking(TPolicy::kPriorityClass)) {
                 // The gates' inputs. A block the analysis does not know keeps period and deadline at
                 // zero, which leaves it released on data alone -- the same
                 // deliberately-imperfect treatment adopted blocks already receive for priority.
                 states[i].batchFloor = gr::scheduler::detail::releaseThreshold(*blocks[i]);
-                if (const DerivedAttributes* attributes = _schedulingAnalysis.find(*blocks[i]); attributes != nullptr) {
+                if (attributes != nullptr) {
                     states[i].batchFloor              = std::max(attributes->batchFloor, 1UZ);
                     states[i].periodSeconds           = static_cast<double>(attributes->period);
                     states[i].relativeDeadlineSeconds = static_cast<double>(attributes->relativeDeadline);

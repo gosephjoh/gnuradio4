@@ -594,8 +594,10 @@ const boost::ut::suite<"earliest deadline first"> edfTests = [] {
 
         std::array<Job, 1> lhsStorage{};
         std::array<Job, 1> rhsStorage{};
-        SchedState         lhs{.index = 7UZ};
-        SchedState         rhs{.index = 2UZ};
+        // A dynamic-key policy is never pre-sorted and never given a topological tie-break, so its
+        // `tieBreak` is always the block's own position -- which is what `syncSchedStates` writes.
+        SchedState lhs{.index = 7UZ, .tieBreak = 7UZ};
+        SchedState rhs{.index = 2UZ, .tieBreak = 2UZ};
         lhs.jobs.storage = std::span<Job>{lhsStorage};
         rhs.jobs.storage = std::span<Job>{rhsStorage};
         expect(lhs.jobs.push(Job{.batch = 1UZ, .absoluteDeadline = deadline}));

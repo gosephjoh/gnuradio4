@@ -85,7 +85,7 @@ const boost::ut::suite<"SchedulingPolicy"> schedulingPolicyTests = [] {
 
         std::vector<SchedState> states(blocks.size());
         for (std::size_t i = 0UZ; i < states.size(); ++i) {
-            states[i] = SchedState{.index = i, .batchCeiling = 100UZ + i};
+            states[i] = SchedState{.index = i, .tieBreak = i, .batchCeiling = 100UZ + i};
         }
         const auto statesBefore = states;
 
@@ -103,7 +103,7 @@ const boost::ut::suite<"SchedulingPolicy"> schedulingPolicyTests = [] {
         auto                    blocks = makeBlocks(graph, 4UZ);
         std::vector<SchedState> states(blocks.size());
         for (std::size_t i = 0UZ; i < states.size(); ++i) {
-            states[i] = SchedState{.index = i, .batchCeiling = 10UZ * (i + 1UZ)};
+            states[i] = SchedState{.index = i, .tieBreak = i, .batchCeiling = 10UZ * (i + 1UZ)};
         }
         const auto before = blocks;
 
@@ -126,7 +126,7 @@ const boost::ut::suite<"SchedulingPolicy"> schedulingPolicyTests = [] {
         std::vector<SchedState> states(blocks.size());
         const std::array        priorities{5, 40, 10, 20};
         for (std::size_t i = 0UZ; i < states.size(); ++i) {
-            states[i] = SchedState{.index = i, .userPriority = priorities[i]};
+            states[i] = SchedState{.index = i, .tieBreak = i, .userPriority = priorities[i]};
         }
         const auto before = blocks;
 
@@ -146,8 +146,8 @@ const boost::ut::suite<"SchedulingPolicy"> schedulingPolicyTests = [] {
         gr::Graph               graph;
         auto                    blocks = makeBlocks(graph, 2UZ);
         std::vector<SchedState> states(blocks.size());
-        states[0]         = SchedState{.index = 0UZ, .priority = 99, .userPriority = 0}; // derived rank only
-        states[1]         = SchedState{.index = 1UZ, .priority = 1, .userPriority = 0};
+        states[0]         = SchedState{.index = 0UZ, .tieBreak = 0UZ, .priority = 99, .userPriority = 0}; // derived rank only
+        states[1]         = SchedState{.index = 1UZ, .tieBreak = 1UZ, .priority = 1, .userPriority = 0};
         const auto before = blocks;
 
         gr::scheduler::detail::applyStaticOrder<FixedPriorityPolicy>(blocks, states);
@@ -160,9 +160,9 @@ const boost::ut::suite<"SchedulingPolicy"> schedulingPolicyTests = [] {
         gr::Graph               graph;
         auto                    blocks = makeBlocks(graph, 3UZ);
         std::vector<SchedState> states(blocks.size());
-        states[0]         = SchedState{.index = 0UZ, .priority = 1}; // longest period -> lowest rank
-        states[1]         = SchedState{.index = 1UZ, .priority = 3}; // shortest period -> highest rank
-        states[2]         = SchedState{.index = 2UZ, .priority = 2};
+        states[0]         = SchedState{.index = 0UZ, .tieBreak = 0UZ, .priority = 1}; // longest period -> lowest rank
+        states[1]         = SchedState{.index = 1UZ, .tieBreak = 1UZ, .priority = 3}; // shortest period -> highest rank
+        states[2]         = SchedState{.index = 2UZ, .tieBreak = 2UZ, .priority = 2};
         const auto before = blocks;
 
         gr::scheduler::detail::applyStaticOrder<RateMonotonicPolicy>(blocks, states);
@@ -180,7 +180,7 @@ const boost::ut::suite<"SchedulingPolicy"> schedulingPolicyTests = [] {
         auto                    blocks = makeBlocks(graph, 5UZ);
         std::vector<SchedState> states(blocks.size());
         for (std::size_t i = 0UZ; i < states.size(); ++i) {
-            states[i] = SchedState{.index = i};
+            states[i] = SchedState{.index = i, .tieBreak = i};
         }
         const auto before = blocks;
 
@@ -263,15 +263,15 @@ const boost::ut::suite<"SchedulingPolicy"> schedulingPolicyTests = [] {
         gr::Graph               graph;
         auto                    blocks = makeBlocks(graph, 3UZ);
         std::vector<SchedState> states(blocks.size());
-        states[0] = SchedState{.index = 0UZ, .userPriority = 30};
-        states[1] = SchedState{.index = 1UZ, .userPriority = 20};
-        states[2] = SchedState{.index = 2UZ, .userPriority = 10};
+        states[0] = SchedState{.index = 0UZ, .tieBreak = 0UZ, .userPriority = 30};
+        states[1] = SchedState{.index = 1UZ, .tieBreak = 1UZ, .userPriority = 20};
+        states[2] = SchedState{.index = 2UZ, .tieBreak = 2UZ, .userPriority = 10};
         gr::scheduler::detail::applyStaticOrder<FixedPriorityPolicy>(blocks, states);
         expect(eq(states[0].userPriority, 30)) << "ordered to begin with";
 
         auto adopted = makeBlocks(graph, 1UZ); // a block appended by adoption, top priority
         blocks.push_back(adopted.front());
-        states.push_back(SchedState{.index = blocks.size() - 1UZ, .userPriority = 99});
+        states.push_back(SchedState{.index = blocks.size() - 1UZ, .tieBreak = blocks.size() - 1UZ, .userPriority = 99});
         expect(blocks.back() == adopted.front()) << "adoption appends, so it starts last";
 
         gr::scheduler::detail::applyStaticOrder<FixedPriorityPolicy>(blocks, states);
@@ -279,6 +279,87 @@ const boost::ut::suite<"SchedulingPolicy"> schedulingPolicyTests = [] {
         expect(blocks.front() == adopted.front()) << "after re-ordering the adopted block must run first, not last";
         expect(eq(states.front().userPriority, 99));
         expect(eq(states.back().userPriority, 10)) << "and the rest keep their relative order";
+    };
+
+    "the tie-break travels with its block and decides equal keys"_test = [] {
+        // M2f-4. Every key is equal here, so the tie-break alone orders the list -- and it is
+        // deliberately not the position, so a comparator still keyed on `index` would fail.
+        gr::Graph               graph;
+        auto                    blocks = makeBlocks(graph, 3UZ);
+        std::vector<SchedState> states(blocks.size());
+        states[0]         = SchedState{.index = 0UZ, .tieBreak = 2UZ};
+        states[1]         = SchedState{.index = 1UZ, .tieBreak = 0UZ};
+        states[2]         = SchedState{.index = 2UZ, .tieBreak = 1UZ};
+        const auto before = blocks;
+
+        gr::scheduler::detail::applyStaticOrder<FixedPriorityPolicy>(blocks, states);
+
+        expect(blocks[0] == before[1]) << "the smallest tie-break runs first";
+        expect(blocks[1] == before[2]);
+        expect(blocks[2] == before[0]);
+        expect(eq(states[0].tieBreak, 0UZ)) << "each state followed its own block";
+        expect(eq(states[0].index, 1UZ)) << "and `index` still names the original position";
+    };
+
+    "a data-topological tie-break orders equal priorities by data flow"_test = [] {
+        // M2f-5, the feature end to end. No block declares a priority, so every key ties and the
+        // setting decides the whole order. Registration order is chosen to contradict both
+        // directions, so all three answers differ.
+        const auto orderUnder = [](gr::scheduler::TieBreak tieBreak) {
+            gr::Graph graph;
+            auto&     mid  = graph.emplaceBlock<gr::testing::Copy<float>>({{"name", std::string("mid")}});
+            auto&     sink = graph.emplaceBlock<gr::testing::Copy<float>>({{"name", std::string("sink")}});
+            auto&     src  = graph.emplaceBlock<gr::testing::Copy<float>>({{"name", std::string("src")}});
+            expect(graph.connect<"out", "in">(src, mid).has_value());
+            expect(graph.connect<"out", "in">(mid, sink).has_value());
+
+            gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::externalStep, gr::profiling::null::Profiler, FixedPriorityPolicy> sched;
+            sched.tie_break = tieBreak;
+            expect(sched.exchange(std::move(graph)).has_value());
+            expect(sched.changeStateTo(gr::lifecycle::State::INITIALISED).has_value());
+
+            std::string order;
+            for (const auto& block : (*sched.jobs())[0]) {
+                order += (order.empty() ? "" : ", ") + std::string(block->name());
+            }
+            std::ignore = sched.changeStateTo(gr::lifecycle::State::STOPPED);
+            return order;
+        };
+
+        using enum gr::scheduler::TieBreak;
+        expect(eq(orderUnder(registrationOrder), std::string("mid, sink, src"))) << "the default must reproduce the historic order exactly";
+        expect(eq(orderUnder(upstreamFirst), std::string("src, mid, sink"))) << "producers before the blocks they feed";
+        expect(eq(orderUnder(downstreamFirst), std::string("sink, mid, src"))) << "and the reverse drains first";
+    };
+
+    "the tie-break leaves round robin and dynamic-key policies alone"_test = [] {
+        // The scope boundary, made executable. Round robin keys on the position itself and is the
+        // baseline every measurement is taken against; EDF is never pre-sorted. Neither may move.
+        const auto orderUnder = [](auto policyTag, gr::scheduler::TieBreak tieBreak) {
+            using TPolicy = decltype(policyTag);
+            gr::Graph graph;
+            auto&     mid  = graph.emplaceBlock<gr::testing::Copy<float>>({{"name", std::string("mid")}});
+            auto&     sink = graph.emplaceBlock<gr::testing::Copy<float>>({{"name", std::string("sink")}});
+            auto&     src  = graph.emplaceBlock<gr::testing::Copy<float>>({{"name", std::string("src")}});
+            expect(graph.connect<"out", "in">(src, mid).has_value());
+            expect(graph.connect<"out", "in">(mid, sink).has_value());
+
+            gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::externalStep, gr::profiling::null::Profiler, TPolicy> sched;
+            sched.tie_break = tieBreak;
+            expect(sched.exchange(std::move(graph)).has_value());
+            expect(sched.changeStateTo(gr::lifecycle::State::INITIALISED).has_value());
+
+            std::string order;
+            for (const auto& block : (*sched.jobs())[0]) {
+                order += (order.empty() ? "" : ", ") + std::string(block->name());
+            }
+            std::ignore = sched.changeStateTo(gr::lifecycle::State::STOPPED);
+            return order;
+        };
+
+        const std::string registered{"mid, sink, src"};
+        expect(eq(orderUnder(RoundRobinPolicy{}, gr::scheduler::TieBreak::upstreamFirst), registered)) << "round robin must stay the historic sweep";
+        expect(eq(orderUnder(EdfPolicy{}, gr::scheduler::TieBreak::upstreamFirst), registered)) << "a dynamic-key policy is not pre-sorted at all";
     };
 
     "round robin gives one turn each; fixed priority re-selects within a pass"_test = [] {

@@ -2,6 +2,7 @@
 #define GNURADIO_SCHEDULINGPOLICY_HPP
 
 #include <algorithm>
+#include <cassert>
 #include <chrono>
 #include <concepts>
 #include <cstddef>
@@ -72,6 +73,28 @@ enum class SelectionStrategy : std::uint8_t {
     readyHeap   /// O(log n) per selection over a heap rebuilt once per pass
 };
 
+/// How the block list is ordered where two blocks compare equal under a task-level fixed-priority
+/// policy (`PriorityClass::fixedTask` -- fixed priority and rate monotonic). Applied once, when the
+/// list is first ordered; nothing during a pass consults it.
+///
+/// Round robin is deliberately outside this: it keys on the position itself, so it never ties, and
+/// it has to keep meaning "the historic sweep" to remain the baseline the other policies are
+/// measured against.
+enum class TieBreak : std::uint8_t {
+    registrationOrder, /// the block's position in its worker's job list -- the historic behaviour
+    upstreamFirst,     /// data-topological: a producer is ordered before every block it feeds
+    downstreamFirst    /// the reverse: drain what is already in flight before refilling it
+};
+
+[[nodiscard]] constexpr std::string_view toString(TieBreak tieBreak) noexcept {
+    switch (tieBreak) {
+    case TieBreak::upstreamFirst: return "upstream_first";
+    case TieBreak::downstreamFirst: return "downstream_first";
+    case TieBreak::registrationOrder: break;
+    }
+    return "registration_order";
+}
+
 /// Whether the ordering key is fixed once the schedule is formed, and the list can be pre-sorted.
 [[nodiscard]] constexpr bool hasStaticKey(PriorityClass priorityClass) noexcept { return priorityClass == PriorityClass::none || priorityClass == PriorityClass::fixedTask; }
 
@@ -130,6 +153,16 @@ struct JobQueue {
 
 struct SchedState {
     std::size_t index = 0UZ;
+
+    /// What orders this block against another of equal key. It is the block's position -- `index`
+    /// -- unless a task-level fixed-priority policy was asked for a data-topological order, which is
+    /// the only case where the two differ (`TieBreak`, `SchedulerBase::tie_break`). Resolved during
+    /// setup, so no pass pays for the choice, and kept apart from `index` so that round robin --
+    /// which keys on the position itself -- cannot be moved by a tie-break setting.
+    ///
+    /// N.B. a `SchedState` built by hand must set this beside `index`: the values have to be
+    /// distinct within a job list, or the ordering stops being a strict total order.
+    std::size_t tieBreak = 0UZ;
 
     /// Per-invocation batch ceiling, resolved once during setup and handed to `work()` as its
     /// requested work. Ceiling only: a batch *floor* has no enforcement path at this layer, since
@@ -265,16 +298,21 @@ struct EdfPolicy {
 
 static_assert(SchedulingPolicyLike<EdfPolicy>);
 
-/// The one ordering every selector must use: minimum key first, ties broken by registration order.
+/// The one ordering every selector must use: minimum key first, ties broken by `tieBreak` -- the
+/// block's position, unless `SchedulerBase::tie_break` asked a task-level fixed-priority policy for
+/// a data-topological order.
 ///
 /// Shared deliberately. A linear scan breaking ties by scan position and a heap breaking them by
 /// insertion order would disagree on equal keys, and the two would stop being comparable for reasons
-/// unrelated to either being wrong.
+/// unrelated to either being wrong. N.B. the ready heap (`Scheduler.hpp`) breaks ties on the block's
+/// *position*, which agrees with this only because the policies that use it keep `tieBreak == index`
+/// -- they are never pre-sorted, and never given a topological tie-break. Giving a dynamic-key
+/// policy one means bringing that comparator here too.
 template<typename TPolicy>
 [[nodiscard]] bool selectsBefore(const TPolicy& policy, const BlockModel& lhsBlock, const SchedState& lhs, const BlockModel& rhsBlock, const SchedState& rhs) {
     const auto lhsKey = policy.key(lhsBlock, lhs);
     const auto rhsKey = policy.key(rhsBlock, rhs);
-    return lhsKey == rhsKey ? lhs.index < rhs.index : lhsKey < rhsKey;
+    return lhsKey == rhsKey ? lhs.tieBreak < rhs.tieBreak : lhsKey < rhsKey;
 }
 
 /**
@@ -313,6 +351,19 @@ void applyStaticOrder(std::vector<std::shared_ptr<BlockModel>>& blocks, std::vec
         const TPolicy            policy{};
         std::vector<std::size_t> order(blocks.size());
         std::iota(order.begin(), order.end(), 0UZ);
+
+        // The sort below is unstable, so it is deterministic only if the comparison is a strict
+        // total order -- which rests entirely on the tie-breaks being distinct. A duplicate makes
+        // the resulting permutation arbitrary, and the symptom would be an intermittent reordering
+        // far from here, so it is caught at the source instead.
+        [[maybe_unused]] const auto tieBreaksAreDistinct = [&states] {
+            std::vector<std::size_t> tieBreaks;
+            tieBreaks.reserve(states.size());
+            std::ranges::transform(states, std::back_inserter(tieBreaks), &SchedState::tieBreak);
+            std::ranges::sort(tieBreaks);
+            return std::ranges::adjacent_find(tieBreaks) == tieBreaks.end();
+        };
+        assert(tieBreaksAreDistinct() && "SchedState::tieBreak must be distinct within a job list");
 
         std::ranges::sort(order, [&policy, &blocks, &states](std::size_t lhs, std::size_t rhs) { return selectsBefore(policy, *blocks[lhs], states[lhs], *blocks[rhs], states[rhs]); });
 
