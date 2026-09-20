@@ -79,6 +79,11 @@ struct DerivedAttributes {
     double      relativeRate = 1.0; /// invocations per invocation of the component's source; derived from the above
     std::size_t nominalBatch = 1UZ; /// batch the strategy assumed when sizing period/WCET
 
+    /// Position in a data-topological order of the graph: a block ranks before every block it
+    /// feeds, wherever the edges allow it (`gr::graph::topologicalOrder`). Offered to the scheduler
+    /// as a tie-break; it is not itself a priority and says nothing about urgency.
+    std::size_t topologicalIndex = 0UZ;
+
     /// The batch interval. `batchFloor` is the release threshold, `executionCeiling` what the
     /// worker requests -- `kUnboundedBatch` when nothing bounds it, which is what the scheduler
     /// passes today. `nominalBatch` is the modelling operating point and falls back to the
@@ -610,15 +615,18 @@ requires std::invocable<const TUserSetLookup&, const BlockModel&>
 
     const gr::graph::AdjacencyList                     adjacency = gr::graph::computeAdjacencyList(graph);
     const std::vector<std::shared_ptr<gr::BlockModel>> sources   = gr::graph::findSourceBlocks(adjacency);
+    const std::vector<std::size_t>                     topology  = gr::graph::topologicalOrder(graph.blocks(), adjacency);
 
-    for (const std::shared_ptr<BlockModel>& block : graph.blocks()) {
-        const BatchResolution batch = strategy.resolve(*block, schedulerCeiling);
+    for (std::size_t position = 0UZ; position < graph.blocks().size(); ++position) {
+        const std::shared_ptr<BlockModel>& block = graph.blocks()[position];
+        const BatchResolution              batch = strategy.resolve(*block, schedulerCeiling);
 
         DerivedAttributes attributes;
         attributes.batchFloor       = batch.floor;
         attributes.executionCeiling = batch.executionCeiling;
         attributes.nominalBatch     = batch.nominalBatch;
         attributes.batchOrigin      = batch.origin;
+        attributes.topologicalIndex = topology[position];
         analysis.perBlock.emplace(block.get(), attributes);
     }
 
@@ -848,23 +856,34 @@ requires std::invocable<const TUserSetLookup&, const BlockModel&>
         } // otherwise left unknown: never derived from the graph
     }
 
-    // rate-monotonic priority: shorter period -> larger value; user-set priorities are untouched
-    std::vector<const BlockModel*> byPeriod;
+    // Rate-monotonic priority: shorter period -> larger value; user-set priorities are untouched.
+    //
+    // One rank per *distinct* period, so blocks of equal period share a priority. Rate monotonic is
+    // defined over rate classes and says nothing about ordering two tasks of the same period;
+    // handing them distinct ranks would settle a scheduling question inside a derived value, where
+    // no policy can see it and no setting can change it. Equal periods are therefore a genuine tie,
+    // left for the scheduler to break (`SchedulingPolicy.hpp`, `selectsBefore`).
+    //
+    // N.B. periods are compared exactly. Two blocks agree only if their derivations produced the
+    // same float, which is the case for the uniform-rate graphs this matters on, and is the same
+    // comparison the previous ranking used.
+    std::vector<float> distinctPeriods;
     for (const std::shared_ptr<BlockModel>& block : graph.blocks()) {
         if (!userSet(*block).priority && analysis.perBlock.at(block.get()).period > 0.f) {
-            byPeriod.push_back(block.get());
+            distinctPeriods.push_back(analysis.perBlock.at(block.get()).period);
         }
     }
-    std::ranges::sort(byPeriod, [&](const BlockModel* lhs, const BlockModel* rhs) {
-        const float lhsPeriod = analysis.perBlock.at(lhs).period;
-        const float rhsPeriod = analysis.perBlock.at(rhs).period;
-        return lhsPeriod != rhsPeriod ? lhsPeriod < rhsPeriod : lhs->uniqueName() < rhs->uniqueName();
-    });
-    std::int32_t rank = static_cast<std::int32_t>(byPeriod.size());
-    for (const BlockModel* block : byPeriod) {
-        DerivedAttributes& attributes = analysis.perBlock.at(block);
-        attributes.priority           = rank--;
-        attributes.priorityOrigin     = AttributeOrigin::derivedFromRate;
+    std::ranges::sort(distinctPeriods);
+    distinctPeriods.erase(std::ranges::unique(distinctPeriods).begin(), distinctPeriods.end());
+
+    for (const std::shared_ptr<BlockModel>& block : graph.blocks()) {
+        DerivedAttributes& attributes = analysis.perBlock.at(block.get());
+        if (userSet(*block).priority || attributes.period <= 0.f) {
+            continue;
+        }
+        const auto rateClass      = std::ranges::lower_bound(distinctPeriods, attributes.period);
+        attributes.priority       = static_cast<std::int32_t>(distinctPeriods.size() - static_cast<std::size_t>(std::ranges::distance(distinctPeriods.begin(), rateClass)));
+        attributes.priorityOrigin = AttributeOrigin::derivedFromRate;
     }
 
     for (const std::shared_ptr<BlockModel>& block : graph.blocks()) {

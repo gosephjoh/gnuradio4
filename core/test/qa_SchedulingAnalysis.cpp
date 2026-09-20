@@ -298,6 +298,55 @@ const boost::ut::suite<"SchedulingAnalysis"> schedulingAnalysisTests = [] {
         }
     };
 
+    "equal periods are one rate class and share a priority"_test = [] {
+        // Rate monotonic orders rate *classes*. A uniform 1:1 chain is one class, so the derivation
+        // must report a tie rather than invent an order -- which it used to take from `uniqueName()`,
+        // making the schedule depend on C++ type names and on a global id compared as a string.
+        AnchoredChain g{atRate(1000.f)};
+        const auto    analysis = deriveSchedulingAttributes(g.graph, defaultStrategy, noneUserSet);
+
+        const std::int32_t priority = analysis.find(*g.src)->priority;
+        expect(priority > 0) << "an anchored block must still receive a priority";
+        expect(eq(analysis.find(*g.mid)->priority, priority)) << "equal periods must tie";
+        expect(eq(analysis.find(*g.sink)->priority, priority));
+    };
+
+    "a shorter period outranks a longer one"_test = [] {
+        // Two classes, not three blocks: the 8:1 decimator leaves src and dec sharing the input
+        // rate, and only the sink an eighth of it.
+        gr::Graph graph;
+        auto&     src  = graph.emplaceBlock<RateSource<float>>(atRate(1000.f));
+        auto&     dec  = graph.emplaceBlock<Decimate<float, 8U>>();
+        auto&     sink = graph.emplaceBlock<gr::testing::NullSink<float>>();
+        expect(graph.connect<"out", "in">(src, dec).has_value());
+        expect(graph.connect<"out", "in">(dec, sink).has_value());
+
+        const auto blocks   = graph.blocks();
+        const auto analysis = deriveSchedulingAttributes(graph, defaultStrategy, noneUserSet);
+
+        expect(eq(analysis.find(*blocks[0])->priority, 2)) << "the two blocks at the input rate share the higher rank";
+        expect(eq(analysis.find(*blocks[1])->priority, 2));
+        expect(eq(analysis.find(*blocks[2])->priority, 1)) << "and the eighth-rate sink ranks below them";
+    };
+
+    "the topological index follows the edges, not the registration order"_test = [] {
+        // Registered back to front on purpose: the index exists to give the scheduler a tie-break
+        // that means something, so it must contradict registration order when the edges do.
+        gr::Graph graph;
+        auto&     sink = graph.emplaceBlock<gr::testing::NullSink<float>>();
+        auto&     mid  = graph.emplaceBlock<gr::testing::Copy<float>>();
+        auto&     src  = graph.emplaceBlock<RateSource<float>>(atRate(1000.f));
+        expect(graph.connect<"out", "in">(src, mid).has_value());
+        expect(graph.connect<"out", "in">(mid, sink).has_value());
+
+        const auto blocks   = graph.blocks();
+        const auto analysis = deriveSchedulingAttributes(graph, defaultStrategy, noneUserSet);
+
+        expect(eq(analysis.find(*blocks[2])->topologicalIndex, 0UZ)) << "the source leads";
+        expect(eq(analysis.find(*blocks[1])->topologicalIndex, 1UZ));
+        expect(eq(analysis.find(*blocks[0])->topologicalIndex, 2UZ)) << "and the sink trails, although it was registered first";
+    };
+
     "an 8:1 decimator reduces the rate downstream of itself"_test = [] {
         // the coverage gap that mattered: every other topology here is 1:1, so a unit error in
         // the rate/period relationship would be invisible.
