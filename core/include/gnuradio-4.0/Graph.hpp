@@ -12,7 +12,9 @@
 #include <gnuradio-4.0/thread/thread_pool.hpp>
 
 #include <algorithm>
+#include <limits>
 #include <map>
+#include <queue>
 #include <tuple>
 #include <variant>
 
@@ -1094,6 +1096,77 @@ inline std::vector<std::shared_ptr<BlockModel>> findSourceBlocks(const Adjacency
     sources.erase(std::remove_if(sources.begin(), sources.end(), [&](const auto& b) { return destinations.contains(b); }), sources.end());
     std::sort(sources.begin(), sources.end(), [](const auto& a, const auto& b) { return a->name() < b->name(); });
     return sources;
+}
+
+/// Ranks `blocks` so that a producer precedes every block it feeds, returned parallel to `blocks`.
+///
+/// Kahn's algorithm, with the ready set drained in the order `blocks` are given -- which makes the
+/// result a function of the edge set and of that order alone. The adjacency's own iteration order is
+/// unspecified (it is an `unordered_map`) and deliberately does not reach the ranking.
+///
+/// A cycle leaves every one of its blocks with a remaining predecessor, so none of them ever becomes
+/// ready. The lowest-numbered block still unplaced is then admitted and the walk continues: the result
+/// stays total and reproducible, but the order *within* a loop carries no meaning. Blocks the
+/// adjacency does not mention -- including ones with no edges at all -- keep their given order.
+inline std::vector<std::size_t> topologicalOrder(std::span<const std::shared_ptr<BlockModel>> blocks, const AdjacencyList& adjacency) {
+    const std::size_t nBlocks = blocks.size();
+
+    std::unordered_map<const BlockModel*, std::size_t> positionOf;
+    positionOf.reserve(nBlocks);
+    for (std::size_t position = 0UZ; position < nBlocks; ++position) {
+        positionOf.emplace(blocks[position].get(), position);
+    }
+
+    std::vector<std::vector<std::size_t>> successors(nBlocks);
+    std::vector<std::size_t>              remainingPredecessors(nBlocks, 0UZ);
+    for (const auto& [sourceBlock, ports] : adjacency) {
+        const auto source = positionOf.find(sourceBlock.get());
+        if (source == positionOf.end()) {
+            continue; // the adjacency may name blocks that are not entries of `blocks`
+        }
+        for (const std::vector<const Edge*>& edges : ports | std::views::values) {
+            for (const Edge* edge : edges) {
+                if (const auto destination = positionOf.find(edge->destinationBlock().get()); destination != positionOf.end()) {
+                    successors[source->second].push_back(destination->second);
+                    ++remainingPredecessors[destination->second];
+                }
+            }
+        }
+    }
+
+    constexpr std::size_t    kUnplaced = std::numeric_limits<std::size_t>::max();
+    std::vector<std::size_t> rank(nBlocks, kUnplaced);
+
+    std::priority_queue<std::size_t, std::vector<std::size_t>, std::greater<>> ready;
+    for (std::size_t position = 0UZ; position < nBlocks; ++position) {
+        if (remainingPredecessors[position] == 0UZ) {
+            ready.push(position);
+        }
+    }
+
+    std::size_t nextRank    = 0UZ;
+    std::size_t breakInScan = 0UZ;
+    while (nextRank < nBlocks) {
+        if (ready.empty()) {
+            // every block left is inside a cycle: admit the lowest-numbered one and carry on
+            while (breakInScan < nBlocks && rank[breakInScan] != kUnplaced) {
+                ++breakInScan;
+            }
+            ready.push(breakInScan);
+        }
+
+        const std::size_t current = ready.top();
+        ready.pop();
+        rank[current] = nextRank++;
+
+        for (std::size_t successor : successors[current]) {
+            if (--remainingPredecessors[successor] == 0UZ && rank[successor] == kUnplaced) {
+                ready.push(successor);
+            }
+        }
+    }
+
+    return rank;
 }
 
 struct FeedbackLoop {

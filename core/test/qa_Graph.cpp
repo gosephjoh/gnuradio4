@@ -8,6 +8,7 @@
 #include <gnuradio-4.0/testing/NullSources.hpp>
 #include <gnuradio-4.0/testing/TagMonitors.hpp>
 
+#include <numeric>
 #include <optional>
 
 template<typename T, std::size_t nPorts>
@@ -1099,5 +1100,182 @@ const boost::ut::suite<"Graph::ungroupBlocks"> _ungroupBlocks = [] {
 };
 
 } // namespace group_blocks_test
+
+namespace topology {
+
+template<typename T>
+struct Split2 : gr::Block<Split2<T>> {
+    gr::PortIn<T>  in;
+    gr::PortOut<T> out0;
+    gr::PortOut<T> out1;
+
+    GR_MAKE_REFLECTABLE(Split2, in, out0, out1);
+
+    [[nodiscard]] constexpr std::tuple<T, T> processOne(T value) const noexcept { return {value, value}; }
+};
+
+template<typename T>
+struct Merge2 : gr::Block<Merge2<T>> {
+    gr::PortIn<T>  in0;
+    gr::PortIn<T>  in1;
+    gr::PortOut<T> out;
+
+    GR_MAKE_REFLECTABLE(Merge2, in0, in1, out);
+
+    [[nodiscard]] constexpr T processOne(T lhs, T rhs) const noexcept { return lhs + rhs; }
+};
+
+std::vector<std::size_t> ranksOf(const gr::Graph& graph) { return gr::graph::topologicalOrder(graph.blocks(), gr::graph::computeAdjacencyList(graph)); }
+
+/// Every rank appears exactly once -- what makes the ordering a strict total order, and therefore
+/// what makes an unstable sort keyed on it deterministic.
+bool isPermutation(const std::vector<std::size_t>& ranks) {
+    std::vector<std::size_t> sorted = ranks;
+    std::ranges::sort(sorted);
+    std::vector<std::size_t> expected(ranks.size());
+    std::iota(expected.begin(), expected.end(), 0UZ);
+    return sorted == expected;
+}
+
+} // namespace topology
+
+const boost::ut::suite<"graph::topologicalOrder"> _topologicalOrder = [] {
+    using namespace boost::ut;
+    using namespace gr;
+    using namespace gr::testing;
+
+    "a chain ranks each producer before its consumer"_test = [] {
+        Graph graph;
+        auto& src  = graph.emplaceBlock<NullSource<float>>();
+        auto& copy = graph.emplaceBlock<Copy<float>>();
+        auto& sink = graph.emplaceBlock<NullSink<float>>();
+        expect(graph.connect<"out", "in">(src, copy).has_value());
+        expect(graph.connect<"out", "in">(copy, sink).has_value());
+
+        const std::vector<std::size_t> ranks = topology::ranksOf(graph);
+
+        expect(topology::isPermutation(ranks));
+        expect(eq(ranks, std::vector<std::size_t>{0UZ, 1UZ, 2UZ})) << "a graph built in pipeline order must come back unchanged";
+    };
+
+    "the data flow outranks the registration order"_test = [] {
+        // The whole point: registration order is only the *seed*. Here it contradicts the edges,
+        // and the edges must win -- otherwise the result is registration order under another name.
+        Graph graph;
+        auto& sink = graph.emplaceBlock<NullSink<float>>();
+        auto& copy = graph.emplaceBlock<Copy<float>>();
+        auto& src  = graph.emplaceBlock<NullSource<float>>();
+        expect(graph.connect<"out", "in">(src, copy).has_value());
+        expect(graph.connect<"out", "in">(copy, sink).has_value());
+
+        const std::vector<std::size_t> ranks = topology::ranksOf(graph);
+
+        expect(topology::isPermutation(ranks));
+        expect(lt(ranks[2], ranks[1])) << "the source runs before the block it feeds";
+        expect(lt(ranks[1], ranks[0])) << "which runs before the sink";
+    };
+
+    "a diamond ranks the join after both branches"_test = [] {
+        Graph graph;
+        auto& src   = graph.emplaceBlock<NullSource<float>>();
+        auto& split = graph.emplaceBlock<topology::Split2<float>>();
+        auto& left  = graph.emplaceBlock<Copy<float>>();
+        auto& right = graph.emplaceBlock<Copy<float>>();
+        auto& merge = graph.emplaceBlock<topology::Merge2<float>>();
+        auto& sink  = graph.emplaceBlock<NullSink<float>>();
+        expect(graph.connect<"out", "in">(src, split).has_value());
+        expect(graph.connect<"out0", "in">(split, left).has_value());
+        expect(graph.connect<"out1", "in">(split, right).has_value());
+        expect(graph.connect<"out", "in0">(left, merge).has_value());
+        expect(graph.connect<"out", "in1">(right, merge).has_value());
+        expect(graph.connect<"out", "in">(merge, sink).has_value());
+
+        const std::vector<std::size_t> ranks = topology::ranksOf(graph);
+
+        expect(topology::isPermutation(ranks));
+        expect(lt(ranks[2], ranks[4])) << "the join waits for the left branch";
+        expect(lt(ranks[3], ranks[4])) << "and for the right one -- which a depth-first preorder would not guarantee";
+        expect(lt(ranks[4], ranks[5]));
+    };
+
+    "a feedback loop still yields a total order"_test = [] {
+        // No block in a cycle ever becomes ready, so the break-in rule decides. It is a convention,
+        // not a meaning: all that is pinned here is that the result stays total and reproducible.
+        Graph graph;
+        auto& a = graph.emplaceBlock<Copy<float>>();
+        auto& b = graph.emplaceBlock<Copy<float>>();
+        auto& c = graph.emplaceBlock<Copy<float>>();
+        expect(graph.connect<"out", "in">(a, b).has_value());
+        expect(graph.connect<"out", "in">(b, c).has_value());
+        expect(graph.connect<"out", "in">(c, a).has_value());
+
+        const std::vector<std::size_t> ranks = topology::ranksOf(graph);
+
+        expect(topology::isPermutation(ranks));
+        expect(eq(ranks, std::vector<std::size_t>{0UZ, 1UZ, 2UZ})) << "the lowest-numbered block breaks the cycle, and the rest follows it";
+        expect(eq(ranks, topology::ranksOf(graph))) << "and the choice is reproducible";
+    };
+
+    "a self-loop is a cycle of one"_test = [] {
+        Graph graph;
+        auto& src  = graph.emplaceBlock<NullSource<float>>();
+        auto& copy = graph.emplaceBlock<Copy<float>>();
+        expect(graph.connect<"out", "in">(src, copy).has_value());
+        expect(graph.connect<"out", "in">(copy, copy).has_value());
+
+        const std::vector<std::size_t> ranks = topology::ranksOf(graph);
+
+        expect(topology::isPermutation(ranks));
+        expect(lt(ranks[0], ranks[1])) << "the edge that is not a self-loop still orders the two";
+    };
+
+    "disconnected components and isolated blocks are ranked, not dropped"_test = [] {
+        // `computeAdjacencyList` keys only blocks with *outgoing* edges, so an isolated block is
+        // neither a source nor reachable. Taking the block list as the node set is what keeps it.
+        Graph graph;
+        auto& srcA     = graph.emplaceBlock<NullSource<float>>();
+        auto& isolated = graph.emplaceBlock<NullSink<float>>();
+        auto& sinkA    = graph.emplaceBlock<NullSink<float>>();
+        auto& srcB     = graph.emplaceBlock<NullSource<float>>();
+        auto& sinkB    = graph.emplaceBlock<NullSink<float>>();
+        expect(graph.connect<"out", "in">(srcA, sinkA).has_value());
+        expect(graph.connect<"out", "in">(srcB, sinkB).has_value());
+        std::ignore = isolated;
+
+        const std::vector<std::size_t> ranks = topology::ranksOf(graph);
+
+        expect(eq(ranks.size(), 5UZ)) << "every block is ranked";
+        expect(topology::isPermutation(ranks));
+        expect(lt(ranks[0], ranks[2])) << "each component is ordered internally";
+        expect(lt(ranks[3], ranks[4]));
+        expect(eq(ranks[1], 1UZ)) << "an isolated block keeps its registration position";
+    };
+
+    "renaming a block cannot change the ranking"_test = [] {
+        // Guards the *seed*. The ranking takes no names at all, and the obvious way to reintroduce a
+        // dependence on one is to reseed it from `findSourceBlocks`, which sorts by `name()`.
+        Graph graph;
+        auto& src  = graph.emplaceBlock<NullSource<float>>();
+        auto& copy = graph.emplaceBlock<Copy<float>>();
+        auto& sink = graph.emplaceBlock<NullSink<float>>();
+        expect(graph.connect<"out", "in">(src, copy).has_value());
+        expect(graph.connect<"out", "in">(copy, sink).has_value());
+
+        const std::vector<std::size_t> before = topology::ranksOf(graph);
+        src.name                              = "zzz_renamed_to_sort_last";
+        sink.name                             = "aaa_renamed_to_sort_first";
+
+        expect(eq(before, topology::ranksOf(graph)));
+    };
+
+    "empty and single-block graphs"_test = [] {
+        Graph empty;
+        expect(topology::ranksOf(empty).empty());
+
+        Graph single;
+        std::ignore = single.emplaceBlock<NullSource<float>>();
+        expect(eq(topology::ranksOf(single), std::vector<std::size_t>{0UZ}));
+    };
+};
 
 int main() { /* not needed for UT */ }
