@@ -8,6 +8,7 @@
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string_view>
 #include <type_traits>
 #include <utility>
@@ -81,7 +82,7 @@ enum class Category : std::uint32_t {
     /// Exact per-invocation sample counts from inside `work()`. Appended rather than slotted next to
     /// `workPhases`, because `categoryMask` is written into the `.gr4trace` header: renumbering a bit
     /// would silently change what an already-written capture's mask means, with no version to signal it.
-    workExact     = 1U << 8
+    workExact = 1U << 8
 };
 
 /// One past the last `Kind`, so a test can walk every enumerator. `categoryOf`'s own completeness is
@@ -175,16 +176,19 @@ namespace flag {
 /// cannot silently compare a round-robin trace against an EDF one.
 inline constexpr std::uint8_t kLoopKindMask = 0b0000'0011U;
 
-inline constexpr std::uint8_t kIsSource         = 1U << 2; /// `Kind::workEnd`: performed_work is processedOut
-inline constexpr std::uint8_t kJobBacked        = 1U << 3; /// `Kind::work*`: ran against a released job
-inline constexpr std::uint8_t kBoundHit         = 1U << 0; /// `Kind::sweep`: the selection bound was reached
-inline constexpr std::uint8_t kViaStep          = 1U << 1; /// `Kind::sweep`: `externalStep`, not a pool worker
-inline constexpr std::uint8_t kDidAdopt         = 1U << 0; /// `Kind::messagePhase`
-inline constexpr std::uint8_t kDidRemove        = 1U << 1; /// `Kind::messagePhase`
-inline constexpr std::uint8_t kDidReap          = 1U << 2; /// `Kind::messagePhase`
-inline constexpr std::uint8_t kDidHouseKeep     = 1U << 3; /// `Kind::messagePhase`
-inline constexpr std::uint8_t kDidStateSync     = 1U << 4; /// `Kind::messagePhase`
-inline constexpr std::uint8_t kListChanged      = 1U << 0; /// `Kind::stateSync`: the block list actually moved
+inline constexpr std::uint8_t kIsSource     = 1U << 2; /// `Kind::workEnd`: performed_work is processedOut
+inline constexpr std::uint8_t kJobBacked    = 1U << 3; /// `Kind::work*`: ran against a released job
+inline constexpr std::uint8_t kBoundHit     = 1U << 0; /// `Kind::sweep`: the selection bound was reached
+inline constexpr std::uint8_t kViaStep      = 1U << 1; /// `Kind::sweep`: `externalStep`, not a pool worker
+inline constexpr std::uint8_t kDidAdopt     = 1U << 0; /// `Kind::messagePhase`
+inline constexpr std::uint8_t kDidRemove    = 1U << 1; /// `Kind::messagePhase`
+inline constexpr std::uint8_t kDidReap      = 1U << 2; /// `Kind::messagePhase`
+inline constexpr std::uint8_t kDidHouseKeep = 1U << 3; /// `Kind::messagePhase`
+inline constexpr std::uint8_t kDidStateSync = 1U << 4; /// `Kind::messagePhase`
+inline constexpr std::uint8_t kListChanged  = 1U << 0; /// `Kind::stateSync`: the block list actually moved
+/// `Kind::workerStop`: `payload2` holds a real on-core time. Distinguishes a platform with no
+/// thread-CPU clock from a worker that consumed nothing -- a bare zero would read as total preemption.
+inline constexpr std::uint8_t kThreadCpuValid   = 1U << 0;
 inline constexpr std::uint8_t kQuiescenceDenied = 1U << 5; /// `Kind::messagePhase`: the work guard refused the pass
 
 /// `Kind::jobRelease`. Clear means the per-sweep backstop released it; set means the event-driven
@@ -495,6 +499,19 @@ inline constexpr std::size_t kDefaultRingCapacity = 65536UZ;
 /// The CPU this thread is running on, or -1 where the platform cannot say. Read once per worker at
 /// start-up and never on the hot path: it is the thread-to-core mapping a report needs in order to
 /// explain why two workers that ought to be independent are not.
+/**
+ * The calling thread's consumed CPU time in nanoseconds, or nothing where the platform cannot say.
+ *
+ * Distinct from `now()` in both meaning and cost. `now()` is wall-clock and reads from the vDSO in
+ * ~25 ns; this is the time the thread actually spent **on a core**, and on Linux it is a real
+ * syscall — hundreds of nanoseconds. It is therefore read exactly **twice per worker thread, ever**,
+ * at the ends of the worker loop, and never on a marker path.
+ *
+ * Empty rather than zero when unavailable: a zero would be indistinguishable from a thread that
+ * consumed no CPU, which is the one reading that would mislead a reader into seeing total preemption.
+ */
+[[nodiscard]] std::optional<std::uint64_t> threadCpuNow() noexcept;
+
 [[nodiscard]] std::int32_t currentCpu() noexcept;
 
 void                        setCategories(std::uint32_t mask) noexcept;

@@ -34,6 +34,9 @@
 #if defined(CLOCK_MONOTONIC)
 #define GR_TRACE_HAS_CLOCK_GETTIME 1
 #endif
+#if defined(CLOCK_THREAD_CPUTIME_ID)
+#define GR_TRACE_HAS_THREAD_CPUTIME 1
+#endif
 #endif
 #endif
 #endif
@@ -238,6 +241,18 @@ Ring* createThreadRing() noexcept {
 }
 
 } // namespace detail
+
+std::optional<std::uint64_t> threadCpuNow() noexcept {
+#if defined(GR_TRACE_HAS_THREAD_CPUTIME)
+    ::timespec ts{};
+    if (::clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) != 0) {
+        return std::nullopt;
+    }
+    return static_cast<std::uint64_t>(ts.tv_sec) * 1'000'000'000UL + static_cast<std::uint64_t>(ts.tv_nsec);
+#else
+    return std::nullopt; // no per-thread CPU clock here; a report must say so rather than assume zero
+#endif
+}
 
 std::int32_t currentCpu() noexcept {
 #if defined(GR_TRACE_HAS_SCHED_GETCPU)

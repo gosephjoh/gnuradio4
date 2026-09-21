@@ -193,6 +193,12 @@ int main() {
         scope.finish(2UL);
     });
 
+    // Read twice per worker thread for the whole of its life, never on a marker path -- so this is
+    // reported for honesty about what T4h added, not because it is on any hot path. On Linux it is a
+    // real syscall rather than a vDSO read, which is exactly why it is not on one.
+    std::uint64_t cpuSink       = 0UL;
+    const double  threadCpuRead = nanosPerOp([&cpuSink](std::uint32_t) { cpuSink += gr::trace::threadCpuNow().value_or(0UL); });
+
     setCategories(0U);
     reset();
 
@@ -203,6 +209,10 @@ int main() {
     std::print("{:<44} {:>10.2f}\n", "now(), one clock read", clockRead);
     std::print("{:<44} {:>10.2f}\n", "Scope, two clock reads", scopePaired);
     std::print("{:<44} {:>10.2f}\n", "Scope, both instants supplied", scopeChained);
+    std::print("{:<44} {:>10.2f}\n", "threadCpuNow(), 2x per worker lifetime", threadCpuRead);
+    if (cpuSink == 0UL) {
+        std::print("(the thread-CPU clock returned nothing on this platform)\n");
+    }
 
     if constexpr (!kEnabled) {
         std::print("\nTracing is COMPILED OUT, so every emit path above is 0.00 by construction:\n");
@@ -268,9 +278,9 @@ int main() {
         // inside, so the difference between these two rows is `workExact`'s own cost and nothing
         // else. `workPhases` is expected to be the expensive one -- four scopes against one -- and
         // the point of printing it is that the figure is stated rather than discovered later.
-        const RunResult boundary  = bestOf(categoryMask(Category::work), batchCeiling);
-        const RunResult exact     = bestOf(categoryMask(Category::work, Category::workExact), batchCeiling);
-        const RunResult phases    = bestOf(categoryMask(Category::work, Category::workExact, Category::workPhases), batchCeiling);
+        const RunResult boundary = bestOf(categoryMask(Category::work), batchCeiling);
+        const RunResult exact    = bestOf(categoryMask(Category::work, Category::workExact), batchCeiling);
+        const RunResult phases   = bestOf(categoryMask(Category::work, Category::workExact, Category::workPhases), batchCeiling);
 
         std::print("\n{}\n", title);
         std::print("{:<32} {:>9} {:>10} {:>10} {:>11}\n", "configuration", "ms", "vs mask 0", "records", "ns/record");

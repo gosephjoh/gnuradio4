@@ -757,6 +757,237 @@ struct ChainLatency {
     return out;
 }
 
+/**
+ * @brief How one worker thread spent its life, decomposed.
+ *
+ * Answers "is this flowgraph limited by its blocks or by its scheduler?" — the time a worker spent
+ * inside block `work()` code, against the time it was alive.
+ *
+ * **Terms** are disjoint spans of the lifetime that sum to it: `messagePhaseNs`, `sweepNs`, `idleNs`
+ * and the `unaccountedNs` residual, with block execution nested inside the sweep. **Metrics** are
+ * ratios between terms and are never added to anything.
+ *
+ * `occupancy` is block time over the whole life; `utilisation` excludes time the worker deliberately
+ * waited, so a starved worker reads as 0 % occupied but can still be fully utilised over the little
+ * time it was trying to work. Both are wall-clock fractions. `utilisation` is **not** block time
+ * over CPU time: that mixes a wall numerator with a CPU denominator and exceeds 1 as soon as the
+ * worker is preempted mid-`work()`, which is precisely when a reader most needs it to be sound.
+ */
+struct WorkerUtilisation {
+    std::uint8_t workerId = 0U;
+    bool         computed = false;
+    std::string  reason; /// why not, when `!computed`; carries the offending numbers
+
+    std::uint64_t lifetimeNs        = 0UL;
+    std::uint64_t blockProductiveNs = 0UL;
+    std::uint64_t blockProbeNs      = 0UL;
+    std::uint64_t sweepNs           = 0UL;
+    std::uint64_t messagePhaseNs    = 0UL;
+    std::uint64_t idleNs            = 0UL;
+    std::uint64_t unaccountedNs     = 0UL;
+
+    /// On-core time, from the worker's own `CLOCK_THREAD_CPUTIME_ID` delta. Absent rather than zero
+    /// where the platform has no such clock: a zero would read as total preemption.
+    bool          hasThreadCpuTime  = false;
+    std::uint64_t threadCpuNs       = 0UL;
+    std::uint64_t preemptionNs      = 0UL;   /// off-core involuntarily: lifetime - cpu - idle, clamped
+    bool          preemptionClamped = false; /// the clamp fired, so an assumption behind it bent
+
+    double occupancy      = 0.0;   /// (productive + probe) / lifetime
+    double utilisation    = 0.0;   /// (productive + probe) / (lifetime - idle); 0 when never active
+    bool   hasUtilisation = false; /// false when the worker only ever idled, so the ratio is undefined
+
+    [[nodiscard]] std::uint64_t blockNs() const noexcept { return blockProductiveNs + blockProbeNs; }
+};
+
+namespace detail {
+
+/// Sums the durations of one kind for one worker, reporting whether any of them had saturated. A
+/// saturated duration makes the sum a *lower bound*, which cannot be divided into a percentage.
+struct DurationSum {
+    std::uint64_t total     = 0UL;
+    bool          saturated = false;
+    std::size_t   count     = 0UZ;
+};
+
+[[nodiscard]] inline DurationSum sumDurations(std::span<const Event> events, std::uint8_t worker, Kind kind) {
+    DurationSum sum;
+    for (const Event& event : events) {
+        if (event.kind != kind || event.workerId != worker) {
+            continue;
+        }
+        ++sum.count;
+        sum.saturated = sum.saturated || event.durationNs == kSaturated;
+        sum.total += event.durationNs;
+    }
+    return sum;
+}
+
+} // namespace detail
+
+/// Microseconds, because the payload word is 32 bits and nanoseconds would overflow it after 4.295 s.
+inline constexpr std::uint64_t kThreadCpuScaleNs = 1000UL;
+
+/**
+ * One entry per worker that emitted anything, whether or not its figures could be computed.
+ *
+ * Refuses **per worker** rather than per capture: one thread with a mangled lifetime says nothing
+ * about the others, and a partial answer is worth having so long as it is never a partial *number*.
+ */
+[[nodiscard]] inline std::vector<WorkerUtilisation> workerUtilisation(std::span<const Event> events, std::uint64_t lostRecords) {
+    std::vector<std::uint8_t> workers;
+    bool                      sawViaStep = false;
+    for (const Event& event : events) {
+        if (std::ranges::find(workers, event.workerId) == workers.end()) {
+            workers.push_back(event.workerId);
+        }
+        sawViaStep = sawViaStep || (event.kind == Kind::sweep && (event.flags & flag::kViaStep) != 0U);
+    }
+    std::ranges::sort(workers);
+
+    std::vector<WorkerUtilisation> out;
+    out.reserve(workers.size());
+    for (const std::uint8_t worker : workers) {
+        WorkerUtilisation w{.workerId = worker};
+
+        // Before anything is summed. With a wrapped ring the terms cover a truncated window while the
+        // lifetime spans the whole run, so every ratio understates by an unknowable amount -- and the
+        // interval-clipping problem disappears entirely once this is refused rather than warned about.
+        if (lostRecords > 0UL) {
+            w.reason = std::format("{} records were lost, so the sums cover a shorter window than the lifetime they would be divided by", lostRecords);
+            out.push_back(std::move(w));
+            continue;
+        }
+        if (worker == kWorkerOverflow) {
+            w.reason = std::format("worker id {} is the saturation bucket into which every thread past {} folds, so it names no single thread", kWorkerOverflow, kWorkerOverflow - 1U);
+            out.push_back(std::move(w));
+            continue;
+        }
+
+        const Event* started = nullptr;
+        const Event* stopped = nullptr;
+        std::size_t  nStarts = 0UZ;
+        std::size_t  nStops  = 0UZ;
+        for (const Event& event : events) {
+            if (event.workerId != worker) {
+                continue;
+            }
+            if (event.kind == Kind::workerStart) {
+                started = &event;
+                ++nStarts;
+            } else if (event.kind == Kind::workerStop) {
+                stopped = &event;
+                ++nStops;
+            }
+        }
+
+        if (started == nullptr || stopped == nullptr) {
+            w.reason = sawViaStep ? std::string("the capture was taken under ExecutionPolicy::externalStep, which has no worker loop: step() runs on the caller's thread, so there is no worker whose lifetime this could be a fraction of") : std::string("no workerStart/workerStop pair for this worker -- enable Category::lifecycle, or the capture was written while the worker was still running");
+            out.push_back(std::move(w));
+            continue;
+        }
+        if (nStarts != 1UZ || nStops != 1UZ) {
+            w.reason = std::format("expected exactly one workerStart and one workerStop, found {} and {}", nStarts, nStops);
+            out.push_back(std::move(w));
+            continue;
+        }
+        if (stopped->startNs <= started->startNs) {
+            w.reason = std::format("workerStop at {} ns does not follow workerStart at {} ns", stopped->startNs, started->startNs);
+            out.push_back(std::move(w));
+            continue;
+        }
+
+        w.lifetimeNs = stopped->startNs - started->startNs;
+
+        const detail::DurationSum sweep    = detail::sumDurations(events, worker, Kind::sweep);
+        const detail::DurationSum message  = detail::sumDurations(events, worker, Kind::messagePhase);
+        const detail::DurationSum idle     = detail::sumDurations(events, worker, Kind::idle);
+        const detail::DurationSum produced = detail::sumDurations(events, worker, Kind::workEnd);
+
+        std::uint64_t probeNs        = 0UL;
+        bool          probeSaturated = false;
+        for (const Event& event : events) {
+            if (event.kind == Kind::workProbe && event.workerId == worker) {
+                probeSaturated = probeSaturated || event.payload1 == kSaturated;
+                probeNs += event.payload1;
+            }
+        }
+
+        // A saturated term is a lower bound, not a value. It can never cause a *false* containment
+        // failure -- it only ever makes a sum smaller -- but every percentage derived from it
+        // understates, so it is caught here by name rather than indirectly by an invariant that would
+        // then report the wrong cause.
+        if (sweep.saturated || message.saturated || idle.saturated || produced.saturated || probeSaturated) {
+            w.reason = "an interval exceeded the 4.295 s the duration field can hold, so at least one term is a lower bound rather than a value";
+            out.push_back(std::move(w));
+            continue;
+        }
+
+        w.sweepNs           = sweep.total;
+        w.messagePhaseNs    = message.total;
+        w.idleNs            = idle.total;
+        w.blockProductiveNs = produced.total;
+        w.blockProbeNs      = probeNs;
+
+        // Containment, exact. The markers are structurally nested -- a workEnd lies wholly inside the
+        // sweep that produced it, invocations within a worker are sequential, and messagePhase/sweep/
+        // idle occupy successive regions of one loop iteration -- so there is no skew to absorb and a
+        // violation by one nanosecond is a genuine fault rather than noise.
+        if (w.blockNs() > w.sweepNs) {
+            w.reason = std::format("block execution ({} ns productive + {} ns probing) exceeds the {} ns of sweeps that must contain it", w.blockProductiveNs, w.blockProbeNs, w.sweepNs);
+            out.push_back(std::move(w));
+            continue;
+        }
+        const std::uint64_t accounted = w.messagePhaseNs + w.sweepNs + w.idleNs;
+        if (accounted > w.lifetimeNs) {
+            w.reason = std::format("sweep {} ns + messages {} ns + idle {} ns = {} ns exceeds the {} ns lifetime that must contain them", w.sweepNs, w.messagePhaseNs, w.idleNs, accounted, w.lifetimeNs);
+            out.push_back(std::move(w));
+            continue;
+        }
+        w.unaccountedNs = w.lifetimeNs - accounted;
+
+        if ((stopped->flags & flag::kThreadCpuValid) != 0U) {
+            // The same rule the interval terms follow: a clipped reading is a lower bound, not a
+            // value. Believing it would report the gap between the true on-core time and the clipped
+            // one as preemption that never happened. Reachable without the lost-records refusal
+            // intervening -- a long run with only `lifecycle` live emits two records per worker, so
+            // the ring never wraps and the 71-minute ceiling is what gives way first.
+            if (stopped->payload2 == kSaturated) {
+                w.reason = std::format("the on-core time exceeded the {} minutes the field can hold, so it is a lower bound rather than a value", (std::uint64_t{kSaturated} * kThreadCpuScaleNs) / 60'000'000'000UL);
+                out.push_back(std::move(w));
+                continue;
+            }
+            w.hasThreadCpuTime = true;
+            w.threadCpuNs      = static_cast<std::uint64_t>(stopped->payload2) * kThreadCpuScaleNs;
+            if (w.threadCpuNs > w.lifetimeNs) {
+                w.reason = std::format("on-core time {} ns exceeds the {} ns the worker was alive, which no single thread can do", w.threadCpuNs, w.lifetimeNs);
+                out.push_back(std::move(w));
+                continue;
+            }
+            // Idling is a genuine blocking wait, so it consumes no CPU and is subtracted out to leave
+            // *involuntary* time off-core. The clamp is still needed -- not every idle reason is
+            // guaranteed to block, and the two clocks are read microseconds apart -- and when it fires
+            // it is recorded rather than hidden, because it means one of those assumptions bent.
+            const std::uint64_t offCore = w.lifetimeNs - w.threadCpuNs;
+            w.preemptionClamped         = offCore < w.idleNs;
+            w.preemptionNs              = w.preemptionClamped ? 0UL : offCore - w.idleNs;
+        }
+
+        w.occupancy = static_cast<double>(w.blockNs()) / static_cast<double>(w.lifetimeNs);
+        if (w.lifetimeNs > w.idleNs) {
+            w.hasUtilisation = true;
+            w.utilisation    = static_cast<double>(w.blockNs()) / static_cast<double>(w.lifetimeNs - w.idleNs);
+        }
+        // else: the worker only ever idled. Occupancy of 0 % is true and meaningful; "share of active
+        // time" has none, and reporting it as 0 % would present an idle worker as a busy one that
+        // achieved nothing.
+
+        w.computed = true;
+        out.push_back(std::move(w));
+    }
+    return out;
+}
+
 [[nodiscard]] inline property_map report(std::span<const Event> events, std::uint64_t lostRecords) {
     property_map out;
     out["records"] = events.size();
