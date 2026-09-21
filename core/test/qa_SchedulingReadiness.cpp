@@ -343,7 +343,8 @@ const boost::ut::suite<"readiness predicate vs work()"> crossCheckTests = [] {
     // `availableToProcess`, so `computeSampleLimits()` folds `requestedWork` through unchanged and
     // `performed_work` comes back equal to it -- with both input buffers empty, nothing consumed
     // and nothing published. Any loop treating `performed_work > 0` as "this block did something"
-    // is therefore misled by such a block; M2e's selection loop restarts on exactly that signal.
+    // is therefore misled by such a block; the fixed-priority selection loop restarts on exactly
+    // that signal.
     "performed_work is non-zero for an idle all-asynchronous block"_test = [] {
         TwoInput<Join2Async<float>, "in0", "in1"> harness;
         harness.prime(0UZ, 0UZ);

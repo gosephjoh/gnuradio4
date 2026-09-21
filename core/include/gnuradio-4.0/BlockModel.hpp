@@ -492,6 +492,19 @@ public:
 
     [[nodiscard]] virtual work::Result work(std::size_t requested_work) = 0;
 
+    /**
+     * Caches the interned trace identity inside the wrapped block, so a marker in `Block::work()` can
+     * name itself. Identities are interned against the `BlockModel` address, but `BlockWrapper<T>`
+     * holds its block as `std::conditional_t<kOwning, T, T*>` -- by value or by pointer, and in
+     * neither case at the model's own address -- so `this` inside `Block::workInternal` is a
+     * different address and no lookup from there would find the right entry.
+     *
+     * Called by the scheduler on its house-keeping cadence, never per invocation. Defaulted to a no-op
+     * rather than pure so that a `BlockModel` implementation outside this repository keeps compiling;
+     * in-tree, `BlockWrapper` is the only implementation and it overrides.
+     */
+    virtual void setTraceEntityId(gr::trace::EntityId) noexcept {}
+
     [[nodiscard]] virtual work::Status draw(const property_map& config = {}) = 0;
 
     [[nodiscard]] virtual block::Category blockCategory() const { return block::Category::NormalBlock; }
@@ -775,6 +788,12 @@ public:
     }
 
     [[nodiscard]] constexpr work::Result work(std::size_t requested_work = undefined_size) override { return blockRef().work(requested_work); }
+
+    void setTraceEntityId(gr::trace::EntityId entityId) noexcept override {
+        if constexpr (requires { blockRef()._traceEntityId = entityId; }) {
+            blockRef()._traceEntityId = entityId;
+        }
+    }
 
     constexpr work::Status draw(const property_map& config = {}) override {
         if constexpr (requires { blockRef().draw(config); }) {

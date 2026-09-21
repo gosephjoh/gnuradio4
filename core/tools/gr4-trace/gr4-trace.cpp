@@ -1,0 +1,332 @@
+#include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <fstream>
+#include <optional>
+#include <print>
+#include <span>
+#include <string>
+#include <string_view>
+#include <vector>
+
+#include <gnuradio-4.0/TraceCatapult.hpp>
+#include <gnuradio-4.0/TraceFile.hpp>
+#include <gnuradio-4.0/TraceReport.hpp>
+
+/**
+ * `gr4-trace` — read a `.gr4trace` capture and say something useful about it.
+ *
+ * A front end, deliberately: every answer it gives comes from `load()`, `timingReport()` and
+ * `catapultJson()`, all of which are tested directly. Putting the logic here instead would move it
+ * somewhere no test can reach, which is how command-line tools come to be the least trustworthy part
+ * of a codebase.
+ *
+ * It is built whether or not tracing is compiled in, because reading a capture and producing one are
+ * unrelated: an engineer analysing a trace from a traced build is usually not running one.
+ */
+namespace {
+
+using namespace gr::trace;
+
+/// Keeps the distinguishing tail of a long block name. `gr::testing::ConstantSource<float32>#9`
+/// truncated from the right becomes `gr::testing::ConstantSource<float3`, which loses both the type
+/// argument and the instance number -- the two parts that tell one block from another.
+[[nodiscard]] std::string elide(std::string_view name, std::size_t width) {
+    if (name.size() <= width) {
+        return std::string(name);
+    }
+    return std::string("\u2026") + std::string(name.substr(name.size() - (width - 1UZ)));
+}
+
+/// A number of nanoseconds a person can read at a glance.
+[[nodiscard]] std::string humanNs(double nanoseconds) {
+    if (nanoseconds < 1e3) {
+        return std::format("{:.0f} ns", nanoseconds);
+    }
+    if (nanoseconds < 1e6) {
+        return std::format("{:.2f} µs", nanoseconds / 1e3);
+    }
+    return std::format("{:.2f} ms", nanoseconds / 1e6);
+}
+
+template<typename T>
+[[nodiscard]] T fieldOr(const gr::property_map& map, std::string_view key, T fallback) {
+    const auto it = map.find(key);
+    return it != map.end() ? (*it).second.value_or(std::move(fallback)) : fallback;
+}
+
+[[nodiscard]] gr::property_map nestedOr(const gr::property_map& map, std::string_view key) {
+    const auto it = map.find(key);
+    if (it == map.end()) {
+        return {};
+    }
+    const gr::pmt::Value value = (*it).second;
+    return value.value_or(gr::property_map{});
+}
+
+int usage() {
+    std::println(stderr, "usage: gr4-trace <command> <capture.gr4trace> [output]");
+    std::println(stderr, "");
+    std::println(stderr, "  report    <capture>            per-block cost, jitter and marginal-cost fit");
+    std::println(stderr, "  catapult  <capture> <out.json> [block ...] Chrome trace JSON, for ui.perfetto.dev");
+    std::println(stderr, "            naming a source-to-sink chain adds latency flow arrows");
+    std::println(stderr, "            --lockstep  assume one invocation per successor invocation,");
+    std::println(stderr, "                        instead of walking recorded stream positions");
+    std::println(stderr, "  utilisation <capture>          per worker: where its time went, and how much it held a core");
+    std::println(stderr, "  summary   <capture>            header fields and a record census");
+    return 2;
+}
+
+void printHeader(const Capture& capture) {
+    std::println("{:<22} {}", "records", capture.events.size());
+    std::println("{:<22} {}", "identities", capture.entities.size());
+    if (capture.header.lostCount > 0UL) {
+        // Said first and said plainly. Every figure below understates by an unknown amount, and a
+        // reader who misses this will draw conclusions the capture cannot support.
+        std::println("{:<22} {}  <-- records were evicted; everything below understates", "LOST", capture.header.lostCount);
+    }
+    std::println("{:<22} {}", "emitting threads", capture.header.ringCount);
+    std::println("{:<22} 0x{:02x}", "categories live", capture.header.categoryMask);
+    std::println("{:<22} {} ns", "clock read cost", capture.header.clockCostNs);
+}
+
+int commandSummary(const Capture& capture) {
+    printHeader(capture);
+
+    std::map<std::string_view, std::size_t> census;
+    for (const Event& event : capture.events) {
+        ++census[detail::kindName(event.kind)];
+    }
+    std::println("");
+    std::println("{:<22} {:>9}", "record kind", "count");
+    for (const auto& [kind, count] : census) {
+        std::println("{:<22} {:>9}", kind, count);
+    }
+    return 0;
+}
+
+int commandReport(const Capture& capture) {
+    printHeader(capture);
+
+    const gr::property_map timing = timingReport(capture.events, capture.entities);
+    const gr::property_map tardy  = report(capture.events, capture.header.lostCount);
+
+    std::println("");
+    std::println("{:<22} {}", "cost samples used", fieldOr<std::uint64_t>(timing, "invocations", 0UL));
+    std::println("{:<22} {} unsuccessful, {} saturated, {} unattributed", "... and discarded", fieldOr<std::uint64_t>(timing, "rejected_status", 0UL), fieldOr<std::uint64_t>(timing, "rejected_saturated", 0UL), fieldOr<std::uint64_t>(timing, "rejected_no_entity", 0UL));
+
+    const gr::property_map blocks = nestedOr(timing, "blocks");
+    if (blocks.empty()) {
+        std::println("");
+        std::println("no per-block cost in this capture: it carries no successful work records");
+    } else {
+        std::println("");
+        std::println("{:<38} {:>7} {:>11} {:>11} {:>11}  {}", "block", "calls", "average", "jitter", "worst", "marginal cost");
+        for (const auto& entry : blocks) {
+            const gr::pmt::Value   value = entry.second;
+            const gr::property_map block = value.value_or(gr::property_map{});
+            const std::string      fit   = fieldOr<std::string>(block, "fit", std::string("low-confidence"));
+
+            // A refused fit prints the reason, never a number. The whole point of withholding the
+            // slope is undone by a tool that prints something in its place.
+            const std::string marginal = fit == "identifiable" //
+                                             ? std::format("{:.3f} ns/item + {} per call", fieldOr<double>(block, "item_cost_ns", 0.0), humanNs(fieldOr<double>(block, "invocation_cost_ns", 0.0)))
+                                             : std::format("not identifiable: {}", fieldOr<std::string>(block, "fit_reason", std::string("unknown")));
+
+            std::println("{:<38} {:>7} {:>11} {:>11} {:>11}  {}", elide(entry.first, 38UZ), fieldOr<std::uint64_t>(block, "invocations", 0UL), humanNs(fieldOr<double>(block, "acet_ns", 0.0)), humanNs(fieldOr<double>(block, "jitter_ns", 0.0)), humanNs(static_cast<double>(fieldOr<std::uint64_t>(block, "wcet_ns", 0UL))), marginal);
+        }
+    }
+
+    const std::uint64_t misses = fieldOr<std::uint64_t>(tardy, "deadline_misses", 0UL);
+    std::println("");
+    if (misses > 0UL) {
+        std::println("{:<22} {} (worst {} late)", "deadline misses", misses, humanNs(static_cast<double>(fieldOr<std::uint64_t>(tardy, "tardiness_max_ns", 0UL))));
+    } else {
+        std::println("{:<22} none recorded", "deadline misses");
+    }
+    std::println("{:<22} {}", "response times", fieldOr<std::string>(tardy, "response_time", std::string("unavailable")));
+    const std::string reason = fieldOr<std::string>(tardy, "response_time_reason", std::string{});
+    if (!reason.empty()) {
+        std::println("{:<22} {}", "", reason);
+    }
+    std::println("{:<22} {}", "live vs reconstructed", fieldOr<std::string>(tardy, "cross_check", std::string("unavailable")));
+    return 0;
+}
+
+/// Resolves block names to interned ids, so a chain is given as names rather than ids a user would
+/// have to look up first.
+///
+/// Matched as a **substring** of the unique name, because that name is type-derived -- a block the
+/// user called "src" is recorded as `gr::testing::ConstantSource<float32>#16` -- so requiring the
+/// whole thing would mean copying it out of a report first. An ambiguous or unknown name is an error
+/// rather than a silently wrong chain: picking the first of two matches would produce a latency for
+/// a path the user did not ask about.
+[[nodiscard]] std::optional<std::vector<EntityId>> resolveChain(const Capture& capture, std::span<const std::string_view> names) {
+    std::vector<EntityId> chain;
+    for (const std::string_view name : names) {
+        std::vector<const LoadedEntity*> matches;
+        for (const LoadedEntity& entity : capture.entities) {
+            if (entity.uniqueName.find(name) != std::string::npos) {
+                matches.push_back(&entity);
+            }
+        }
+        if (matches.empty()) {
+            std::println(stderr, "gr4-trace: no block matching '{}' in this capture", name);
+            return std::nullopt;
+        }
+        if (matches.size() > 1UZ) {
+            std::println(stderr, "gr4-trace: '{}' matches {} blocks; name one of them more precisely:", name, matches.size());
+            for (const LoadedEntity* entity : matches) {
+                std::println(stderr, "  {}", entity->uniqueName);
+            }
+            return std::nullopt;
+        }
+        chain.push_back(matches.front()->id);
+    }
+    return chain;
+}
+
+int commandUtilisation(const Capture& capture) {
+    const std::vector<WorkerUtilisation> workers = workerUtilisation(capture.events, capture.header.lostCount);
+    if (workers.empty()) {
+        std::println("no workers in this capture");
+        return 0;
+    }
+
+    for (const WorkerUtilisation& w : workers) {
+        std::println("");
+        std::println("worker {}", w.workerId);
+        if (!w.computed) {
+            std::println("  not computed: {}", w.reason);
+            continue;
+        }
+
+        const auto percent = [&w](std::uint64_t ns) { return 100.0 * static_cast<double>(ns) / static_cast<double>(w.lifetimeNs); };
+        const auto line    = [&percent](std::string_view label, std::uint64_t ns) { std::println("  {:<26} {:>10.3f} ms {:>7.1f} %", label, static_cast<double>(ns) / 1e6, percent(ns)); };
+
+        std::println("  {:<26} {:>10.3f} ms", "alive", static_cast<double>(w.lifetimeNs) / 1e6);
+        line("block execution", w.blockNs());
+        line("  of which productive", w.blockProductiveNs);
+        line("  of which polling", w.blockProbeNs);
+        line("scheduler within sweeps", w.sweepNs - w.blockNs());
+        line("messages, house-keeping", w.messagePhaseNs);
+        line("idle (waiting by choice)", w.idleNs);
+        line("unaccounted", w.unaccountedNs);
+
+        if (w.hasThreadCpuTime) {
+            line("on a core", w.threadCpuNs);
+            line("preempted", w.preemptionNs);
+            if (w.preemptionClamped) {
+                std::println("  note: idle exceeded the time off core, so preemption was clamped to zero -- one of the assumptions behind it does not hold here");
+            }
+        } else {
+            std::println("  {:<26} {:>10}", "on a core", "unknown on this platform");
+        }
+
+        std::println("");
+        std::println("  block occupancy  {:>6.1f} %   (of the whole life)", 100.0 * w.occupancy);
+        if (w.hasUtilisation) {
+            std::println("  block utilisation{:>6.1f} %   (of the time it was trying to work)", 100.0 * w.utilisation);
+        } else {
+            std::println("  block utilisation  n/a       (this worker only ever waited, so there was no active time to be a fraction of)");
+        }
+
+        // Stated rather than left silent: a check that passed and a check that was skipped look
+        // identical otherwise, and the slack is the evidence the decomposition was actually evaluated.
+        std::println("  terms fit within the lifetime, with {:.1f} % unaccounted", percent(w.unaccountedNs));
+    }
+    return 0;
+}
+
+int commandCatapult(const Capture& capture, const std::string& outputPath, std::span<const EntityId> chain, LatencyMode mode) {
+    std::ofstream out(outputPath, std::ios::binary | std::ios::trunc);
+    if (!out.is_open()) {
+        std::println(stderr, "gr4-trace: cannot open '{}' for writing", outputPath);
+        return 1;
+    }
+    const std::string json = catapultJson(capture, chain, mode);
+    if (!chain.empty()) {
+        // Said out loud, because a chain that could not be reconstructed produces a timeline that
+        // looks exactly like one that was never asked for.
+        const ChainLatency latency = chainLatency(capture.events, chain, mode);
+        if (latency.computed) {
+            std::println("latency over {} samples ({}): min {} ns, median {} ns, max {} ns", latency.samples, mode == LatencyMode::invocationLockstep ? "assuming invocation lockstep" : "from stream positions", latency.minNs, latency.medianNs, latency.maxNs);
+            if (latency.unmatched > 0UZ) {
+                std::println("note: {} invocations could not be paired and are absent from these figures", latency.unmatched);
+            }
+        } else {
+            std::println("no flow arrows: {}", latency.reason);
+        }
+    }
+    out.write(json.data(), static_cast<std::streamsize>(json.size()));
+    out.flush();
+    if (!out.good()) {
+        std::println(stderr, "gr4-trace: write failed for '{}'", outputPath);
+        return 1;
+    }
+    std::println("{} events -> {} ({} bytes)", capture.events.size(), outputPath, json.size());
+    if (capture.header.lostCount > 0UL) {
+        std::println("note: {} records were evicted before this capture was written; the timeline has gaps", capture.header.lostCount);
+    }
+    return 0;
+}
+
+} // namespace
+
+int main(int argc, char** argv) {
+    const std::vector<std::string_view> args(argv, argv + argc);
+    if (args.size() < 3UZ) {
+        return usage();
+    }
+    const std::string_view command = args[1];
+    const std::string      path(args[2]);
+
+    const auto capture = load(path);
+    if (!capture.has_value()) {
+        // The reader's refusals name what was wrong with the file; passing that through unchanged is
+        // more use than a tool-level "could not read".
+        std::println(stderr, "{}", capture.error().message);
+        return 1;
+    }
+
+    if (command == "summary") {
+        return commandSummary(*capture);
+    }
+    if (command == "report") {
+        return commandReport(*capture);
+    }
+    if (command == "utilisation") {
+        return commandUtilisation(*capture);
+    }
+    if (command == "catapult") {
+        if (args.size() < 4UZ) {
+            std::println(stderr, "gr4-trace catapult needs an output path");
+            return usage();
+        }
+        // `--lockstep` selects the assumption; without it the position walk is used, which assumes
+        // nothing and refuses what it cannot reconstruct.
+        std::vector<std::string_view> rest(args.begin() + 4, args.end());
+        LatencyMode                   mode = LatencyMode::streamPosition;
+        if (const auto flag = std::ranges::find(rest, std::string_view{"--lockstep"}); flag != rest.end()) {
+            mode = LatencyMode::invocationLockstep;
+            rest.erase(flag);
+        }
+
+        std::vector<EntityId> chain;
+        if (!rest.empty()) {
+            const auto resolved = resolveChain(*capture, rest);
+            if (!resolved.has_value()) {
+                return 1;
+            }
+            chain = *resolved;
+        } else if (mode == LatencyMode::invocationLockstep) {
+            // Selecting how to reconstruct a chain, without naming one, reconstructs nothing. Silence
+            // here would look identical to a successful run.
+            std::println(stderr, "gr4-trace: --lockstep selects how a chain is reconstructed, but no chain was named");
+            return usage();
+        }
+        return commandCatapult(*capture, std::string(args[3]), chain, mode);
+    }
+    std::println(stderr, "gr4-trace: unknown command '{}'", command);
+    return usage();
+}

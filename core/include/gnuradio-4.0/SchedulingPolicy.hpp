@@ -16,6 +16,7 @@
 #include <vector>
 
 #include <gnuradio-4.0/BlockModel.hpp>
+#include <gnuradio-4.0/Trace.hpp>
 
 namespace gr::scheduler {
 
@@ -164,6 +165,17 @@ struct SchedState {
     /// distinct within a job list, or the ordering stops being a strict total order.
     std::size_t tieBreak = 0UZ;
 
+    /// Interned trace identity, assigned in `syncSchedStates()` and `kNoEntity` where tracing is
+    /// compiled out. Cached here rather than looked up per marker because this struct is already
+    /// beside the block in the worker's hot loop, and because an id derived from the block's address
+    /// survives `applyStaticOrder`'s permutation -- which a position-derived one would not.
+    gr::trace::EntityId entityId = gr::trace::kNoEntity;
+
+    /// Which worker owns this state, for markers emitted from code that has the state but not the
+    /// worker -- `releaseIfEligible()` is a free function and would otherwise attribute every release
+    /// to worker 0. Assigned beside `entityId` in `syncSchedStates()`, which already receives it.
+    std::uint8_t workerId = 0U;
+
     /// Per-invocation batch ceiling, resolved once during setup and handed to `work()` as its
     /// requested work. Ceiling only: a batch *floor* has no enforcement path at this layer, since
     /// `work()` takes an upper bound and clamps it up to the block's release threshold.
@@ -178,6 +190,16 @@ struct SchedState {
     /// because an *absolute* priority scheme must treat "no user value" as unset rather than
     /// inheriting a derived rank -- and because, being block-local, it survives adoption intact.
     std::int32_t userPriority = 0;
+
+    /// Unproductive `work()` invocations this sweep, and what they cost. Aggregated rather than
+    /// recorded one record at a time: under round robin and fixed priority `work()` doubles as the
+    /// eligibility oracle, so most invocations do nothing, and a record each would bury the
+    /// productive ones. Flushed to one `workProbe` per block per sweep and zeroed.
+    ///
+    /// Reset wholesale by `syncSchedStates()` on the house-keeping cadence, which is harmless: these
+    /// are per-sweep quantities and the sweep that filled them has already flushed them.
+    std::uint32_t probeCount = 0U;
+    std::uint64_t probeNs    = 0UL;
 
     /// Set when the block has reported `DONE`, so a selection loop can skip it instead of
     /// re-probing it on every restart. Cleared whenever the states are re-derived, which is the
