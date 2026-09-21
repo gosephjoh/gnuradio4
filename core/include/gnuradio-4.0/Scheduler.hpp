@@ -395,7 +395,7 @@ public:
                     gr::trace::EntityDescription{.uniqueName = blocks[i]->uniqueName(), .typeName = blocks[i]->typeName(), .workerId = workerId, .nInputPorts = static_cast<std::uint16_t>(blocks[i]->dynamicInputPortsSize()), .nOutputPorts = static_cast<std::uint16_t>(blocks[i]->dynamicOutputPortsSize())});
                 // The block-side markers cannot reach this id themselves -- the key above is the
                 // `BlockModel` address, not the block's -- so it is pushed down here, once per re-sync.
-                blocks[i]->setTraceEntityId(entityId);
+                blocks[i]->setTraceContext(entityId, workerId);
             }
 
             states[i] = SchedState{.index = i, .entityId = entityId, .workerId = workerId, .batchCeiling = ceiling, .priority = priority, .userPriority = userPriority};

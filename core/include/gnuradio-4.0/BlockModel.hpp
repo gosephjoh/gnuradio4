@@ -493,17 +493,22 @@ public:
     [[nodiscard]] virtual work::Result work(std::size_t requested_work) = 0;
 
     /**
-     * Caches the interned trace identity inside the wrapped block, so a marker in `Block::work()` can
-     * name itself. Identities are interned against the `BlockModel` address, but `BlockWrapper<T>`
-     * holds its block as `std::conditional_t<kOwning, T, T*>` -- by value or by pointer, and in
-     * neither case at the model's own address -- so `this` inside `Block::workInternal` is a
-     * different address and no lookup from there would find the right entry.
+     * Caches what a marker inside `Block::work()` needs to describe itself: which block it is, and
+     * which worker is running it. Neither is reachable from in there. Identities are interned against
+     * the `BlockModel` address, but `BlockWrapper<T>` holds its block as
+     * `std::conditional_t<kOwning, T, T*>` -- by value or by pointer, and in neither case at the
+     * model's own address -- so `this` inside `Block::workInternal` is a different address and no
+     * lookup from there would find the right entry; and a block has no way at all to know which
+     * thread is executing it.
+     *
+     * Taken from the block's scheduler assignment rather than from whichever thread happens to be
+     * running, so a stray call from a non-worker thread cannot make it wrong.
      *
      * Called by the scheduler on its house-keeping cadence, never per invocation. Defaulted to a no-op
      * rather than pure so that a `BlockModel` implementation outside this repository keeps compiling;
      * in-tree, `BlockWrapper` is the only implementation and it overrides.
      */
-    virtual void setTraceEntityId(gr::trace::EntityId) noexcept {}
+    virtual void setTraceContext(gr::trace::EntityId, std::uint8_t /*workerId*/) noexcept {}
 
     [[nodiscard]] virtual work::Status draw(const property_map& config = {}) = 0;
 
@@ -789,9 +794,10 @@ public:
 
     [[nodiscard]] constexpr work::Result work(std::size_t requested_work = undefined_size) override { return blockRef().work(requested_work); }
 
-    void setTraceEntityId(gr::trace::EntityId entityId) noexcept override {
+    void setTraceContext(gr::trace::EntityId entityId, std::uint8_t workerId) noexcept override {
         if constexpr (requires { blockRef()._traceEntityId = entityId; }) {
             blockRef()._traceEntityId = entityId;
+            blockRef()._traceWorkerId = workerId;
         }
     }
 
