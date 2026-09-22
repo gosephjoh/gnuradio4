@@ -1,0 +1,262 @@
+#!/usr/bin/env python3
+"""rt-microbench4 -- the microbenchmarks that check the mechanisms behind the sweep's results.
+
+    ./scripts/rt-microbench4 --out-dir DIR [--cell CELL] [--only M1,M2,...]
+
+  M1  isolated per-block cost: the receiver unthrottled on one worker with a batch ceiling N,
+      workExact tracing only -> mean/max ns per call and ns per input sample per block; the sum
+      over the batch path is the floor of the batch response time
+  M2  scheduler cost per invocation: microbench4 (synthetic Copy chains) under RR, EDF, RM at
+      N = 1024 and 4096, 1 and 3 chains, with and without explicit deadlines and with every trace
+      category live; ns per invocation, best of 3
+  M3  the non-preemptive blocking bound: the longest single invocation of any block at each N
+      (from M1), the most a tight job can wait behind a running job
+  M4  EDF selection oracle: one 30 s run at a contention point with the class deadlines
+      (2 workers, 3 receivers, 2.5 Msps, N = 1024, chain 0 at 0.25) and one at equal deadlines,
+      tables kept -> trace-edf-oracle.py: fraction of job starts that passed over a ready job
+      with an earlier deadline
+  M6  scheduler pass cost on four workers: the light multi-rate mix (1.25, 1.25, 2.5, 5 Msps,
+      rotation 1, 20 s) under RR, EDF and RM at process_stream_to_message_ratio 16 (the default)
+      and 4096, with every event category traced -> per worker, the rate, mean and p99 duration
+      and the busy share of every scheduler event kind (sweep, stateSync, messagePhase,
+      releaseScan, ...) inside the analysis window, next to the batch RT of every receiver
+  M5  trace overhead at an unsaturated point: 1 receiver, 1 worker, 2.5 Msps, N = 1024, 30 s,
+      every policy, every category live against no category -> frame response time
+Writes DIR/micro.json and DIR/MICRO.md (tables).  Takes about ten minutes; run it with the
+machine otherwise idle.
+"""
+import argparse, json, os, subprocess, sys, glob
+import numpy as np
+import pandas as pd
+
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+RX = os.path.join(HERE, "build", "rx_latency4"); MB = os.path.join(HERE, "build", "microbench4"); EXP = os.path.join(HERE, "build", "trace_export")
+ANALYSE = os.path.join(HERE, "scripts", "trace-batch-rt.py"); ORACLE = os.path.join(HERE, "scripts", "trace-edf-oracle.py")
+PRE = ["throttle", "mag2", "avgpow", "dly16", "conj", "mul", "avgcor", "mag", "div", "syncshort"]
+POST = ["dly320", "synclong", "fft", "eq", "decode"]
+
+
+def sh(cmd, log=None):
+    print("+ " + " ".join(cmd), flush=True)
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if log:
+        open(log, "a").write(" ".join(cmd) + "\n" + r.stdout + r.stderr + "\n")
+    if r.returncode != 0:
+        print(r.stderr[-800:], file=sys.stderr)
+    return r
+
+
+def m1(cell, out, log):
+    res = {}
+    for N in (1024, 2048, 4096):
+        d = os.path.join(out, f"m1_N{N}")
+        os.makedirs(d, exist_ok=True)
+        sh([RX, "--run-dir", cell, "--out-dir", d, "--rate", "0", "--chains", "1", "--threads", "1", "--policy", "rr", "--batch", str(N), "--buffer", str(16 * N),
+            "--max-samples", "20000000", "--timeout-s", "120", "--trace-categories", "0x104", "--trace-buffer", "8388608", "--trace-out", os.path.join(d, "trace.gr4trace")], log)
+        sh([EXP, os.path.join(d, "trace.gr4trace"), "--out-dir", d, "--meta", os.path.join(d, "trace_meta.json")], log)
+        I = pd.read_csv(os.path.join(d, "trace_invocations.csv"), dtype={"role": str})
+        I = I[(I["in"] > 0) | (I["out"] > 0)]
+        per = {}
+        for role, g in I.groupby("role"):
+            samples = int(g["out"].sum()) if role == "fsrc" else int(g["in"].sum())
+            per[role] = {"calls": int(len(g)), "mean_us": float(g.dur_ns.mean() / 1e3), "p99_us": float(g.dur_ns.quantile(0.99) / 1e3), "max_us": float(g.dur_ns.max() / 1e3),
+                         "ns_per_sample": float(g.dur_ns.sum() / samples) if samples else None, "mean_in": float(g["in"].mean())}
+        floor = sum(per[r]["mean_us"] for r in PRE if r in per)
+        res[N] = {"per_block": per, "floor_us_excl_throttle": floor, "longest_call_us": max(v["max_us"] for v in per.values()), "longest_call_block": max(per, key=lambda r: per[r]["max_us"])}
+        for f in ("trace.gr4trace", "trace_invocations.csv", "trace_work.csv", "trace_probes.csv"):
+            fp = os.path.join(d, f)
+            if os.path.exists(fp):
+                os.remove(fp)
+    return res
+
+
+def m2(out, log):
+    res = []
+    for N in (1024, 4096):
+        for C in (1, 3):
+            for pol in ("rr", "edf", "rm"):
+                for variant in ("plain", "deadlines", "traced"):
+                    cmd = [MB, "--policy", pol, "--chains", str(C), "--length", "9", "--batch", str(N), "--samples", "20000000", "--threads", "1"]
+                    if variant == "deadlines":
+                        cmd += ["--deadlines", ",".join(["0.0001"] + ["0.0004"] * (C - 1))]
+                    if variant == "traced":
+                        cmd += ["--trace", "0x1ff", "--deadlines", ",".join(["0.0001"] + ["0.0004"] * (C - 1))]
+                    best = None
+                    for _ in range(3):
+                        r = sh(cmd, log)
+                        if r.returncode == 0:
+                            j = json.loads(r.stdout.strip().splitlines()[-1])
+                            if best is None or j["ns_per_invocation"] < best["ns_per_invocation"]:
+                                best = j
+                    if best:
+                        best["variant"] = variant
+                        res.append(best)
+    return res
+
+
+def m4(cell, out, log):
+    res = {}
+    for name, extra in (("A25", ["--deadline-classes", "0.25,1,1"]), ("base", [])):
+        d = os.path.join(out, f"m4_{name}")
+        os.makedirs(d, exist_ok=True)
+        sh([RX, "--run-dir", cell, "--out-dir", d, "--rate", "2500000", "--chains", "3", "--threads", "2", "--policy", "edf", "--fixed-batch", "1024", "--max-samples", str(30 * 2500000),
+            "--timeout-s", "120", "--trace-categories", "all", "--trace-buffer", "16777216", "--trace-limit-mb", "1024", "--trace-out", os.path.join(d, "trace.gr4trace")] + extra, log)
+        sh([sys.executable, ANALYSE, d, "--warmup", "5", "--window", "20", "--quiet"], log)
+        r = sh([sys.executable, ORACLE, d, "--warmup", "5", "--window", "20"], log)
+        b = json.load(open(os.path.join(d, "batch_rt.json")))
+        o = json.load(open(os.path.join(d, "edf_oracle.json")))
+        res[name] = {"oracle": o, "per_chain_batch_rt": [pc.get("batch_rt") for pc in b["per_chain"]], "saturated": b.get("saturated"), "edf": b.get("edf", {}).get("per_chain")}
+        for f in glob.glob(os.path.join(d, "trace_*.csv")) + [os.path.join(d, "trace.gr4trace")]:
+            if os.path.exists(f) and not f.endswith(("trace_header.json", "trace_kinds.csv", "trace_entities.csv")):
+                os.remove(f)
+    return res
+
+
+def m5(cell, out, log):
+    res = {}
+    for pol in ("rr", "edf", "rm"):
+        for traced in (True, False):
+            d = os.path.join(out, f"m5_{pol}_{'trace' if traced else 'notrace'}")
+            os.makedirs(d, exist_ok=True)
+            cmd = [RX, "--run-dir", cell, "--out-dir", d, "--rate", "2500000", "--chains", "1", "--threads", "1", "--policy", pol, "--fixed-batch", "1024", "--max-samples", str(30 * 2500000), "--timeout-s", "120"]
+            if traced:
+                cmd += ["--trace-categories", "all", "--trace-buffer", "16777216", "--trace-limit-mb", "1024", "--trace-out", os.path.join(d, "trace.gr4trace")]
+            sh(cmd, log)
+            sh([sys.executable, ANALYSE, d, "--warmup", "5", "--window", "20", "--quiet"], log)
+            b = json.load(open(os.path.join(d, "batch_rt.json")))
+            pc = b["per_chain"][0]
+            res[f"{pol}_{'traced' if traced else 'untraced'}"] = {"frame_rt": pc["frame_rt"], "batch_rt": pc.get("batch_rt"), "elapsed_s": b.get("elapsed_s"), "realtime_ratio": b.get("realtime_ratio")}
+            for f in glob.glob(os.path.join(d, "trace_*.csv")) + [os.path.join(d, "trace.gr4trace")]:
+                if os.path.exists(f) and not f.endswith(("trace_header.json", "trace_kinds.csv", "trace_entities.csv")):
+                    os.remove(f)
+    return res
+
+
+M6_KINDS = ("sweep", "stateSync", "messagePhase", "houseKeeping", "releaseScan", "select", "selectEmpty", "workProbe", "zombieReap", "adopt")
+M6_RATES = "1250000,1250000,2500000,5000000"
+
+
+def m6(cell, out, log):
+    res = {}
+    for ratio in (16, 4096):
+        for pol in ("rr", "edf", "rm"):
+            d = os.path.join(out, f"m6_{pol}_r{ratio}")
+            os.makedirs(d, exist_ok=True)
+            cmd = [RX, "--run-dir", cell, "--out-dir", d, "--chains", "4", "--threads", "4", "--policy", pol, "--fixed-batch", "1024", "--rates", M6_RATES, "--run-s", "20", "--rotate", "1",
+                   "--sched-ratio", str(ratio), "--timeout-s", "200", "--trace-categories", "all", "--trace-buffer", "16777216", "--trace-limit-mb", "1024", "--trace-out", os.path.join(d, "trace.gr4trace")]
+            sh(cmd, log)
+            sh([EXP, os.path.join(d, "trace.gr4trace"), "--out-dir", d, "--meta", os.path.join(d, "trace_meta.json"), "--all-events"], log)
+            sh([sys.executable, ANALYSE, d, "--warmup", "3", "--window", "12", "--quiet"], log)
+            b = json.load(open(os.path.join(d, "batch_rt.json")))
+            w0, w1 = b["window_ns"]; span = (w1 - w0) / 1e9
+            E = pd.read_csv(os.path.join(d, "trace_events.csv")); E = E[(E.start_ns >= w0) & (E.start_ns < w1)]
+            workers = sorted(E.worker.unique()); T = max(len(workers), 1)
+            kinds = {}
+            for k in M6_KINDS:
+                x = E[E.kind == k]
+                if len(x):
+                    kinds[k] = {"per_s_per_worker": len(x) / span / T, "mean_us": float(x.dur_ns.mean() / 1e3), "p99_us": float(x.dur_ns.quantile(0.99) / 1e3), "max_us": float(x.dur_ns.max() / 1e3), "busy_share": float(x.dur_ns.sum() / 1e9 / span / T)}
+            ss = E[E.kind == "stateSync"]
+            discarded = {"mean": float(ss.p1.mean()), "max": int(ss.p1.max()), "syncs_with_discards": float((ss.p1 > 0).mean())} if len(ss) else None
+            sw = E[E.kind == "sweep"].sort_values(["worker", "start_ns"]); gaps = []
+            for _, g in sw.groupby("worker"):
+                st = g.start_ns.to_numpy(); en = st + g.dur_ns.to_numpy()
+                if len(st) > 1:
+                    gaps.append(float(np.mean(st[1:] - en[:-1]) / 1e3))
+            res[f"{pol}_r{ratio}"] = {"policy": pol, "sched_ratio": ratio, "window_s": span, "kinds": kinds, "gap_between_sweeps_us": gaps, "jobs_discarded_per_sync": discarded,
+                                      "per_chain": [{"chain": pc["chain"], "rate": pc.get("rate"), "period_us": pc.get("batch_period_us"), "batch_rt": pc.get("batch_rt"), "frame_rt": pc.get("frame_rt"), "saturated": pc.get("saturated"), "edf": pc.get("edf")} for pc in b["per_chain"]],
+                                      "occupancy": b.get("utilization", {}).get("per_worker_occupancy")}
+            for f in glob.glob(os.path.join(d, "trace_*.csv")) + [os.path.join(d, "trace.gr4trace")]:
+                if os.path.exists(f) and not f.endswith(("trace_header.json", "trace_kinds.csv", "trace_entities.csv")):
+                    os.remove(f)
+    return res
+
+
+def write_md(res, out):
+    L = ["# Microbenchmarks\n", "Generated by `scripts/rt-microbench4`; raw values in `micro.json`.\n"]
+    if "M1" in res:
+        L.append("\n## M1 — isolated per-block cost (unthrottled, one worker, RR, batch ceiling N)\n")
+        for N, r in sorted(res["M1"].items(), key=lambda kv: int(kv[0])):
+            L.append(f"\nN = {N}: batch-path floor (sum of mean costs, throttle excluded) {r['floor_us_excl_throttle']:.1f} µs; longest single call {r['longest_call_us']:.0f} µs ({r['longest_call_block']})\n")
+            L.append("\n| block | calls | mean µs | p99 µs | max µs | ns / sample |\n|---|---|---|---|---|---|\n")
+            for role in ["fsrc"] + PRE[1:] + POST + ["stamp", "latsink"]:
+                if role in r["per_block"]:
+                    v = r["per_block"][role]
+                    L.append(f"| {role} | {v['calls']} | {v['mean_us']:.2f} | {v['p99_us']:.1f} | {v['max_us']:.0f} | {v['ns_per_sample']:.1f} |\n" if v["ns_per_sample"] is not None else f"| {role} | {v['calls']} | {v['mean_us']:.2f} | {v['p99_us']:.1f} | {v['max_us']:.0f} | - |\n")
+    if "M2" in res:
+        L.append("\n## M2 — scheduler cost per invocation on a synthetic copy graph (one worker, best of 3)\n\n| N | chains | variant | RR ns/inv | EDF ns/inv | RM ns/inv |\n|---|---|---|---|---|---|\n")
+        rows = {}
+        for j in res["M2"]:
+            rows.setdefault((j["batch"], j["chains"], j["variant"]), {})[j["policy"]] = j["ns_per_invocation"]
+        for k in sorted(rows):
+            v = rows[k]
+            L.append(f"| {k[0]} | {k[1]} | {k[2]} | {v.get('rr', float('nan')):.0f} | {v.get('edf', float('nan')):.0f} | {v.get('rm', float('nan')):.0f} |\n")
+    if "M3" in res:
+        L.append("\n## M3 — non-preemptive blocking bound\n\n| N | longest call µs | block | class deadline 0.25 × period at 2.5 Msps µs | at 5 Msps µs |\n|---|---|---|---|---|\n")
+        for N, r in sorted(res["M3"].items(), key=lambda kv: int(kv[0])):
+            L.append(f"| {N} | {r['longest_call_us']:.0f} | {r['longest_call_block']} | {r['tight_deadline_2p5_us']:.0f} | {r['tight_deadline_5_us']:.0f} |\n")
+    if "M4" in res:
+        L.append("\n## M4 — EDF selection oracle (2 workers, 3 receivers, 2.5 Msps, N = 1024, 30 s)\n\n| setting | job starts | inversions | ratio | pipeline ratio | waiting job of a tighter class | chain 0 batch RT mean µs | chains 1,2 |\n|---|---|---|---|---|---|---|---|\n")
+        for name, r in res["M4"].items():
+            o = r["oracle"]; pcs = r["per_chain_batch_rt"]
+            c0 = f"{pcs[0]['mean_us']:.0f}" if pcs and pcs[0] and pcs[0].get("n") else "-"
+            c12 = ", ".join(f"{p['mean_us']:.0f}" for p in pcs[1:] if p and p.get("n"))
+            L.append(f"| {name} | {o['starts']} | {o['inversions']} | {o['inversion_ratio']:.2e} | {o['pipeline_inversion_ratio']:.2e} | {o['inversions_waiting_job_tighter_class']} | {c0} | {c12} |\n")
+    if "M5" in res:
+        L.append("\n## M5 — trace overhead at an unsaturated point (1 receiver, 1 worker, 2.5 Msps, N = 1024, 30 s)\n\n| policy | frame RT mean µs untraced | traced | Δ | std untraced | traced | run time / air untraced | traced |\n|---|---|---|---|---|---|---|---|\n")
+        for pol in ("rr", "edf", "rm"):
+            u = res["M5"].get(f"{pol}_untraced"); t = res["M5"].get(f"{pol}_traced")
+            if u and t:
+                L.append(f"| {pol} | {u['frame_rt']['mean_us']:.0f} | {t['frame_rt']['mean_us']:.0f} | {t['frame_rt']['mean_us'] - u['frame_rt']['mean_us']:+.0f} | {u['frame_rt']['std_us']:.0f} | {t['frame_rt']['std_us']:.0f} | {u['realtime_ratio']:.3f} | {t['realtime_ratio']:.3f} |\n")
+    if "M6" in res:
+        L.append("\n## M6 — scheduler pass cost on four workers (light mix 1.25/1.25/2.5/5 Msps, N = 1024, rotation 1, 20 s, every category traced)\n")
+        L.append("\nBatch response time per receiver (mean µs, and the fraction of batches later than the receiver's own period):\n\n| policy | ratio | rx 0 | rx 1 | rx 2 | rx 3 (5 Msps) | EDF pipeline misses |\n|---|---|---|---|---|---|---|\n")
+        for key, r in res["M6"].items():
+            cells = []
+            for pc in r["per_chain"]:
+                br = pc.get("batch_rt") or {}
+                cells.append(f"{br.get('mean_us', float('nan')):.0f} ({100 * br.get('over_period', 0) / max(br.get('n', 1), 1):.1f}%)" if br else "-")
+            e = [pc["edf"] for pc in r["per_chain"] if pc.get("edf")]
+            L.append(f"| {r['policy']} | {r['sched_ratio']} | " + " | ".join(cells) + f" | {sum(x['misses'] for x in e) if e else '-'} |\n")
+        L.append("\nScheduler events per worker inside the window (rate, mean and p99 duration, share of the worker's time):\n\n| policy | ratio | event | per s | mean µs | p99 µs | busy % |\n|---|---|---|---|---|---|---|\n")
+        for key, r in res["M6"].items():
+            for k in ("sweep", "stateSync", "messagePhase", "releaseScan", "workProbe"):
+                v = r["kinds"].get(k)
+                if v:
+                    L.append(f"| {r['policy']} | {r['sched_ratio']} | {k} | {v['per_s_per_worker']:.0f} | {v['mean_us']:.1f} | {v['p99_us']:.1f} | {100 * v['busy_share']:.1f} |\n")
+        L.append("\nJobs discarded by the re-sync (EDF only tracks jobs; mean per re-sync, max, share of re-syncs that discarded any): " + "; ".join(f"{r['policy']} r{r['sched_ratio']}: {r['jobs_discarded_per_sync']['mean']:.2f}, {r['jobs_discarded_per_sync']['max']}, {100 * r['jobs_discarded_per_sync']['syncs_with_discards']:.0f}%" for r in res["M6"].values() if r.get("jobs_discarded_per_sync")) + "\n")
+        L.append("\nMean gap between consecutive passes of a worker (µs, one value per worker): " + "; ".join(f"{r['policy']} r{r['sched_ratio']}: " + ", ".join(f"{g:.1f}" for g in r["gap_between_sweeps_us"]) for r in res["M6"].values()) + "\n")
+    open(os.path.join(out, "MICRO.md"), "w").write("".join(L))
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--out-dir", required=True)
+    ap.add_argument("--cell", default=os.path.join(HERE, "data", "rt_300_300_102934_QPSK_1_2_s1"))
+    ap.add_argument("--only", default="M1,M2,M3,M4,M5,M6")
+    a = ap.parse_args()
+    os.chdir(HERE)
+    os.makedirs(a.out_dir, exist_ok=True)
+    log = os.path.join(a.out_dir, "micro.log")
+    want = set(a.only.split(","))
+    path = os.path.join(a.out_dir, "micro.json")
+    res = json.load(open(path)) if os.path.exists(path) else {}
+    if "M1" in want:
+        res["M1"] = m1(a.cell, a.out_dir, log)
+    if "M2" in want:
+        res["M2"] = m2(a.out_dir, log)
+    if "M3" in want and "M1" in res:
+        res["M3"] = {N: {"longest_call_us": r["longest_call_us"], "longest_call_block": r["longest_call_block"], "tight_deadline_2p5_us": 0.25 * int(N) / 2.5e6 * 1e6, "tight_deadline_5_us": 0.25 * int(N) / 5e6 * 1e6} for N, r in res["M1"].items()}
+    if "M4" in want:
+        res["M4"] = m4(a.cell, a.out_dir, log)
+    if "M5" in want:
+        res["M5"] = m5(a.cell, a.out_dir, log)
+    if "M6" in want:
+        res["M6"] = m6(a.cell, a.out_dir, log)
+    json.dump(res, open(path, "w"), indent=1)
+    write_md(res, a.out_dir)
+    print("wrote", path, "and MICRO.md")
+
+
+if __name__ == "__main__":
+    main()

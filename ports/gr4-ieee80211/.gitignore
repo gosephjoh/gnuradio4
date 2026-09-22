@@ -1,0 +1,13 @@
+build/
+build*.log
+gate4-run.log
+data/
+results/**/*.cf32
+results/**/*.bin
+rtrun4.log
+*.log
+*.gr4trace
+trace_*.csv
+trace_header.json
+batch_rt.csv
+__pycache__/

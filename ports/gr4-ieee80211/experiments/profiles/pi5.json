@@ -1,0 +1,113 @@
+{
+  "name": "pi5",
+  "description": "Raspberry Pi 5: 4 Cortex-A76 cores, 8 GB; slower per core than the x86 box, so the utilization targets are reached with fewer receivers and lower rates -- run the probe first and let rt-plan4 choose; the probe runs at probe_rate (the lowest) so its per-block costs are taken unsaturated",
+  "cell": "data/rt_300_300_102934_QPSK_1_2_s1",
+  "gr3_cell": null,
+  "policies": [
+    "rr",
+    "edf",
+    "rm"
+  ],
+  "batches": [
+    1024,
+    2048,
+    4096
+  ],
+  "workers": [
+    1,
+    2,
+    3
+  ],
+  "receivers": [
+    1,
+    2,
+    3
+  ],
+  "rates": [
+    1250000,
+    2500000,
+    5000000,
+    10000000
+  ],
+  "rate_sweep": {
+    "receivers": 1,
+    "workers": 1,
+    "rates": [
+      1250000,
+      2500000,
+      5000000
+    ]
+  },
+  "utilization_targets": [
+    0.3,
+    0.5,
+    0.7,
+    0.85,
+    0.95
+  ],
+  "run_s": 60,
+  "repeats": 3,
+  "warmup_s": 5,
+  "window_s": 20,
+  "trace_categories": "all",
+  "trace_buffer_records": 16777216,
+  "trace_limit_mb": 512,
+  "sched_ratio": 0,
+  "controls": "top",
+  "timeout_s": 240,
+  "probe_rate": 1250000,
+  "ring_note": "with every category live an idle worker emits ~7 M records/s (its probing of blocks with no work); the ring keeps the most recent records, so the analysis window is whatever the ring holds and trace-batch-rt.py reports window_covered_s",
+  "classes": {
+    "description": "as x86-8core but fewer points; run the probe and the main sweep first to know the machine's saturation",
+    "points": [
+      {
+        "N": 1024,
+        "workers": 1,
+        "receivers": 2,
+        "rate": 1250000
+      },
+      {
+        "N": 1024,
+        "workers": 2,
+        "receivers": 2,
+        "rate": 1250000
+      },
+      {
+        "N": 1024,
+        "workers": 3,
+        "receivers": 3,
+        "rate": 2500000
+      },
+      {
+        "N": 2048,
+        "workers": 2,
+        "receivers": 3,
+        "rate": 1250000
+      }
+    ],
+    "settings": [
+      {
+        "name": "base"
+      },
+      {
+        "name": "A25",
+        "tight": 0.25
+      },
+      {
+        "name": "A50",
+        "tight": 0.5
+      },
+      {
+        "name": "B25",
+        "frame": 0.25
+      },
+      {
+        "name": "AB25",
+        "tight": 0.25,
+        "frame": 0.25
+      }
+    ],
+    "run_s": 30,
+    "repeats": 2
+  }
+}

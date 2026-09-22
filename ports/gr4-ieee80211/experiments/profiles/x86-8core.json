@@ -1,0 +1,175 @@
+{
+  "name": "x86-8core",
+  "description": "the development machine: 8 hardware threads, 14 GB RAM (decision 0036 defaults); the probe runs at probe_rate (the lowest) so its per-block costs are taken unsaturated",
+  "cell": "data/rt_300_300_102934_QPSK_1_2_s1",
+  "gr3_cell": "/home/gr3/gr3-ieee802-11-project/data/phase10/rt_300_300_102934_QPSK_1_2_s1",
+  "policies": [
+    "rr",
+    "edf",
+    "rm"
+  ],
+  "batches": [
+    1024,
+    2048,
+    4096
+  ],
+  "workers": [
+    1,
+    2,
+    6
+  ],
+  "receivers": [
+    1,
+    2,
+    3,
+    4
+  ],
+  "rates": [
+    2500000,
+    5000000,
+    10000000
+  ],
+  "rate_sweep": {
+    "receivers": 1,
+    "workers": 1,
+    "rates": [
+      2500000,
+      5000000,
+      10000000,
+      20000000
+    ]
+  },
+  "utilization_targets": [
+    0.3,
+    0.5,
+    0.7,
+    0.85,
+    0.95
+  ],
+  "run_s": 60,
+  "repeats": 3,
+  "warmup_s": 5,
+  "window_s": 20,
+  "trace_categories": "all",
+  "trace_buffer_records": 33554432,
+  "trace_limit_mb": 1024,
+  "sched_ratio": 0,
+  "controls": "top",
+  "timeout_s": 180,
+  "probe_rate": 2500000,
+  "ring_note": "with every category live an idle worker emits ~7 M records/s (its probing of blocks with no work); the ring keeps the most recent records, so the analysis window is whatever the ring holds and trace-batch-rt.py reports window_covered_s",
+  "classes": {
+    "description": "the EDF-benefit experiment: chain 0 is the control-channel receiver (modification A: its class factor), the frame path of every receiver carries the frame factor (modification B); factors multiply one batch period; settings base = the equal-deadline runs; the 2-worker 3-receiver point at 2.5 Msps sits at the knee (demand 0.75-0.88 on the busiest worker, saturating run to run), the one at 2.0 Msps is the same contention kept schedulable",
+    "points": [
+      {
+        "N": 1024,
+        "workers": 1,
+        "receivers": 2,
+        "rate": 2500000
+      },
+      {
+        "N": 1024,
+        "workers": 2,
+        "receivers": 3,
+        "rate": 2000000
+      },
+      {
+        "N": 1024,
+        "workers": 2,
+        "receivers": 3,
+        "rate": 2500000
+      },
+      {
+        "N": 1024,
+        "workers": 6,
+        "receivers": 3,
+        "rate": 5000000
+      },
+      {
+        "N": 2048,
+        "workers": 1,
+        "receivers": 2,
+        "rate": 2500000
+      },
+      {
+        "N": 2048,
+        "workers": 2,
+        "receivers": 3,
+        "rate": 2000000
+      },
+      {
+        "N": 2048,
+        "workers": 2,
+        "receivers": 3,
+        "rate": 2500000
+      },
+      {
+        "N": 2048,
+        "workers": 6,
+        "receivers": 3,
+        "rate": 5000000
+      }
+    ],
+    "settings": [
+      {
+        "name": "base"
+      },
+      {
+        "name": "A25",
+        "tight": 0.25
+      },
+      {
+        "name": "A50",
+        "tight": 0.5
+      },
+      {
+        "name": "B25",
+        "frame": 0.25
+      },
+      {
+        "name": "AB25",
+        "tight": 0.25,
+        "frame": 0.25
+      }
+    ],
+    "run_s": 30,
+    "repeats": 2
+  },
+  "multirate": {
+    "description": "multi-rate receivers on four workers: the fastest receiver last in graph order (round robin serves it last), construction order rotated by one slot per receiver so the heavy blocks spread over the workers; implicit deadlines (each receiver's own batch period); RM gets true periods",
+    "workers": 4,
+    "N": 1024,
+    "rotate": 1,
+    "run_s": 30,
+    "repeats": 3,
+    "mixes": [
+      {
+        "name": "light",
+        "rates": [
+          1250000,
+          1250000,
+          2500000,
+          5000000
+        ]
+      },
+      {
+        "name": "mid",
+        "rates": [
+          1250000,
+          2500000,
+          2500000,
+          5000000
+        ]
+      },
+      {
+        "name": "knee",
+        "rates": [
+          2500000,
+          2500000,
+          5000000,
+          5000000
+        ]
+      }
+    ]
+  }
+}

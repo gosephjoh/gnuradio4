@@ -1,0 +1,393 @@
+{
+  "app": "rx_latency4",
+  "run_dir": "/home/gr3/gnuradio4/ports/gr4-ieee80211/data/rt_300_300_102934_QPSK_1_2_s1",
+  "input": "/home/gr3/gnuradio4/ports/gr4-ieee80211/data/rt_300_300_102934_QPSK_1_2_s1/rx_stimulus.cf32",
+  "out_dir": "results/sweep-x86-8core/micro/m5_rm_notrace",
+  "policy": "rm",
+  "policy_name": "RateMonotonic",
+  "scheduler": "Simple<multiThreaded>",
+  "threads": 1,
+  "hw_threads": 8,
+  "rate": 2500000.0,
+  "chunk": 1024,
+  "fixed_batch": 1024,
+  "batch": 1024,
+  "buffer": 16384,
+  "tiny_period_s": 9.999999974752427e-07,
+  "selection_strategy": "heap",
+  "sched_ratio": 0,
+  "max_outstanding_jobs": 0,
+  "frames": 12866,
+  "max_samples": 75000000,
+  "deadline_classes": [],
+  "frame_deadline": 1.0,
+  "elapsed_s": 30.032386146,
+  "result": "ok",
+  "trace": {
+    "compiled_in": true,
+    "mask": 0,
+    "buffer_records": 0,
+    "limit_mb": 0,
+    "recorded": 0,
+    "lost": 0,
+    "rings": 0,
+    "path": null,
+    "written": null
+  },
+  "chains": [
+    {
+      "chain": 0,
+      "throttle_start_ns": 91983136330128,
+      "throttle_chunks": 73246,
+      "throttle_max_chunks_per_call": 1,
+      "throttle_max_backlog_samples": 2340,
+      "blocks": [
+        {
+          "unique_name": "gr4wifi::FileSourceRaw<complex<float32>>#0",
+          "role": "fsrc"
+        },
+        {
+          "unique_name": "gr4wifi::Throttle<complex<float32>>#0",
+          "role": "throttle"
+        },
+        {
+          "unique_name": "gr4wifi::ArrivalStamper#0",
+          "role": "stamp"
+        },
+        {
+          "unique_name": "gr4wifi::MagSquared#0",
+          "role": "mag2"
+        },
+        {
+          "unique_name": "gr4wifi::MovingAverage<float32>#0",
+          "role": "avgpow"
+        },
+        {
+          "unique_name": "gr4wifi::SampleDelay<complex<float32>>#0",
+          "role": "dly16"
+        },
+        {
+          "unique_name": "gr4wifi::Conjugate#0",
+          "role": "conj"
+        },
+        {
+          "unique_name": "gr4wifi::Multiply2<complex<float32>>#0",
+          "role": "mul"
+        },
+        {
+          "unique_name": "gr4wifi::MovingAverage<complex<float32>>#0",
+          "role": "avgcor"
+        },
+        {
+          "unique_name": "gr::blocks::type::converter::Abs<complex<float32>>#0",
+          "role": "mag"
+        },
+        {
+          "unique_name": "gr4wifi::Divide2<float32>#0",
+          "role": "div"
+        },
+        {
+          "unique_name": "gr4wifi::SyncShort#0",
+          "role": "syncshort"
+        },
+        {
+          "unique_name": "gr4wifi::SampleDelay<complex<float32>>#1",
+          "role": "dly320"
+        },
+        {
+          "unique_name": "gr4wifi::SyncLong#0",
+          "role": "synclong"
+        },
+        {
+          "unique_name": "gr4wifi::Fft64#0",
+          "role": "fft"
+        },
+        {
+          "unique_name": "gr4wifi::FrameEqualizer#0",
+          "role": "eq"
+        },
+        {
+          "unique_name": "gr4wifi::DecodeMac#0",
+          "role": "decode"
+        },
+        {
+          "unique_name": "gr4wifi::LatencySink#0",
+          "role": "latsink"
+        }
+      ]
+    }
+  ],
+  "analysis": [
+    {
+      "unique_name": "gr4wifi::FileSourceRaw<complex<float32>>#0",
+      "name": "c0_fsrc",
+      "period_s": 2.499999993688107e-07,
+      "relative_deadline_s": 2.499999993688107e-07,
+      "priority": 18,
+      "batch_floor": 1,
+      "execution_ceiling": null,
+      "nominal_batch": 4096,
+      "relative_sample_rate": 1.0,
+      "period_origin": "user_set",
+      "deadline_origin": "user_set",
+      "priority_origin": "derived_from_rate",
+      "batch_origin": "assumed_batch"
+    },
+    {
+      "unique_name": "gr4wifi::Throttle<complex<float32>>#0",
+      "name": "c0_throttle",
+      "period_s": 4.999999987376214e-07,
+      "relative_deadline_s": 4.999999987376214e-07,
+      "priority": 17,
+      "batch_floor": 1,
+      "execution_ceiling": null,
+      "nominal_batch": 4096,
+      "relative_sample_rate": 1.0,
+      "period_origin": "user_set",
+      "deadline_origin": "user_set",
+      "priority_origin": "derived_from_rate",
+      "batch_origin": "assumed_batch"
+    },
+    {
+      "unique_name": "gr4wifi::ArrivalStamper#0",
+      "name": "c0_stamp",
+      "period_s": 7.500000265281415e-07,
+      "relative_deadline_s": 0.0004096000047866255,
+      "priority": 16,
+      "batch_floor": 1,
+      "execution_ceiling": 1024,
+      "nominal_batch": 1024,
+      "relative_sample_rate": 1.0,
+      "period_origin": "user_set",
+      "deadline_origin": "user_set",
+      "priority_origin": "derived_from_rate",
+      "batch_origin": "user_set"
+    },
+    {
+      "unique_name": "gr4wifi::MagSquared#0",
+      "name": "c0_mag2",
+      "period_s": 9.999999974752427e-07,
+      "relative_deadline_s": 0.0004096000047866255,
+      "priority": 9,
+      "batch_floor": 1024,
+      "execution_ceiling": 1024,
+      "nominal_batch": 1024,
+      "relative_sample_rate": 1.0,
+      "period_origin": "user_set",
+      "deadline_origin": "user_set",
+      "priority_origin": "derived_from_rate",
+      "batch_origin": "user_set"
+    },
+    {
+      "unique_name": "gr4wifi::MovingAverage<float32>#0",
+      "name": "c0_avgpow",
+      "period_s": 9.999999974752427e-07,
+      "relative_deadline_s": 0.0004096000047866255,
+      "priority": 7,
+      "batch_floor": 1024,
+      "execution_ceiling": 1024,
+      "nominal_batch": 1024,
+      "relative_sample_rate": 1.0,
+      "period_origin": "user_set",
+      "deadline_origin": "user_set",
+      "priority_origin": "derived_from_rate",
+      "batch_origin": "user_set"
+    },
+    {
+      "unique_name": "gr4wifi::SampleDelay<complex<float32>>#0",
+      "name": "c0_dly16",
+      "period_s": 9.999999974752427e-07,
+      "relative_deadline_s": 0.0004096000047866255,
+      "priority": 5,
+      "batch_floor": 1024,
+      "execution_ceiling": 1024,
+      "nominal_batch": 1024,
+      "relative_sample_rate": 1.0,
+      "period_origin": "user_set",
+      "deadline_origin": "user_set",
+      "priority_origin": "derived_from_rate",
+      "batch_origin": "user_set"
+    },
+    {
+      "unique_name": "gr4wifi::Conjugate#0",
+      "name": "c0_conj",
+      "period_s": 9.999999974752427e-07,
+      "relative_deadline_s": 0.0004096000047866255,
+      "priority": 15,
+      "batch_floor": 1024,
+      "execution_ceiling": 1024,
+      "nominal_batch": 1024,
+      "relative_sample_rate": 1.0,
+      "period_origin": "user_set",
+      "deadline_origin": "user_set",
+      "priority_origin": "derived_from_rate",
+      "batch_origin": "user_set"
+    },
+    {
+      "unique_name": "gr4wifi::Multiply2<complex<float32>>#0",
+      "name": "c0_mul",
+      "period_s": 9.999999974752427e-07,
+      "relative_deadline_s": 0.0004096000047866255,
+      "priority": 6,
+      "batch_floor": 1024,
+      "execution_ceiling": 1024,
+      "nominal_batch": 1024,
+      "relative_sample_rate": 1.0,
+      "period_origin": "user_set",
+      "deadline_origin": "user_set",
+      "priority_origin": "derived_from_rate",
+      "batch_origin": "user_set"
+    },
+    {
+      "unique_name": "gr4wifi::MovingAverage<complex<float32>>#0",
+      "name": "c0_avgcor",
+      "period_s": 9.999999974752427e-07,
+      "relative_deadline_s": 0.0004096000047866255,
+      "priority": 8,
+      "batch_floor": 1024,
+      "execution_ceiling": 1024,
+      "nominal_batch": 1024,
+      "relative_sample_rate": 1.0,
+      "period_origin": "user_set",
+      "deadline_origin": "user_set",
+      "priority_origin": "derived_from_rate",
+      "batch_origin": "user_set"
+    },
+    {
+      "unique_name": "gr::blocks::type::converter::Abs<complex<float32>>#0",
+      "name": "c0_mag",
+      "period_s": 9.999999974752427e-07,
+      "relative_deadline_s": 0.0004096000047866255,
+      "priority": 1,
+      "batch_floor": 1024,
+      "execution_ceiling": 1024,
+      "nominal_batch": 1024,
+      "relative_sample_rate": 1.0,
+      "period_origin": "user_set",
+      "deadline_origin": "user_set",
+      "priority_origin": "derived_from_rate",
+      "batch_origin": "user_set"
+    },
+    {
+      "unique_name": "gr4wifi::Divide2<float32>#0",
+      "name": "c0_div",
+      "period_s": 9.999999974752427e-07,
+      "relative_deadline_s": 0.0004096000047866255,
+      "priority": 13,
+      "batch_floor": 1024,
+      "execution_ceiling": 1024,
+      "nominal_batch": 1024,
+      "relative_sample_rate": 1.0,
+      "period_origin": "user_set",
+      "deadline_origin": "user_set",
+      "priority_origin": "derived_from_rate",
+      "batch_origin": "user_set"
+    },
+    {
+      "unique_name": "gr4wifi::SyncShort#0",
+      "name": "c0_syncshort",
+      "period_s": 9.999999974752427e-07,
+      "relative_deadline_s": 0.0004096000047866255,
+      "priority": 2,
+      "batch_floor": 1,
+      "execution_ceiling": 2048,
+      "nominal_batch": 2048,
+      "relative_sample_rate": 1.0,
+      "period_origin": "user_set",
+      "deadline_origin": "user_set",
+      "priority_origin": "derived_from_rate",
+      "batch_origin": "user_set"
+    },
+    {
+      "unique_name": "gr4wifi::SampleDelay<complex<float32>>#1",
+      "name": "c0_dly320",
+      "period_s": 9.999999974752427e-07,
+      "relative_deadline_s": 0.0004096000047866255,
+      "priority": 4,
+      "batch_floor": 1,
+      "execution_ceiling": 1024,
+      "nominal_batch": 1024,
+      "relative_sample_rate": 1.0,
+      "period_origin": "user_set",
+      "deadline_origin": "user_set",
+      "priority_origin": "derived_from_rate",
+      "batch_origin": "user_set"
+    },
+    {
+      "unique_name": "gr4wifi::SyncLong#0",
+      "name": "c0_synclong",
+      "period_s": 9.999999974752427e-07,
+      "relative_deadline_s": 0.0004096000047866255,
+      "priority": 3,
+      "batch_floor": 64,
+      "execution_ceiling": 1024,
+      "nominal_batch": 1024,
+      "relative_sample_rate": 1.0,
+      "period_origin": "user_set",
+      "deadline_origin": "user_set",
+      "priority_origin": "derived_from_rate",
+      "batch_origin": "user_set"
+    },
+    {
+      "unique_name": "gr4wifi::Fft64#0",
+      "name": "c0_fft",
+      "period_s": 9.999999974752427e-07,
+      "relative_deadline_s": 0.0004096000047866255,
+      "priority": 12,
+      "batch_floor": 64,
+      "execution_ceiling": 1024,
+      "nominal_batch": 1024,
+      "relative_sample_rate": 1.0,
+      "period_origin": "user_set",
+      "deadline_origin": "user_set",
+      "priority_origin": "derived_from_rate",
+      "batch_origin": "user_set"
+    },
+    {
+      "unique_name": "gr4wifi::FrameEqualizer#0",
+      "name": "c0_eq",
+      "period_s": 9.999999974752427e-07,
+      "relative_deadline_s": 0.0004096000047866255,
+      "priority": 11,
+      "batch_floor": 64,
+      "execution_ceiling": 1024,
+      "nominal_batch": 1024,
+      "relative_sample_rate": 1.0,
+      "period_origin": "user_set",
+      "deadline_origin": "user_set",
+      "priority_origin": "derived_from_rate",
+      "batch_origin": "user_set"
+    },
+    {
+      "unique_name": "gr4wifi::DecodeMac#0",
+      "name": "c0_decode",
+      "period_s": 9.999999974752427e-07,
+      "relative_deadline_s": 0.0004096000047866255,
+      "priority": 14,
+      "batch_floor": 48,
+      "execution_ceiling": 1024,
+      "nominal_batch": 1024,
+      "relative_sample_rate": 1.0,
+      "period_origin": "user_set",
+      "deadline_origin": "user_set",
+      "priority_origin": "derived_from_rate",
+      "batch_origin": "user_set"
+    },
+    {
+      "unique_name": "gr4wifi::LatencySink#0",
+      "name": "c0_latsink",
+      "period_s": 9.999999974752427e-07,
+      "relative_deadline_s": 0.0004096000047866255,
+      "priority": 10,
+      "batch_floor": 1,
+      "execution_ceiling": 1024,
+      "nominal_batch": 1024,
+      "relative_sample_rate": 1.0,
+      "period_origin": "user_set",
+      "deadline_origin": "user_set",
+      "priority_origin": "derived_from_rate",
+      "batch_origin": "user_set"
+    }
+  ],
+  "diagnostics": []
+}

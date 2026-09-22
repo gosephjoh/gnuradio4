@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+# rt-run4 -- one command for every lever, GR4 edition, self-contained.
+#
+#   ./scripts/rt-run4 MIN MAX RATE CHAINS [--packets N] [--mcs NAME] [--seed S] [--chunk N]
+#                     [--deadline-ms F] [--threads N] [--buffer N] [--gr3-cell DIR] [--run]
+#
+# Generates the sample cell with this repo's own gen4 (no GNU Radio 3 needed)
+# into data/rt_<MIN>_<MAX>_<N>_<MCS>_s<seed>/, or reuses it; the GR4 receiver
+# replays it and writes latency.csv / latency_summary.json into
+# <cell>/runs4/rate<R>_chains<C>/.  Prints the commands (start htop first);
+# --run executes.
+#
+# gen4 reproduces the GR3 project's generator byte for byte on payloads.bin
+# and the manifest, and to float rounding on the samples (docs/port-notes.md).
+# --gr3-cell DIR replays a cell the GR3 project generated instead, for a
+# comparison on literally identical bytes on a box that has both.
+#
+# Scheduler knobs (results/latency_knobs.md): GR4's stock multi-threaded
+# scheduler busy-polls on every worker and hands a block its whole buffer per
+# call, which starved the throttle for up to 18 ms and gave GR4 a p95 five
+# times GR3's.  Defaults here: --threads = hardware threads - 2 (min 1) and
+# --buffer 8192 items (what GR3's buffers hold); pass --threads 0 --buffer 0
+# for GR4's own defaults.
+set -u
+HERE="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$HERE" || exit 1
+
+usage() { sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+die() { echo "rt-run4: $*" >&2; exit 2; }
+
+[ $# -ge 4 ] || usage
+MIN=$1; MAX=$2; RATE=$3; CHAINS=$4; shift 4
+PACKETS=1000; MCS=QPSK_1_2; SEED=1; CHUNK=4096; DEADLINE=100; RUN=0; GR3CELL=""
+HW=$(nproc 2>/dev/null || echo 8); THREADS=$(( HW > 2 ? HW - 2 : 1 )); BUFFER=8192
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --packets)     PACKETS=$2; shift 2;;
+        --mcs)         MCS=$2; shift 2;;
+        --seed)        SEED=$2; shift 2;;
+        --chunk)       CHUNK=$2; shift 2;;
+        --deadline-ms) DEADLINE=$2; shift 2;;
+        --gr3-cell)    GR3CELL=$2; shift 2;;
+        --threads)     THREADS=$2; shift 2;;
+        --buffer)      BUFFER=$2; shift 2;;
+        --run)         RUN=1; shift;;
+        -h|--help)     usage;;
+        *) die "unknown option $1";;
+    esac
+done
+int() { case "$1" in ''|*[!0-9]*) return 1;; esac; }
+int "$MIN" && int "$MAX" || die "MIN and MAX must be integers"
+[ "$MIN" -ge 8 ] && [ "$MAX" -le 1500 ] && [ "$MIN" -le "$MAX" ] || die "need 8 <= MIN <= MAX <= 1500"
+int "$CHAINS" && [ "$CHAINS" -ge 1 ] || die "CHAINS must be >= 1"
+int "$PACKETS" && [ "$PACKETS" -ge 1 ] || die "--packets must be >= 1"
+RATE_HZ=$(python3 -c "import sys
+try:
+    r=float(sys.argv[1]); print('bad' if r<0 else ('%d' % r if r==int(r) else '%g' % r))
+except ValueError: print('bad')" "$RATE")
+[ "$RATE_HZ" != bad ] || die "RATE must be a number of samples/s (0 = unthrottled)"
+for bin in gen4 rx_latency4; do
+    [ -x "build/$bin" ] || die "build/$bin missing -- cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j1"
+done
+
+if [ -n "$GR3CELL" ]; then
+    CELL=$GR3CELL
+    [ -s "$CELL/rx_stimulus.cf32" ] && [ -s "$CELL/manifest.json" ] || die "$CELL is not a run directory"
+    echo "rt-run4: replaying the GR3-generated cell $CELL"
+else
+    CELL="data/rt_${MIN}_${MAX}_${PACKETS}_${MCS}_s${SEED}"
+    if [ -s "$CELL/rx_stimulus.cf32" ] && [ -s "$CELL/manifest.json" ]; then
+        echo "rt-run4: reusing $CELL (same MIN/MAX/packets/mcs/seed)"
+    else
+        ./build/gen4 --out "$CELL" --frames "$PACKETS" --payload-range "$MIN,$MAX" --mcs "$MCS" --seed "$SEED" --force || die "gen4 failed"
+    fi
+fi
+FACTS=$(python3 - "$CELL/manifest.json" "$RATE_HZ" <<'EOF'
+import json,sys
+m=json.load(open(sys.argv[1])); r=float(sys.argv[2])
+p=m["prediction"]; L=[f["length"] for f in m["frames"]]
+air=p["total_samples"]/10e6
+print("%d packets, payload %d..%d B, %s, %.1f MB, %.3f s of air at 10 Msps, %.0f frames/s;" % (p["frames"], min(L), max(L), m["generator"]["mcs"], p["sample_file_bytes"]/1e6, air, p["frames_per_s"]))
+print("at %s samples/s the replay takes about %.3f s (%.2fx real time)" % (sys.argv[2], p["total_samples"]/r, r/10e6) if r>0 else "unthrottled: the replay takes as long as the receivers need")
+EOF
+)
+TAG="rate${RATE_HZ}_chains${CHAINS}"; [ "$CHUNK" = 4096 ] || TAG="${TAG}_chunk${CHUNK}"
+[ "$THREADS" = "$(( HW > 2 ? HW - 2 : 1 ))" ] && [ "$BUFFER" = 8192 ] || TAG="${TAG}_t${THREADS}_b${BUFFER}"
+OUT="$CELL/runs4/$TAG"
+mkdir -p "$OUT" || die "cannot create $OUT"
+CMD="./build/rx_latency4 --run-dir $CELL --input $CELL/rx_stimulus.cf32 --out-dir $OUT --rate $RATE_HZ --chains $CHAINS --chunk $CHUNK --deadline-ms $DEADLINE --threads $THREADS --buffer $BUFFER"
+SUM="$HERE/scripts/rt-table $OUT"
+cat <<EOF
+
+rt-run4: $FACTS
+rt-run4: $CHAINS GR4 receiver(s) at $( [ "$RATE_HZ" = 0 ] && echo unthrottled || echo "$RATE_HZ samples/s" ), chunk $CHUNK, deadline $DEADLINE ms
+rt-run4: scheduler: $THREADS worker threads of $HW hardware threads, $BUFFER-item buffers (--threads 0 --buffer 0 = GR4 defaults; see results/latency_knobs.md)
+rt-run4: outputs -> $OUT/{latency.csv,latency_summary.json}
+
+# 1. in another terminal:
+htop -t
+
+# 2. the GR4 receiver(s):
+$CMD
+
+# 3. the numbers, one row per receiver (add more run directories to compare; --md / --csv / --wide):
+$SUM
+
+# 4. against a GR3 run of the same levers (its latency.csv, from ./scripts/rt-run in the GR3 project):
+python3 $HERE/scripts/compare-runs.py <GR3 latency.csv> $OUT/latency.csv
+EOF
+if [ "$RUN" -eq 1 ]; then
+    echo; echo "rt-run4: --run given, executing step 2 now"
+    $CMD; rc=$?
+    echo; eval "$SUM" 2>/dev/null
+    exit $rc
+fi

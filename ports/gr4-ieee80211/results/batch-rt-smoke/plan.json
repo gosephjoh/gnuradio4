@@ -1,0 +1,1301 @@
+{
+  "profile": "x86-8core",
+  "points": [
+    {
+      "N": 1024,
+      "workers": 1,
+      "receivers": 1,
+      "rate": 2500000,
+      "u_max_worker": 0.33985211180892344,
+      "u_total": 0.3398521118089235,
+      "target": "0.3,0.5",
+      "kind": "target"
+    },
+    {
+      "N": 1024,
+      "workers": 1,
+      "receivers": 2,
+      "rate": 2500000,
+      "u_max_worker": 0.679704223617847,
+      "u_total": 0.679704223617847,
+      "target": 0.7,
+      "kind": "target"
+    },
+    {
+      "N": 1024,
+      "workers": 1,
+      "receivers": 3,
+      "rate": 2500000,
+      "u_max_worker": 1.0195563354267705,
+      "u_total": 1.0195563354267705,
+      "target": "0.85,0.95",
+      "kind": "target"
+    },
+    {
+      "N": 1024,
+      "workers": 2,
+      "receivers": 1,
+      "rate": 2500000,
+      "u_max_worker": 0.26096156570847046,
+      "u_total": 0.3398521118089235,
+      "target": 0.3,
+      "kind": "target"
+    },
+    {
+      "N": 1024,
+      "workers": 2,
+      "receivers": 1,
+      "rate": 5000000,
+      "u_max_worker": 0.5219231314169409,
+      "u_total": 0.679704223617847,
+      "target": 0.5,
+      "kind": "target"
+    },
+    {
+      "N": 1024,
+      "workers": 2,
+      "receivers": 3,
+      "rate": 2500000,
+      "u_max_worker": 0.7828846971254116,
+      "u_total": 1.0195563354267705,
+      "target": "0.7,0.85",
+      "kind": "target"
+    },
+    {
+      "N": 1024,
+      "workers": 2,
+      "receivers": 1,
+      "rate": 10000000,
+      "u_max_worker": 1.0438462628338818,
+      "u_total": 1.359408447235694,
+      "target": 0.95,
+      "kind": "target"
+    },
+    {
+      "N": 1024,
+      "workers": 6,
+      "receivers": 3,
+      "rate": 2500000,
+      "u_max_worker": 0.28986107523848215,
+      "u_total": 1.0195563354267705,
+      "target": 0.3,
+      "kind": "target"
+    },
+    {
+      "N": 1024,
+      "workers": 6,
+      "receivers": 3,
+      "rate": 5000000,
+      "u_max_worker": 0.5797221504769643,
+      "u_total": 2.039112670853541,
+      "target": 0.5,
+      "kind": "target"
+    },
+    {
+      "N": 1024,
+      "workers": 6,
+      "receivers": 4,
+      "rate": 5000000,
+      "u_max_worker": 0.772962867302619,
+      "u_total": 2.718816894471388,
+      "target": 0.7,
+      "kind": "target"
+    },
+    {
+      "N": 1024,
+      "workers": 6,
+      "receivers": 2,
+      "rate": 10000000,
+      "u_max_worker": 0.7729628673026191,
+      "u_total": 2.718816894471388,
+      "target": "0.85,0.95",
+      "kind": "target"
+    },
+    {
+      "N": 2048,
+      "workers": 1,
+      "receivers": 1,
+      "rate": 2500000,
+      "u_max_worker": 0.325302112086987,
+      "u_total": 0.3253021120869869,
+      "target": 0.3,
+      "kind": "target"
+    },
+    {
+      "N": 2048,
+      "workers": 1,
+      "receivers": 2,
+      "rate": 2500000,
+      "u_max_worker": 0.6506042241739739,
+      "u_total": 0.6506042241739738,
+      "target": 0.5,
+      "kind": "target"
+    },
+    {
+      "N": 2048,
+      "workers": 1,
+      "receivers": 1,
+      "rate": 5000000,
+      "u_max_worker": 0.650604224173974,
+      "u_total": 0.6506042241739738,
+      "target": 0.7,
+      "kind": "target"
+    },
+    {
+      "N": 2048,
+      "workers": 1,
+      "receivers": 3,
+      "rate": 2500000,
+      "u_max_worker": 0.9759063362609608,
+      "u_total": 0.9759063362609607,
+      "target": "0.85,0.95",
+      "kind": "target"
+    },
+    {
+      "N": 2048,
+      "workers": 2,
+      "receivers": 1,
+      "rate": 2500000,
+      "u_max_worker": 0.25208912310859083,
+      "u_total": 0.3253021120869869,
+      "target": 0.3,
+      "kind": "target"
+    },
+    {
+      "N": 2048,
+      "workers": 2,
+      "receivers": 1,
+      "rate": 5000000,
+      "u_max_worker": 0.5041782462171817,
+      "u_total": 0.6506042241739738,
+      "target": 0.5,
+      "kind": "target"
+    },
+    {
+      "N": 2048,
+      "workers": 2,
+      "receivers": 3,
+      "rate": 2500000,
+      "u_max_worker": 0.7562673693257725,
+      "u_total": 0.9759063362609607,
+      "target": "0.7,0.85",
+      "kind": "target"
+    },
+    {
+      "N": 2048,
+      "workers": 2,
+      "receivers": 4,
+      "rate": 2500000,
+      "u_max_worker": 1.008356492434363,
+      "u_total": 1.3012084483479476,
+      "target": 0.95,
+      "kind": "target"
+    },
+    {
+      "N": 2048,
+      "workers": 6,
+      "receivers": 3,
+      "rate": 2500000,
+      "u_max_worker": 0.2793293356922873,
+      "u_total": 0.9759063362609607,
+      "target": 0.3,
+      "kind": "target"
+    },
+    {
+      "N": 2048,
+      "workers": 6,
+      "receivers": 3,
+      "rate": 5000000,
+      "u_max_worker": 0.5586586713845746,
+      "u_total": 1.9518126725219214,
+      "target": 0.5,
+      "kind": "target"
+    },
+    {
+      "N": 2048,
+      "workers": 6,
+      "receivers": 2,
+      "rate": 10000000,
+      "u_max_worker": 0.7448782285127661,
+      "u_total": 2.602416896695895,
+      "target": 0.7,
+      "kind": "target"
+    },
+    {
+      "N": 2048,
+      "workers": 6,
+      "receivers": 4,
+      "rate": 5000000,
+      "u_max_worker": 0.7448782285127662,
+      "u_total": 2.602416896695895,
+      "target": 0.85,
+      "kind": "target"
+    },
+    {
+      "N": 2048,
+      "workers": 6,
+      "receivers": 3,
+      "rate": 10000000,
+      "u_max_worker": 1.1173173427691492,
+      "u_total": 3.9036253450438427,
+      "target": 0.95,
+      "kind": "target"
+    },
+    {
+      "N": 4096,
+      "workers": 1,
+      "receivers": 1,
+      "rate": 2500000,
+      "u_max_worker": 0.32518543514587006,
+      "u_total": 0.3251854351458701,
+      "target": 0.3,
+      "kind": "target"
+    },
+    {
+      "N": 4096,
+      "workers": 1,
+      "receivers": 1,
+      "rate": 5000000,
+      "u_max_worker": 0.6503708702917401,
+      "u_total": 0.6503708702917402,
+      "target": 0.5,
+      "kind": "target"
+    },
+    {
+      "N": 4096,
+      "workers": 1,
+      "receivers": 2,
+      "rate": 2500000,
+      "u_max_worker": 0.6503708702917402,
+      "u_total": 0.6503708702917402,
+      "target": 0.7,
+      "kind": "target"
+    },
+    {
+      "N": 4096,
+      "workers": 1,
+      "receivers": 3,
+      "rate": 2500000,
+      "u_max_worker": 0.9755563054376105,
+      "u_total": 0.9755563054376104,
+      "target": "0.85,0.95",
+      "kind": "target"
+    },
+    {
+      "N": 4096,
+      "workers": 2,
+      "receivers": 1,
+      "rate": 2500000,
+      "u_max_worker": 0.252326163968193,
+      "u_total": 0.3251854351458701,
+      "target": 0.3,
+      "kind": "target"
+    },
+    {
+      "N": 4096,
+      "workers": 2,
+      "receivers": 1,
+      "rate": 5000000,
+      "u_max_worker": 0.504652327936386,
+      "u_total": 0.6503708702917402,
+      "target": 0.5,
+      "kind": "target"
+    },
+    {
+      "N": 4096,
+      "workers": 2,
+      "receivers": 3,
+      "rate": 2500000,
+      "u_max_worker": 0.7569784919045791,
+      "u_total": 0.9755563054376104,
+      "target": "0.7,0.85",
+      "kind": "target"
+    },
+    {
+      "N": 4096,
+      "workers": 2,
+      "receivers": 1,
+      "rate": 10000000,
+      "u_max_worker": 1.009304655872772,
+      "u_total": 1.3007417405834805,
+      "target": 0.95,
+      "kind": "target"
+    },
+    {
+      "N": 4096,
+      "workers": 6,
+      "receivers": 3,
+      "rate": 2500000,
+      "u_max_worker": 0.27982070237933065,
+      "u_total": 0.9755563054376104,
+      "target": 0.3,
+      "kind": "target"
+    },
+    {
+      "N": 4096,
+      "workers": 6,
+      "receivers": 3,
+      "rate": 5000000,
+      "u_max_worker": 0.5596414047586613,
+      "u_total": 1.9511126108752208,
+      "target": 0.5,
+      "kind": "target"
+    },
+    {
+      "N": 4096,
+      "workers": 6,
+      "receivers": 2,
+      "rate": 10000000,
+      "u_max_worker": 0.7461885396782151,
+      "u_total": 2.601483481166961,
+      "target": "0.7,0.85",
+      "kind": "target"
+    },
+    {
+      "N": 4096,
+      "workers": 6,
+      "receivers": 3,
+      "rate": 10000000,
+      "u_max_worker": 1.1192828095173226,
+      "u_total": 3.9022252217504416,
+      "target": 0.95,
+      "kind": "target"
+    },
+    {
+      "N": 1024,
+      "workers": 1,
+      "receivers": 1,
+      "rate": 5000000,
+      "u_max_worker": 0.6797042236178469,
+      "u_total": 0.679704223617847,
+      "target": null,
+      "kind": "rate_sweep"
+    },
+    {
+      "N": 1024,
+      "workers": 1,
+      "receivers": 1,
+      "rate": 10000000,
+      "u_max_worker": 1.3594084472356938,
+      "u_total": 1.359408447235694,
+      "target": null,
+      "kind": "rate_sweep"
+    },
+    {
+      "N": 1024,
+      "workers": 1,
+      "receivers": 1,
+      "rate": 20000000,
+      "u_max_worker": 2.7188168944713875,
+      "u_total": 2.718816894471388,
+      "target": null,
+      "kind": "rate_sweep"
+    },
+    {
+      "N": 2048,
+      "workers": 1,
+      "receivers": 1,
+      "rate": 10000000,
+      "u_max_worker": 1.301208448347948,
+      "u_total": 1.3012084483479476,
+      "target": null,
+      "kind": "rate_sweep"
+    },
+    {
+      "N": 2048,
+      "workers": 1,
+      "receivers": 1,
+      "rate": 20000000,
+      "u_max_worker": 2.602416896695896,
+      "u_total": 2.602416896695895,
+      "target": null,
+      "kind": "rate_sweep"
+    },
+    {
+      "N": 4096,
+      "workers": 1,
+      "receivers": 1,
+      "rate": 10000000,
+      "u_max_worker": 1.3007417405834802,
+      "u_total": 1.3007417405834805,
+      "target": null,
+      "kind": "rate_sweep"
+    },
+    {
+      "N": 4096,
+      "workers": 1,
+      "receivers": 1,
+      "rate": 20000000,
+      "u_max_worker": 2.6014834811669605,
+      "u_total": 2.601483481166961,
+      "target": null,
+      "kind": "rate_sweep"
+    }
+  ],
+  "grid": [
+    {
+      "N": 1024,
+      "workers": 1,
+      "receivers": 1,
+      "rate": 2500000,
+      "u_max_worker": 0.33985211180892344,
+      "u_total": 0.3398521118089235
+    },
+    {
+      "N": 1024,
+      "workers": 1,
+      "receivers": 1,
+      "rate": 5000000,
+      "u_max_worker": 0.6797042236178469,
+      "u_total": 0.679704223617847
+    },
+    {
+      "N": 1024,
+      "workers": 1,
+      "receivers": 1,
+      "rate": 10000000,
+      "u_max_worker": 1.3594084472356938,
+      "u_total": 1.359408447235694
+    },
+    {
+      "N": 1024,
+      "workers": 1,
+      "receivers": 2,
+      "rate": 2500000,
+      "u_max_worker": 0.679704223617847,
+      "u_total": 0.679704223617847
+    },
+    {
+      "N": 1024,
+      "workers": 1,
+      "receivers": 2,
+      "rate": 5000000,
+      "u_max_worker": 1.359408447235694,
+      "u_total": 1.359408447235694
+    },
+    {
+      "N": 1024,
+      "workers": 1,
+      "receivers": 2,
+      "rate": 10000000,
+      "u_max_worker": 2.718816894471388,
+      "u_total": 2.718816894471388
+    },
+    {
+      "N": 1024,
+      "workers": 1,
+      "receivers": 3,
+      "rate": 2500000,
+      "u_max_worker": 1.0195563354267705,
+      "u_total": 1.0195563354267705
+    },
+    {
+      "N": 1024,
+      "workers": 1,
+      "receivers": 3,
+      "rate": 5000000,
+      "u_max_worker": 2.039112670853541,
+      "u_total": 2.039112670853541
+    },
+    {
+      "N": 1024,
+      "workers": 1,
+      "receivers": 3,
+      "rate": 10000000,
+      "u_max_worker": 4.078225341707082,
+      "u_total": 4.078225341707082
+    },
+    {
+      "N": 1024,
+      "workers": 1,
+      "receivers": 4,
+      "rate": 2500000,
+      "u_max_worker": 1.3594084472356942,
+      "u_total": 1.359408447235694
+    },
+    {
+      "N": 1024,
+      "workers": 1,
+      "receivers": 4,
+      "rate": 5000000,
+      "u_max_worker": 2.7188168944713884,
+      "u_total": 2.718816894471388
+    },
+    {
+      "N": 1024,
+      "workers": 1,
+      "receivers": 4,
+      "rate": 10000000,
+      "u_max_worker": 5.437633788942777,
+      "u_total": 5.437633788942776
+    },
+    {
+      "N": 1024,
+      "workers": 2,
+      "receivers": 1,
+      "rate": 2500000,
+      "u_max_worker": 0.26096156570847046,
+      "u_total": 0.3398521118089235
+    },
+    {
+      "N": 1024,
+      "workers": 2,
+      "receivers": 1,
+      "rate": 5000000,
+      "u_max_worker": 0.5219231314169409,
+      "u_total": 0.679704223617847
+    },
+    {
+      "N": 1024,
+      "workers": 2,
+      "receivers": 1,
+      "rate": 10000000,
+      "u_max_worker": 1.0438462628338818,
+      "u_total": 1.359408447235694
+    },
+    {
+      "N": 1024,
+      "workers": 2,
+      "receivers": 2,
+      "rate": 2500000,
+      "u_max_worker": 0.5219231314169409,
+      "u_total": 0.679704223617847
+    },
+    {
+      "N": 1024,
+      "workers": 2,
+      "receivers": 2,
+      "rate": 5000000,
+      "u_max_worker": 1.0438462628338818,
+      "u_total": 1.359408447235694
+    },
+    {
+      "N": 1024,
+      "workers": 2,
+      "receivers": 2,
+      "rate": 10000000,
+      "u_max_worker": 2.0876925256677636,
+      "u_total": 2.718816894471388
+    },
+    {
+      "N": 1024,
+      "workers": 2,
+      "receivers": 3,
+      "rate": 2500000,
+      "u_max_worker": 0.7828846971254116,
+      "u_total": 1.0195563354267705
+    },
+    {
+      "N": 1024,
+      "workers": 2,
+      "receivers": 3,
+      "rate": 5000000,
+      "u_max_worker": 1.5657693942508233,
+      "u_total": 2.039112670853541
+    },
+    {
+      "N": 1024,
+      "workers": 2,
+      "receivers": 3,
+      "rate": 10000000,
+      "u_max_worker": 3.1315387885016466,
+      "u_total": 4.078225341707082
+    },
+    {
+      "N": 1024,
+      "workers": 2,
+      "receivers": 4,
+      "rate": 2500000,
+      "u_max_worker": 1.0438462628338823,
+      "u_total": 1.359408447235694
+    },
+    {
+      "N": 1024,
+      "workers": 2,
+      "receivers": 4,
+      "rate": 5000000,
+      "u_max_worker": 2.0876925256677645,
+      "u_total": 2.718816894471388
+    },
+    {
+      "N": 1024,
+      "workers": 2,
+      "receivers": 4,
+      "rate": 10000000,
+      "u_max_worker": 4.175385051335529,
+      "u_total": 5.437633788942776
+    },
+    {
+      "N": 1024,
+      "workers": 6,
+      "receivers": 1,
+      "rate": 2500000,
+      "u_max_worker": 0.09662035841282737,
+      "u_total": 0.3398521118089235
+    },
+    {
+      "N": 1024,
+      "workers": 6,
+      "receivers": 1,
+      "rate": 5000000,
+      "u_max_worker": 0.19324071682565475,
+      "u_total": 0.679704223617847
+    },
+    {
+      "N": 1024,
+      "workers": 6,
+      "receivers": 1,
+      "rate": 10000000,
+      "u_max_worker": 0.3864814336513095,
+      "u_total": 1.359408447235694
+    },
+    {
+      "N": 1024,
+      "workers": 6,
+      "receivers": 2,
+      "rate": 2500000,
+      "u_max_worker": 0.19324071682565477,
+      "u_total": 0.679704223617847
+    },
+    {
+      "N": 1024,
+      "workers": 6,
+      "receivers": 2,
+      "rate": 5000000,
+      "u_max_worker": 0.38648143365130955,
+      "u_total": 1.359408447235694
+    },
+    {
+      "N": 1024,
+      "workers": 6,
+      "receivers": 2,
+      "rate": 10000000,
+      "u_max_worker": 0.7729628673026191,
+      "u_total": 2.718816894471388
+    },
+    {
+      "N": 1024,
+      "workers": 6,
+      "receivers": 3,
+      "rate": 2500000,
+      "u_max_worker": 0.28986107523848215,
+      "u_total": 1.0195563354267705
+    },
+    {
+      "N": 1024,
+      "workers": 6,
+      "receivers": 3,
+      "rate": 5000000,
+      "u_max_worker": 0.5797221504769643,
+      "u_total": 2.039112670853541
+    },
+    {
+      "N": 1024,
+      "workers": 6,
+      "receivers": 3,
+      "rate": 10000000,
+      "u_max_worker": 1.1594443009539286,
+      "u_total": 4.078225341707082
+    },
+    {
+      "N": 1024,
+      "workers": 6,
+      "receivers": 4,
+      "rate": 2500000,
+      "u_max_worker": 0.3864814336513095,
+      "u_total": 1.359408447235694
+    },
+    {
+      "N": 1024,
+      "workers": 6,
+      "receivers": 4,
+      "rate": 5000000,
+      "u_max_worker": 0.772962867302619,
+      "u_total": 2.718816894471388
+    },
+    {
+      "N": 1024,
+      "workers": 6,
+      "receivers": 4,
+      "rate": 10000000,
+      "u_max_worker": 1.545925734605238,
+      "u_total": 5.437633788942776
+    },
+    {
+      "N": 2048,
+      "workers": 1,
+      "receivers": 1,
+      "rate": 2500000,
+      "u_max_worker": 0.325302112086987,
+      "u_total": 0.3253021120869869
+    },
+    {
+      "N": 2048,
+      "workers": 1,
+      "receivers": 1,
+      "rate": 5000000,
+      "u_max_worker": 0.650604224173974,
+      "u_total": 0.6506042241739738
+    },
+    {
+      "N": 2048,
+      "workers": 1,
+      "receivers": 1,
+      "rate": 10000000,
+      "u_max_worker": 1.301208448347948,
+      "u_total": 1.3012084483479476
+    },
+    {
+      "N": 2048,
+      "workers": 1,
+      "receivers": 2,
+      "rate": 2500000,
+      "u_max_worker": 0.6506042241739739,
+      "u_total": 0.6506042241739738
+    },
+    {
+      "N": 2048,
+      "workers": 1,
+      "receivers": 2,
+      "rate": 5000000,
+      "u_max_worker": 1.3012084483479478,
+      "u_total": 1.3012084483479476
+    },
+    {
+      "N": 2048,
+      "workers": 1,
+      "receivers": 2,
+      "rate": 10000000,
+      "u_max_worker": 2.6024168966958956,
+      "u_total": 2.602416896695895
+    },
+    {
+      "N": 2048,
+      "workers": 1,
+      "receivers": 3,
+      "rate": 2500000,
+      "u_max_worker": 0.9759063362609608,
+      "u_total": 0.9759063362609607
+    },
+    {
+      "N": 2048,
+      "workers": 1,
+      "receivers": 3,
+      "rate": 5000000,
+      "u_max_worker": 1.9518126725219216,
+      "u_total": 1.9518126725219214
+    },
+    {
+      "N": 2048,
+      "workers": 1,
+      "receivers": 3,
+      "rate": 10000000,
+      "u_max_worker": 3.903625345043843,
+      "u_total": 3.9036253450438427
+    },
+    {
+      "N": 2048,
+      "workers": 1,
+      "receivers": 4,
+      "rate": 2500000,
+      "u_max_worker": 1.301208448347947,
+      "u_total": 1.3012084483479476
+    },
+    {
+      "N": 2048,
+      "workers": 1,
+      "receivers": 4,
+      "rate": 5000000,
+      "u_max_worker": 2.602416896695894,
+      "u_total": 2.602416896695895
+    },
+    {
+      "N": 2048,
+      "workers": 1,
+      "receivers": 4,
+      "rate": 10000000,
+      "u_max_worker": 5.204833793391788,
+      "u_total": 5.20483379339179
+    },
+    {
+      "N": 2048,
+      "workers": 2,
+      "receivers": 1,
+      "rate": 2500000,
+      "u_max_worker": 0.25208912310859083,
+      "u_total": 0.3253021120869869
+    },
+    {
+      "N": 2048,
+      "workers": 2,
+      "receivers": 1,
+      "rate": 5000000,
+      "u_max_worker": 0.5041782462171817,
+      "u_total": 0.6506042241739738
+    },
+    {
+      "N": 2048,
+      "workers": 2,
+      "receivers": 1,
+      "rate": 10000000,
+      "u_max_worker": 1.0083564924343633,
+      "u_total": 1.3012084483479476
+    },
+    {
+      "N": 2048,
+      "workers": 2,
+      "receivers": 2,
+      "rate": 2500000,
+      "u_max_worker": 0.5041782462171817,
+      "u_total": 0.6506042241739738
+    },
+    {
+      "N": 2048,
+      "workers": 2,
+      "receivers": 2,
+      "rate": 5000000,
+      "u_max_worker": 1.0083564924343633,
+      "u_total": 1.3012084483479476
+    },
+    {
+      "N": 2048,
+      "workers": 2,
+      "receivers": 2,
+      "rate": 10000000,
+      "u_max_worker": 2.0167129848687266,
+      "u_total": 2.602416896695895
+    },
+    {
+      "N": 2048,
+      "workers": 2,
+      "receivers": 3,
+      "rate": 2500000,
+      "u_max_worker": 0.7562673693257725,
+      "u_total": 0.9759063362609607
+    },
+    {
+      "N": 2048,
+      "workers": 2,
+      "receivers": 3,
+      "rate": 5000000,
+      "u_max_worker": 1.512534738651545,
+      "u_total": 1.9518126725219214
+    },
+    {
+      "N": 2048,
+      "workers": 2,
+      "receivers": 3,
+      "rate": 10000000,
+      "u_max_worker": 3.02506947730309,
+      "u_total": 3.9036253450438427
+    },
+    {
+      "N": 2048,
+      "workers": 2,
+      "receivers": 4,
+      "rate": 2500000,
+      "u_max_worker": 1.008356492434363,
+      "u_total": 1.3012084483479476
+    },
+    {
+      "N": 2048,
+      "workers": 2,
+      "receivers": 4,
+      "rate": 5000000,
+      "u_max_worker": 2.016712984868726,
+      "u_total": 2.602416896695895
+    },
+    {
+      "N": 2048,
+      "workers": 2,
+      "receivers": 4,
+      "rate": 10000000,
+      "u_max_worker": 4.033425969737452,
+      "u_total": 5.20483379339179
+    },
+    {
+      "N": 2048,
+      "workers": 6,
+      "receivers": 1,
+      "rate": 2500000,
+      "u_max_worker": 0.09310977856409577,
+      "u_total": 0.3253021120869869
+    },
+    {
+      "N": 2048,
+      "workers": 6,
+      "receivers": 1,
+      "rate": 5000000,
+      "u_max_worker": 0.18621955712819155,
+      "u_total": 0.6506042241739738
+    },
+    {
+      "N": 2048,
+      "workers": 6,
+      "receivers": 1,
+      "rate": 10000000,
+      "u_max_worker": 0.3724391142563831,
+      "u_total": 1.3012084483479476
+    },
+    {
+      "N": 2048,
+      "workers": 6,
+      "receivers": 2,
+      "rate": 2500000,
+      "u_max_worker": 0.18621955712819152,
+      "u_total": 0.6506042241739738
+    },
+    {
+      "N": 2048,
+      "workers": 6,
+      "receivers": 2,
+      "rate": 5000000,
+      "u_max_worker": 0.37243911425638304,
+      "u_total": 1.3012084483479476
+    },
+    {
+      "N": 2048,
+      "workers": 6,
+      "receivers": 2,
+      "rate": 10000000,
+      "u_max_worker": 0.7448782285127661,
+      "u_total": 2.602416896695895
+    },
+    {
+      "N": 2048,
+      "workers": 6,
+      "receivers": 3,
+      "rate": 2500000,
+      "u_max_worker": 0.2793293356922873,
+      "u_total": 0.9759063362609607
+    },
+    {
+      "N": 2048,
+      "workers": 6,
+      "receivers": 3,
+      "rate": 5000000,
+      "u_max_worker": 0.5586586713845746,
+      "u_total": 1.9518126725219214
+    },
+    {
+      "N": 2048,
+      "workers": 6,
+      "receivers": 3,
+      "rate": 10000000,
+      "u_max_worker": 1.1173173427691492,
+      "u_total": 3.9036253450438427
+    },
+    {
+      "N": 2048,
+      "workers": 6,
+      "receivers": 4,
+      "rate": 2500000,
+      "u_max_worker": 0.3724391142563831,
+      "u_total": 1.3012084483479476
+    },
+    {
+      "N": 2048,
+      "workers": 6,
+      "receivers": 4,
+      "rate": 5000000,
+      "u_max_worker": 0.7448782285127662,
+      "u_total": 2.602416896695895
+    },
+    {
+      "N": 2048,
+      "workers": 6,
+      "receivers": 4,
+      "rate": 10000000,
+      "u_max_worker": 1.4897564570255324,
+      "u_total": 5.20483379339179
+    },
+    {
+      "N": 4096,
+      "workers": 1,
+      "receivers": 1,
+      "rate": 2500000,
+      "u_max_worker": 0.32518543514587006,
+      "u_total": 0.3251854351458701
+    },
+    {
+      "N": 4096,
+      "workers": 1,
+      "receivers": 1,
+      "rate": 5000000,
+      "u_max_worker": 0.6503708702917401,
+      "u_total": 0.6503708702917402
+    },
+    {
+      "N": 4096,
+      "workers": 1,
+      "receivers": 1,
+      "rate": 10000000,
+      "u_max_worker": 1.3007417405834802,
+      "u_total": 1.3007417405834805
+    },
+    {
+      "N": 4096,
+      "workers": 1,
+      "receivers": 2,
+      "rate": 2500000,
+      "u_max_worker": 0.6503708702917402,
+      "u_total": 0.6503708702917402
+    },
+    {
+      "N": 4096,
+      "workers": 1,
+      "receivers": 2,
+      "rate": 5000000,
+      "u_max_worker": 1.3007417405834805,
+      "u_total": 1.3007417405834805
+    },
+    {
+      "N": 4096,
+      "workers": 1,
+      "receivers": 2,
+      "rate": 10000000,
+      "u_max_worker": 2.601483481166961,
+      "u_total": 2.601483481166961
+    },
+    {
+      "N": 4096,
+      "workers": 1,
+      "receivers": 3,
+      "rate": 2500000,
+      "u_max_worker": 0.9755563054376105,
+      "u_total": 0.9755563054376104
+    },
+    {
+      "N": 4096,
+      "workers": 1,
+      "receivers": 3,
+      "rate": 5000000,
+      "u_max_worker": 1.951112610875221,
+      "u_total": 1.9511126108752208
+    },
+    {
+      "N": 4096,
+      "workers": 1,
+      "receivers": 3,
+      "rate": 10000000,
+      "u_max_worker": 3.902225221750442,
+      "u_total": 3.9022252217504416
+    },
+    {
+      "N": 4096,
+      "workers": 1,
+      "receivers": 4,
+      "rate": 2500000,
+      "u_max_worker": 1.3007417405834805,
+      "u_total": 1.3007417405834805
+    },
+    {
+      "N": 4096,
+      "workers": 1,
+      "receivers": 4,
+      "rate": 5000000,
+      "u_max_worker": 2.601483481166961,
+      "u_total": 2.601483481166961
+    },
+    {
+      "N": 4096,
+      "workers": 1,
+      "receivers": 4,
+      "rate": 10000000,
+      "u_max_worker": 5.202966962333922,
+      "u_total": 5.202966962333922
+    },
+    {
+      "N": 4096,
+      "workers": 2,
+      "receivers": 1,
+      "rate": 2500000,
+      "u_max_worker": 0.252326163968193,
+      "u_total": 0.3251854351458701
+    },
+    {
+      "N": 4096,
+      "workers": 2,
+      "receivers": 1,
+      "rate": 5000000,
+      "u_max_worker": 0.504652327936386,
+      "u_total": 0.6503708702917402
+    },
+    {
+      "N": 4096,
+      "workers": 2,
+      "receivers": 1,
+      "rate": 10000000,
+      "u_max_worker": 1.009304655872772,
+      "u_total": 1.3007417405834805
+    },
+    {
+      "N": 4096,
+      "workers": 2,
+      "receivers": 2,
+      "rate": 2500000,
+      "u_max_worker": 0.504652327936386,
+      "u_total": 0.6503708702917402
+    },
+    {
+      "N": 4096,
+      "workers": 2,
+      "receivers": 2,
+      "rate": 5000000,
+      "u_max_worker": 1.009304655872772,
+      "u_total": 1.3007417405834805
+    },
+    {
+      "N": 4096,
+      "workers": 2,
+      "receivers": 2,
+      "rate": 10000000,
+      "u_max_worker": 2.018609311745544,
+      "u_total": 2.601483481166961
+    },
+    {
+      "N": 4096,
+      "workers": 2,
+      "receivers": 3,
+      "rate": 2500000,
+      "u_max_worker": 0.7569784919045791,
+      "u_total": 0.9755563054376104
+    },
+    {
+      "N": 4096,
+      "workers": 2,
+      "receivers": 3,
+      "rate": 5000000,
+      "u_max_worker": 1.5139569838091582,
+      "u_total": 1.9511126108752208
+    },
+    {
+      "N": 4096,
+      "workers": 2,
+      "receivers": 3,
+      "rate": 10000000,
+      "u_max_worker": 3.0279139676183164,
+      "u_total": 3.9022252217504416
+    },
+    {
+      "N": 4096,
+      "workers": 2,
+      "receivers": 4,
+      "rate": 2500000,
+      "u_max_worker": 1.0093046558727723,
+      "u_total": 1.3007417405834805
+    },
+    {
+      "N": 4096,
+      "workers": 2,
+      "receivers": 4,
+      "rate": 5000000,
+      "u_max_worker": 2.0186093117455446,
+      "u_total": 2.601483481166961
+    },
+    {
+      "N": 4096,
+      "workers": 2,
+      "receivers": 4,
+      "rate": 10000000,
+      "u_max_worker": 4.037218623491089,
+      "u_total": 5.202966962333922
+    },
+    {
+      "N": 4096,
+      "workers": 6,
+      "receivers": 1,
+      "rate": 2500000,
+      "u_max_worker": 0.09327356745977688,
+      "u_total": 0.3251854351458701
+    },
+    {
+      "N": 4096,
+      "workers": 6,
+      "receivers": 1,
+      "rate": 5000000,
+      "u_max_worker": 0.18654713491955377,
+      "u_total": 0.6503708702917402
+    },
+    {
+      "N": 4096,
+      "workers": 6,
+      "receivers": 1,
+      "rate": 10000000,
+      "u_max_worker": 0.37309426983910754,
+      "u_total": 1.3007417405834805
+    },
+    {
+      "N": 4096,
+      "workers": 6,
+      "receivers": 2,
+      "rate": 2500000,
+      "u_max_worker": 0.18654713491955377,
+      "u_total": 0.6503708702917402
+    },
+    {
+      "N": 4096,
+      "workers": 6,
+      "receivers": 2,
+      "rate": 5000000,
+      "u_max_worker": 0.37309426983910754,
+      "u_total": 1.3007417405834805
+    },
+    {
+      "N": 4096,
+      "workers": 6,
+      "receivers": 2,
+      "rate": 10000000,
+      "u_max_worker": 0.7461885396782151,
+      "u_total": 2.601483481166961
+    },
+    {
+      "N": 4096,
+      "workers": 6,
+      "receivers": 3,
+      "rate": 2500000,
+      "u_max_worker": 0.27982070237933065,
+      "u_total": 0.9755563054376104
+    },
+    {
+      "N": 4096,
+      "workers": 6,
+      "receivers": 3,
+      "rate": 5000000,
+      "u_max_worker": 0.5596414047586613,
+      "u_total": 1.9511126108752208
+    },
+    {
+      "N": 4096,
+      "workers": 6,
+      "receivers": 3,
+      "rate": 10000000,
+      "u_max_worker": 1.1192828095173226,
+      "u_total": 3.9022252217504416
+    },
+    {
+      "N": 4096,
+      "workers": 6,
+      "receivers": 4,
+      "rate": 2500000,
+      "u_max_worker": 0.37309426983910754,
+      "u_total": 1.3007417405834805
+    },
+    {
+      "N": 4096,
+      "workers": 6,
+      "receivers": 4,
+      "rate": 5000000,
+      "u_max_worker": 0.7461885396782151,
+      "u_total": 2.601483481166961
+    },
+    {
+      "N": 4096,
+      "workers": 6,
+      "receivers": 4,
+      "rate": 10000000,
+      "u_max_worker": 1.4923770793564302,
+      "u_total": 5.202966962333922
+    }
+  ]
+}

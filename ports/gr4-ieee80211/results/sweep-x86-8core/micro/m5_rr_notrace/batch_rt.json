@@ -1,0 +1,70 @@
+{
+  "run_dir": "results/sweep-x86-8core/micro/m5_rr_notrace",
+  "policy": "rr",
+  "policy_name": "RoundRobin",
+  "threads": 1,
+  "chains": 1,
+  "rate": 2500000.0,
+  "fixed_batch": 1024,
+  "buffer": 16384,
+  "warmup_s": 5.0,
+  "window_s": 20.0,
+  "trace": {
+    "compiled_in": true,
+    "mask": 0,
+    "buffer_records": 0,
+    "limit_mb": 0,
+    "recorded": 0,
+    "lost": 0,
+    "rings": 0,
+    "path": null,
+    "written": null
+  },
+  "result": "ok",
+  "per_chain": [
+    {
+      "chain": 0,
+      "deadline_factor": 1.0,
+      "frame_deadline_factor": 1.0,
+      "frames": 12866,
+      "decoded": 12866,
+      "decoded_in_window": 8578,
+      "frame_rt": {
+        "n": 8578,
+        "min_us": 148.715,
+        "max_us": 720.655,
+        "mean_us": 303.83223327115877,
+        "std_us": 179.94684948755804,
+        "p50_us": 185.9015,
+        "p95_us": 574.5705,
+        "p99_us": 585.6392
+      },
+      "frame_rt_all": {
+        "n": 12866,
+        "min_us": 148.465,
+        "max_us": 720.655,
+        "mean_us": 304.1816569252293,
+        "std_us": 180.02190166838943,
+        "p50_us": 186.106,
+        "p95_us": 574.759,
+        "p99_us": 586.7305000000001
+      }
+    }
+  ],
+  "utilization": null,
+  "edf": null,
+  "sync": null,
+  "batch_period_us": 409.6,
+  "elapsed_s": 30.033400992,
+  "air_s": 30.0,
+  "realtime_ratio": 1.0011133664,
+  "saturated": false,
+  "saturation_reason": null,
+  "window_ns": [
+    91842819835501,
+    91862819835501
+  ],
+  "deadline_classes": [],
+  "frame_deadline": 1.0,
+  "note": "no capture (or no fixed batch): frame response times only"
+}

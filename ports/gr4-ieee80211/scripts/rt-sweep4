@@ -1,0 +1,209 @@
+#!/usr/bin/env python3
+"""rt-sweep4 -- run the 0036 experiment matrix from a machine profile.
+
+    ./scripts/rt-sweep4 PROFILE.json --probe            # the probe runs (one per batch size), then rt-plan4
+    ./scripts/rt-sweep4 PROFILE.json --plan PLAN.json   # the sweep: every point x policy x repeat, plus controls
+    ./scripts/rt-sweep4 PROFILE.json --plan PLAN.json --dry-run   # print the commands only
+    ./scripts/rt-sweep4 PROFILE.json --smoke            # a one-repeat mini matrix to prove the pipeline (run_s of the profile)
+    ./scripts/rt-sweep4 PROFILE.json --classes          # the deadline-structure sweep (profile["classes"]: points, settings, run_s, repeats)
+
+Every run lands in <cell>/runs4/sweep-<profile>/<tag>/ with latency.csv,
+latency_summary.json, trace_meta.json, the capture (trace.gr4trace, gitignored)
+and, after scripts/trace-batch-rt.py, the CSV tables and batch_rt.json.
+`sweep_index.csv` in the sweep directory lists every run.  Written in Python
+because a JSON profile and a four-dimensional matrix are awkward in bash;
+nothing here runs inside a flowgraph.
+"""
+import argparse, csv, json, os, subprocess, sys, time
+
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+RX = os.path.join(HERE, "build", "rx_latency4")
+GEN = os.path.join(HERE, "build", "gen4")
+ANALYSE = os.path.join(HERE, "scripts", "trace-batch-rt.py")
+PLAN = os.path.join(HERE, "scripts", "rt-plan4.py")
+
+
+def sh(cmd, dry):
+    print("+ " + " ".join(cmd), flush=True)
+    if dry:
+        return 0
+    return subprocess.call(cmd)
+
+
+def ensure_cell(prof, dry):
+    cell = prof["cell"]
+    if os.path.exists(os.path.join(cell, "rx_stimulus.cf32")) and os.path.exists(os.path.join(cell, "manifest.json")):
+        return cell
+    # data/rt_<MIN>_<MAX>_<N>_<MCS>_s<seed>
+    base = os.path.basename(cell)
+    parts = base.split("_")
+    if parts[0] != "rt" or len(parts) < 6:
+        sys.exit(f"rt-sweep4: cell {cell} missing and its name is not rt_MIN_MAX_N_MCS_sSEED, cannot generate")
+    mn, mx, n = parts[1], parts[2], parts[3]
+    mcs = "_".join(parts[4:-1])
+    seed = parts[-1][1:]
+    if sh([GEN, "--out", cell, "--frames", n, "--payload-range", f"{mn},{mx}", "--mcs", mcs, "--seed", seed, "--force"], dry) != 0:
+        sys.exit("rt-sweep4: gen4 failed")
+    return cell
+
+
+
+
+def one_run(prof, cell, sweep_dir, point, policy, rep, traced, run_s, a, setting=None):
+    N, T, R, rate = point["N"], point["workers"], point["receivers"], point["rate"]
+    kind = point.get("kind", "point")
+    tag = f"{kind}_N{N}_t{T}_r{R}_rate{int(rate)}_{policy}_{'trace' if traced else 'notrace'}_rep{rep}"
+    if setting:
+        tag = f"cls-{setting['name']}_" + tag
+    if point.get("rates"):
+        tag = f"mr-{point['mix']}_N{N}_t{T}_r{R}_{policy}_{'trace' if traced else 'notrace'}_rep{rep}"
+    out = os.path.join(sweep_dir, tag)
+    if a.skip_existing and os.path.exists(os.path.join(out, "batch_rt.json")):
+        print("skip (exists) " + tag, flush=True)
+        return None
+    os.makedirs(out, exist_ok=True)
+    # a run of run_s seconds whatever the rate: replay the first run_s x rate samples
+    max_samples = int(run_s * rate) if run_s else 0
+    cmd = [RX, "--run-dir", cell, "--input", os.path.join(cell, "rx_stimulus.cf32"), "--out-dir", out,
+           "--rate", str(int(rate)), "--chains", str(R), "--threads", str(T), "--policy", policy,
+           "--fixed-batch", str(N), "--timeout-s", str(prof.get("timeout_s", 300))]
+    if point.get("rates"):
+        # multi-rate receivers: per-receiver rates, a run of run_s seconds each, rotated construction order
+        cmd = [c for c in cmd if c not in ("--rate", str(int(rate)))]
+        cmd += ["--rates", ",".join(str(int(r)) for r in point["rates"]), "--run-s", str(run_s), "--rotate", str(point.get("rotate", 0))]
+        max_samples = 0
+    if max_samples:
+        cmd += ["--max-samples", str(max_samples)]
+    if setting:
+        # modification A: chain 0 is the control-channel receiver with the tight class factor
+        if setting.get("tight"):
+            # tight_index: which receiver is the control channel (default 0 = first in graph order;
+            # -1 = last, the receiver round robin's list order serves last)
+            idx = setting.get("tight_index", 0) % R
+            cls = ["1"] * R
+            cls[idx] = str(setting["tight"])
+            cmd += ["--deadline-classes", ",".join(cls)]
+        # modification B: the frame path of every receiver
+        if setting.get("frame"):
+            cmd += ["--frame-deadline", str(setting["frame"])]
+    if prof.get("sched_ratio"):
+        cmd += ["--sched-ratio", str(prof["sched_ratio"])]
+    if traced:
+        cmd += ["--trace-categories", str(prof.get("trace_categories", "all")), "--trace-buffer", str(prof["trace_buffer_records"]),
+                "--trace-limit-mb", str(prof["trace_limit_mb"]), "--trace-out", os.path.join(out, "trace.gr4trace")]
+    t0 = time.time()
+    rc = sh(cmd, a.dry_run)
+    if not a.dry_run:
+        rc2 = sh([sys.executable, ANALYSE, out, "--warmup", str(prof["warmup_s"]), "--window", str(prof["window_s"]), "--quiet"], False)
+        if traced and not a.keep_captures:
+            cap = os.path.join(out, "trace.gr4trace")
+            if os.path.exists(cap):
+                os.remove(cap)
+        if traced and not a.keep_tables:
+            # the per-record tables are hundreds of MB per run; batch_rt.json/csv, the header,
+            # the census and the entities stay (batch_rt.json holds the EDF and re-sync summaries)
+            # (the EDF release/miss tables are hundreds of MB too: a 60 s EDF run releases millions of jobs)
+            for f in ("trace_invocations.csv", "trace_work.csv", "trace_probes.csv", "trace_events.csv", "trace_sweeps.csv", "trace_releases.csv", "trace_misses.csv", "trace_sync.csv"):
+                fp = os.path.join(out, f)
+                if os.path.exists(fp):
+                    os.remove(fp)
+    else:
+        rc2 = 0
+    return {"tag": tag, "dir": out, "N": N, "workers": T, "receivers": R, "rate": rate, "policy": policy, "traced": traced, "rep": rep,
+            "target": point.get("target"), "kind": point.get("kind"), "setting": setting["name"] if setting else "", "mix": point.get("mix", ""), "rates": ",".join(str(int(r)) for r in point.get("rates", [])), "rc": rc, "analysis_rc": rc2, "wall_s": round(time.time() - t0, 1)}
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("profile")
+    ap.add_argument("--probe", action="store_true")
+    ap.add_argument("--plan")
+    ap.add_argument("--classes", action="store_true", help="the deadline-structure sweep of profile['classes']: points x settings x policies x repeats")
+    ap.add_argument("--multirate", action="store_true", help="the multi-rate receivers experiment of profile['multirate']: mixes x policies x repeats")
+    ap.add_argument("--smoke", action="store_true")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--policies", help="comma list overriding the profile's")
+    ap.add_argument("--repeats", type=int)
+    ap.add_argument("--keep-captures", action="store_true", help="keep trace.gr4trace after analysis (default: deleted; ~1 GB per run)")
+    ap.add_argument("--keep-tables", action="store_true", help="keep the per-record CSV tables after analysis (default: deleted; hundreds of MB per run)")
+    ap.add_argument("--rep-start", type=int, default=0, help="first repeat index to run (resume a sweep)")
+    ap.add_argument("--cell", help="override the profile's cell (e.g. a short one for --smoke)")
+    ap.add_argument("--skip-existing", action="store_true", help="skip a run whose directory already holds batch_rt.json (resume after an interruption)")
+    a = ap.parse_args()
+    prof = json.load(open(a.profile))
+    if a.cell:
+        prof["cell"] = a.cell
+    os.chdir(HERE)
+    for b in (RX,):
+        if not os.path.exists(b) and not a.dry_run:
+            sys.exit(f"rt-sweep4: {b} missing -- cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build --target rx_latency4 gen4 trace_export")
+    cell = ensure_cell(prof, a.dry_run)
+    sweep_dir = os.path.join(cell, "runs4", f"sweep-{prof['name']}" + ("-smoke" if a.smoke else "") + ("-classes" if a.classes else "") + ("-multirate" if a.multirate else ""))
+    os.makedirs(sweep_dir, exist_ok=True)
+    policies = a.policies.split(",") if a.policies else prof["policies"]
+    repeats = a.repeats or (1 if a.smoke else prof["repeats"])
+    index = []
+    if a.probe or a.smoke:
+        # probes: one receiver, one worker, every N, round robin, traced
+        probe_dirs = []
+        for N in prof["batches"]:
+            pt = {"N": N, "workers": 1, "receivers": 1, "rate": prof.get("probe_rate", min(prof["rates"])), "kind": "probe"}
+            r = one_run(prof, cell, sweep_dir, pt, "rr", 0, True, prof["run_s"], a)
+            index.append(r)
+            probe_dirs.append(r["dir"])
+        if not a.dry_run:
+            plan_path = os.path.join(sweep_dir, "plan.json")
+            sh([sys.executable, PLAN, a.profile, *probe_dirs, "--out", plan_path], False)
+            print(f"rt-sweep4: plan written to {plan_path}; next: ./scripts/rt-sweep4 {a.profile} --plan {plan_path}")
+        if a.smoke:
+            pts = [{"N": prof["batches"][0], "workers": 1, "receivers": 1, "rate": prof.get("probe_rate", min(prof["rates"])), "kind": "smoke"}]
+            for pt in pts:
+                for pol in policies:
+                    index.append(one_run(prof, cell, sweep_dir, pt, pol, 0, True, prof["run_s"], a))
+                index.append(one_run(prof, cell, sweep_dir, pts[0], policies[0], 0, False, prof["run_s"], a))
+    if a.plan:
+        plan = json.load(open(a.plan))
+        pts = plan["points"]
+        for rep in range(a.rep_start, repeats):
+            for pt in pts:
+                for pol in policies:
+                    index.append(one_run(prof, cell, sweep_dir, pt, pol, rep, True, prof["run_s"], a))
+            # untraced controls: per N, the point with the highest predicted utilization (0036 item 26)
+            if prof.get("controls") == "top":
+                for N in sorted({p["N"] for p in pts}):
+                    top = max((p for p in pts if p["N"] == N), key=lambda p: p["u_max_worker"])
+                    for pol in policies:
+                        index.append(one_run(prof, cell, sweep_dir, top, pol, rep, False, prof["run_s"], a))
+    if a.classes:
+        cls = prof["classes"]
+        run_s = cls.get("run_s", prof["run_s"])
+        reps_c = a.repeats or cls.get("repeats", prof["repeats"])
+        for rep in range(a.rep_start, reps_c):
+            for pt in cls["points"]:
+                pt = dict(pt, kind="cls")
+                for st in cls["settings"]:
+                    for pol in policies:
+                        index.append(one_run(prof, cell, sweep_dir, pt, pol, rep, True, run_s, a, setting=st))
+    if a.multirate:
+        mr = prof["multirate"]
+        run_s = mr.get("run_s", prof["run_s"])
+        reps_m = a.repeats or mr.get("repeats", prof["repeats"])
+        for rep in range(a.rep_start, reps_m):
+            for mix in mr["mixes"]:
+                pt = {"N": mr["N"], "workers": mr["workers"], "receivers": len(mix["rates"]), "rate": max(mix["rates"]), "rates": mix["rates"], "mix": mix["name"], "rotate": mr.get("rotate", 0), "kind": "mr"}
+                for pol in policies:
+                    index.append(one_run(prof, cell, sweep_dir, pt, pol, rep, True, run_s, a))
+    index = [r for r in index if r]
+    if index and not a.dry_run:
+        path = os.path.join(sweep_dir, "sweep_index.csv")
+        new = not os.path.exists(path)
+        with open(path, "a", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=list(index[0].keys()))
+            if new:
+                w.writeheader()
+            w.writerows(index)
+        print(f"rt-sweep4: {len(index)} runs appended to {path}")
+
+
+if __name__ == "__main__":
+    main()

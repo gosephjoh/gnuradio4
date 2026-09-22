@@ -1,0 +1,94 @@
+{
+  "run_dir": "results/sweep-x86-8core/micro/m4_base",
+  "window_ns": [
+    91741852398627,
+    91752383852391
+  ],
+  "starts": 1997271,
+  "starts_without_release": 4,
+  "inversions": 0,
+  "inversion_ratio": 0.0,
+  "inversions_waiting_job_tighter_class": 0,
+  "pipeline_starts": 1583464,
+  "pipeline_inversions": 0,
+  "pipeline_inversion_ratio": 0.0,
+  "inverted_wait_us": {
+    "n": 0,
+    "mean": null,
+    "max": null
+  },
+  "per_role": {
+    "throttle": {
+      "starts": 380301,
+      "inversions": 0
+    },
+    "synclong": {
+      "starts": 99280,
+      "inversions": 0
+    },
+    "latsink": {
+      "starts": 13070,
+      "inversions": 0
+    },
+    "mag": {
+      "starts": 74404,
+      "inversions": 0
+    },
+    "syncshort": {
+      "starts": 85708,
+      "inversions": 0
+    },
+    "eq": {
+      "starts": 74412,
+      "inversions": 0
+    },
+    "mag2": {
+      "starts": 74489,
+      "inversions": 0
+    },
+    "dly16": {
+      "starts": 114040,
+      "inversions": 0
+    },
+    "mul": {
+      "starts": 74445,
+      "inversions": 0
+    },
+    "fsrc": {
+      "starts": 33506,
+      "inversions": 0
+    },
+    "stamp": {
+      "starts": 36342,
+      "inversions": 0
+    },
+    "avgpow": {
+      "starts": 716642,
+      "inversions": 0
+    },
+    "conj": {
+      "starts": 36339,
+      "inversions": 0
+    },
+    "avgcor": {
+      "starts": 36339,
+      "inversions": 0
+    },
+    "div": {
+      "starts": 36339,
+      "inversions": 0
+    },
+    "fft": {
+      "starts": 40021,
+      "inversions": 0
+    },
+    "decode": {
+      "starts": 28950,
+      "inversions": 0
+    },
+    "dly320": {
+      "starts": 42644,
+      "inversions": 0
+    }
+  }
+}
