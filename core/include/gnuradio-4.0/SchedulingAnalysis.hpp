@@ -343,6 +343,37 @@ struct Readiness {
 /// belongs to the scheduling thrust, not to instrumentation.
 inline constexpr double kMaxRepresentableDeadlineSeconds = static_cast<double>(std::numeric_limits<std::chrono::steady_clock::rep>::max()) * static_cast<double>(std::chrono::steady_clock::period::num) / static_cast<double>(std::chrono::steady_clock::period::den);
 
+/**
+ * @brief Wall-clock budget for one selection pass, or zero where there is none.
+ *
+ * The selection loop is otherwise bounded by a *count* of selections, which bounds the delay before
+ * the backstop release scan runs again only in selections -- not in time, which is the unit the
+ * periods being detected are declared in. One `work()` invocation can be a microsecond or a
+ * millisecond, so the same count is two very different delays.
+ *
+ * `requestedMicros` wins outright where set. Otherwise the budget is a quarter of the shortest
+ * declared period among these states, leaving the remaining three quarters for the response itself.
+ * The divisor is a choice rather than a derivation, which is why the setting exists to override it.
+ *
+ * **Zero means inactive, never expired.** A graph in which no block declares a period keeps the
+ * pre-existing count-bounded behaviour exactly and its caller reads no clock at all. Reading a zero
+ * as "already expired" would end every pass after one selection and spend the worker on backstop
+ * scans instead of work -- the most damaging way to misread this return value.
+ */
+[[nodiscard]] inline std::chrono::nanoseconds passBudget(std::span<const SchedState> states, std::uint64_t requestedMicros) noexcept {
+    if (requestedMicros != 0ULL) {
+        return std::chrono::nanoseconds{requestedMicros * 1000ULL};
+    }
+    double shortestPeriodSeconds = 0.0;
+    for (const SchedState& state : states) {
+        // An unset period is zero and must not be mistaken for the fastest one.
+        if (state.periodSeconds > 0.0 && (shortestPeriodSeconds == 0.0 || state.periodSeconds < shortestPeriodSeconds)) {
+            shortestPeriodSeconds = state.periodSeconds;
+        }
+    }
+    return shortestPeriodSeconds > 0.0 ? std::chrono::nanoseconds{static_cast<std::uint64_t>(shortestPeriodSeconds * 0.25 * 1e9)} : std::chrono::nanoseconds{0};
+}
+
 /// `traceFlags` carries what only the caller knows: which detection path this is. Clear means the
 /// per-sweep backstop, `gr::trace::flag::kViaSuccessorWalk` the event-driven walk. Defaulted because
 /// the backstop is the neutral answer and the unit tests that drive this function directly are not

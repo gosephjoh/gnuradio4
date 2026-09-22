@@ -306,15 +306,16 @@ public:
     Annotated<std::size_t, "max_work_items", Doc<"number of work items per work scheduling interval (controls latency)">>                                                                                                                                                      max_work_items                  = std::numeric_limits<std::size_t>::max(); // TODO: check whether we can keep this std::size_t or more consistently to gr::Size_t
     Annotated<property_map, "sched_settings", Doc<"scheduler implementation specific settings">>                                                                                                                                                                               sched_settings{};
 
-    Annotated<gr::Size_t, "max_selections_per_pass", Doc<"priority-class policies: cap on successful work() calls before returning to house-keeping (0: auto = 4 x block count)">>                                                         max_selections_per_pass = 0U;
-    Annotated<SelectionStrategy, "selection_strategy", Doc<"dynamic-key policies: how the next block is picked -- linearScan (O(n), no auxiliary state) or readyHeap (O(log n), heap rebuilt per pass)">>                                  selection_strategy      = SelectionStrategy::linearScan;
-    Annotated<TieBreak, "tie_break", Doc<"task-level fixed-priority policies (FP, RM): ordering where keys tie -- registrationOrder (job-list position), upstreamFirst or downstreamFirst (data-topological); applied at init()/reset()">> tie_break               = TieBreak::registrationOrder;
-    Annotated<gr::Size_t, "max_outstanding_jobs", Doc<"release-tracking policies: cap on a block's outstanding jobs, clamping the buffer-derived bound (0: uncapped)">>                                                                    max_outstanding_jobs    = kDefaultMaxOutstandingJobs;
+    Annotated<gr::Size_t, "max_selections_per_pass", Doc<"priority-class policies: cap on successful work() calls before returning to house-keeping (0: auto = 4 x block count)">>                                                                                                                                max_selections_per_pass = 0U;
+    Annotated<SelectionStrategy, "selection_strategy", Doc<"dynamic-key policies: how the next block is picked -- linearScan (O(n), no auxiliary state) or readyHeap (O(log n), heap rebuilt per pass)">>                                                                                                         selection_strategy      = SelectionStrategy::linearScan;
+    Annotated<TieBreak, "tie_break", Doc<"task-level fixed-priority policies (FP, RM): ordering where keys tie -- registrationOrder (job-list position), upstreamFirst or downstreamFirst (data-topological); applied at init()/reset()">>                                                                        tie_break               = TieBreak::registrationOrder;
+    Annotated<gr::Size_t, "max_outstanding_jobs", Doc<"release-tracking policies: cap on a block's outstanding jobs, clamping the buffer-derived bound (0: uncapped)">>                                                                                                                                           max_outstanding_jobs    = kDefaultMaxOutstandingJobs;
+    Annotated<gr::Size_t, "max_pass_duration_us", Unit<"us">, Doc<"release-tracking policies: wall-clock budget for one selection pass, after which the worker returns to the backstop release scan (0: auto = a quarter of the shortest declared period on this worker; inactive where no block declares one)">> max_pass_duration_us    = 0U;
 
     Annotated<gr::Size_t, "trace_categories", Doc<"bitmask of live trace-marker groups (0: tracing off). Inert unless the trace layer was compiled in">>                                                                    trace_categories  = 0U;
     Annotated<gr::Size_t, "trace_buffer_size", Doc<"records retained per emitting thread; rounded up to a power of two, capped at 4 GiB/thread (a clamp is reported). Takes effect for threads that have not yet emitted">> trace_buffer_size = 65536U;
 
-    GR_MAKE_REFLECTABLE(SchedulerBase, timeout_ms, watchdog_timeout, timeout_inactivity_count, process_stream_to_message_ratio, house_keeping_policy, house_keeping_depth, max_work_items, max_selections_per_pass, max_outstanding_jobs, selection_strategy, tie_break, trace_categories, trace_buffer_size, poolName, sched_settings);
+    GR_MAKE_REFLECTABLE(SchedulerBase, timeout_ms, watchdog_timeout, timeout_inactivity_count, process_stream_to_message_ratio, house_keeping_policy, house_keeping_depth, max_work_items, max_selections_per_pass, max_outstanding_jobs, max_pass_duration_us, selection_strategy, tie_break, trace_categories, trace_buffer_size, poolName, sched_settings);
 
     constexpr static block::Category blockCategory = block::Category::ScheduledBlockGroup;
 
@@ -1079,7 +1080,7 @@ protected:
         // adoption and lifecycle checks all live between passes. Whether the default multiplier of
         // four ever actually binds is an unprofiled question (RT section 8.3), and this is the record
         // that answers it. Round robin has no bound and never calls this, so it compiles nothing.
-        [[maybe_unused]] const auto traceSelectionBoundHit = [&](std::size_t boundValue, std::size_t blockCount) {
+        [[maybe_unused]] const auto traceSelectionBoundHit = [&](std::size_t boundValue, std::size_t blockCount, std::uint8_t boundFlags = 0U) {
             if constexpr (gr::trace::kEnabled) {
                 if (!gr::trace::categoryEnabled(gr::trace::Category::select)) {
                     return;
@@ -1088,7 +1089,8 @@ protected:
                     .payload0                             = gr::trace::saturate(boundValue),
                     .payload1                             = gr::trace::saturate(blockCount), //
                     .kind                                 = gr::trace::Kind::selectionBoundHit,
-                    .workerId                             = traceWorkerId});
+                    .workerId                             = traceWorkerId,
+                    .flags                                = boundFlags});
             }
         };
 
@@ -1125,6 +1127,7 @@ protected:
             for (std::size_t i = 0UZ; i < nScanned; ++i) {
                 nReleased += releaseAndCount(*blocks[i], states[i], now, 0U /* backstop */);
             }
+
             if constexpr (gr::trace::kEnabled) {
                 scanScope.event().payload1 = gr::trace::saturate(nReleased);
             }
@@ -1414,6 +1417,34 @@ protected:
                 return std::nullopt;
             };
 
+            // The pass also ends when its wall-clock budget is spent, so that the backstop above --
+            // the only release path for a block with no same-worker producer -- runs again within a
+            // bounded *time* rather than a bounded count of selections. A selection is one `work()`
+            // call, and those differ by an order of magnitude within one graph, so a count bounds the
+            // delay only in selections.
+            //
+            // A zero budget means *inactive*, not *expired*: a graph declaring no period keeps the
+            // count-bounded behaviour exactly, and the short-circuit below means it reads no clock.
+            //
+            // `selections > 0` is a floor rather than an optimisation. A budget shorter than one
+            // invocation would otherwise end every pass before it ran anything, and the worker would
+            // spend its life on the O(n) backstop.
+            //
+            // N.B. the budget cannot preempt an invocation already under way -- `work()` runs to
+            // completion -- so a pass lasts `budget + longest invocation` at worst and no budget
+            // reduces it below that. It is measured from here rather than from the backstop, so it
+            // bounds the selection loop itself; the scan's own cost sits outside it.
+            const std::chrono::nanoseconds              selectionBudget = gr::scheduler::passBudget(std::span<const SchedState>{states.data(), nBlocks}, static_cast<std::uint64_t>(max_pass_duration_us));
+            const std::chrono::steady_clock::time_point selectionStart  = selectionBudget.count() == 0 ? std::chrono::steady_clock::time_point{} : std::chrono::steady_clock::now();
+
+            bool       budgetHit     = false;
+            const auto budgetExpired = [&] { return selectionBudget.count() != 0 && selections != 0UZ && std::chrono::steady_clock::now() - selectionStart >= selectionBudget; };
+
+            // Both selection loops end the same way, and the payload differs from the count-bound
+            // case: `payload0` carries microseconds rather than selections, which is what the flag
+            // tells a reader to expect.
+            [[maybe_unused]] const auto traceBudgetHit = [&] { traceSelectionBoundHit(static_cast<std::size_t>(selectionBudget.count() / 1000), nBlocks, gr::trace::flag::kBoundWasTime); };
+
             // A block that has not reported DONE keeps the pass unfinished, as round robin achieves by
             // polling `work()` and getting INSUFFICIENT_* back from the starved ones. Concluding DONE
             // because no block on *this* worker holds a job is sound only for a single worker: across
@@ -1445,6 +1476,10 @@ protected:
                 std::make_heap(readyHeap.begin(), readyHeap.begin() + static_cast<std::ptrdiff_t>(heapSize), worse);
 
                 while (selections < bound && heapSize > 0UZ) {
+                    if (budgetExpired()) {
+                        budgetHit = true;
+                        break;
+                    }
                     std::pop_heap(readyHeap.begin(), readyHeap.begin() + static_cast<std::ptrdiff_t>(heapSize), worse);
                     --heapSize;
                     const std::size_t chosen = readyHeap[heapSize].index;
@@ -1468,7 +1503,9 @@ protected:
                         pushReady(chosen); // re-keyed to whatever job is now at its head
                     }
                 }
-                if (heapSize == 0UZ && selections < bound) {
+                if (budgetHit) {
+                    traceBudgetHit();
+                } else if (heapSize == 0UZ && selections < bound) {
                     traceSelectEmpty(); // exhausted rather than bounded: the two exits are different findings
                 } else if (selections >= bound) {
                     traceSelectionBoundHit(bound, nBlocks);
@@ -1476,6 +1513,10 @@ protected:
                 markUnfinished();
             } else {
                 while (selections < bound) {
+                    if (budgetExpired()) {
+                        budgetHit = true;
+                        break;
+                    }
                     std::size_t                  chosen     = nBlocks;
                     [[maybe_unused]] std::size_t readyCount = 0UZ;
                     for (std::size_t i = 0UZ; i < nBlocks; ++i) {
@@ -1500,7 +1541,9 @@ protected:
                         return *failure;
                     }
                 }
-                if (selections >= bound) {
+                if (budgetHit) {
+                    traceBudgetHit();
+                } else if (selections >= bound) {
                     traceSelectionBoundHit(bound, nBlocks);
                 }
                 markUnfinished();

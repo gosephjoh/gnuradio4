@@ -198,8 +198,14 @@ inline constexpr std::uint8_t kEosWaived        = 1U << 1; /// the batch floor w
 
 inline constexpr std::uint8_t kViaHeap           = 1U << 0; /// `Kind::select`: clear means the linear scan
 inline constexpr std::uint8_t kStaleEntrySkipped = 1U << 1; /// `Kind::select`: a popped heap entry was stale
-inline constexpr std::uint8_t kDeadlineMissed    = 1U << 0; /// `Kind::deadlineMiss`
-inline constexpr std::uint8_t kDeadlineSuspect   = 1U << 1; /// ... but the deadline arithmetic overflowed
+inline constexpr std::uint8_t kBoundWasTime      = 1U << 2; /// `Kind::selectionBoundHit`: the wall-clock budget ended the
+                                                            /// pass, not the selection count, and `payload0` therefore
+                                                            /// carries **microseconds** rather than a selection count. The
+                                                            /// two have different remedies -- a longer budget against a
+                                                            /// larger count -- so a record that cannot say which one fired
+                                                            /// diagnoses neither
+inline constexpr std::uint8_t kDeadlineMissed  = 1U << 0;   /// `Kind::deadlineMiss`
+inline constexpr std::uint8_t kDeadlineSuspect = 1U << 1;   /// ... but the deadline arithmetic overflowed
 
 } // namespace flag
 
