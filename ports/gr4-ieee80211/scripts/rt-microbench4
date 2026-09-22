@@ -236,7 +236,61 @@ def write_md(res, out):
                     L.append(f"| {r['policy']} | {r['sched_ratio']} | {k} | {v['per_s_per_worker']:.0f} | {v['mean_us']:.1f} | {v['p99_us']:.1f} | {100 * v['busy_share']:.1f} |\n")
         L.append("\nJobs discarded by the re-sync (EDF only tracks jobs; mean per re-sync, max, share of re-syncs that discarded any): " + "; ".join(f"{r['policy']} r{r['sched_ratio']}: {r['jobs_discarded_per_sync']['mean']:.2f}, {r['jobs_discarded_per_sync']['max']}, {100 * r['jobs_discarded_per_sync']['syncs_with_discards']:.0f}%" for r in res["M6"].values() if r.get("jobs_discarded_per_sync")) + "\n")
         L.append("\nMean gap between consecutive passes of a worker (µs, one value per worker): " + "; ".join(f"{r['policy']} r{r['sched_ratio']}: " + ", ".join(f"{g:.1f}" for g in r["gap_between_sweeps_us"]) for r in res["M6"].values()) + "\n")
+        L.append(M6_RATIO_NOTE)
+        L.append("\n| policy | ratio | passes per s | mean pass µs | message phases per s | interval between message phases ms | stateSync busy % |\n|---|---|---|---|---|---|---|\n")
+        for key, r in res["M6"].items():
+            sw = r["kinds"].get("sweep"); mp = r["kinds"].get("messagePhase"); ss = r["kinds"].get("stateSync")
+            if sw and mp and ss and mp["per_s_per_worker"] > 0:
+                L.append(f"| {r['policy']} | {r['sched_ratio']} | {sw['per_s_per_worker']:.0f} | {sw['mean_us']:.1f} | {mp['per_s_per_worker']:.0f} | {1e3 / mp['per_s_per_worker']:.2f} | {100 * ss['busy_share']:.1f} |\n")
     open(os.path.join(out, "MICRO.md"), "w").write("".join(L))
+
+
+M6_RATIO_NOTE = """
+### What the ratio is
+
+`process_stream_to_message_ratio` is a setting of GR4's scheduler (`core/include/gnuradio-4.0/Scheduler.hpp`,
+default 16). Every worker runs a loop of *passes*; in a pass it selects blocks and calls their `work()`. The
+worker keeps a pass counter, and once every `ratio` passes it opens a *message phase* before doing any work.
+The message phase is where everything that is not stream processing happens, in this order: the scheduler's and
+graph's own messages (worker 0 only), cleanup of removed blocks, zombie reaping, adoption of new blocks, the
+re-sync of every block's scheduling state (`stateSync`), the static re-ordering of the worker's block list,
+each block's `processScheduledMessages()` (settings changes and other block messages), and buffer house-keeping
+unless the house-keeping policy is Light. Worker 0 also opens the phase early when a scheduler message is
+pending, so the ratio does not bound the latency of scheduler and graph messages; it does bound everything
+else on that list. The ratio is a count of passes, not a time: the interval between two message phases is
+`ratio` × the worker's pass duration, and the pass duration depends on the policy and the load (the table
+below gives both for this run). A power of two is slightly cheaper (the counter wraps with a mask instead of
+a modulo).
+
+The re-sync is what makes the ratio matter to EDF. `syncSchedStates()` assigns whole scheduling states, and
+under a policy that tracks releases the worker then rebuilds its release storage and discards every
+outstanding job — on every message phase, whether or not the graph changed (the source records this as a
+known defect). Under RR and RM the re-sync is a few microseconds; under EDF it is the storage rebuild. At the
+default ratio of 16 that rebuild recurs every 16 passes, which is the `stateSync` row above: its busy share is
+the share of the worker's life spent rebuilding state that did not change. At 4096 the same work recurs 256×
+less often and its busy share falls below one percent, which is why the sweeps compare policies at 4096.
+
+### Choosing and setting a value
+
+The ratio trades scheduler overhead against reaction time. A larger ratio makes every message phase rarer:
+less re-sync cost, more passes per second, but a longer wait before a settings change is applied, a new block
+is adopted or a removed one is released. A smaller ratio does the reverse. The rule is: take the largest
+ratio whose message-phase interval is still inside the latency the application can tolerate for a settings
+change or a graph mutation, and check that `stateSync`'s busy share is negligible at that ratio. For a
+static graph with no settings traffic while running, which is what the sweeps use, 4096 is that value on this
+machine (an interval in the tens of milliseconds, re-sync below 1 %). A graph that expects settings messages
+at a given rate needs an interval shorter than their spacing; divide that by the measured pass duration to
+get the ratio, and round to a power of two. Do not pick the ratio to make one policy look better: it changes
+the re-sync cost of EDF and the pass rate of every policy at once, so policies are compared at the same
+ratio.
+
+Setting it: `rx_latency4 --sched-ratio N` stages it as the scheduler setting `process_stream_to_message_ratio`
+in the property map applied before the scheduler starts (staging then applying; `set()` alone changes
+nothing); the sweep driver takes `sched_ratio` from the machine profile (`experiments/profiles/*.json`,
+`x86-8core-r4096.json` is the 4096 variant) and passes it the same way; in GR4 code it is the constructor
+setting `{"process_stream_to_message_ratio", gr::Size_t(N)}` of any `gr::scheduler::Simple`. The value each
+run used is recorded as `sched_ratio` in its `latency_summary.json` and `trace_meta.json`.
+"""
 
 
 def main():

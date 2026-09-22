@@ -1,0 +1,1278 @@
+{
+ "M6": {
+  "rr_r16": {
+   "policy": "rr",
+   "sched_ratio": 16,
+   "max_pass_duration_us": 51,
+   "window_s": 1.921919301,
+   "kinds": {
+    "sweep": {
+     "per_s_per_worker": 89070.98748159145,
+     "mean_us": 10.023401417161617,
+     "p99_us": 70.59768000000017,
+     "max_us": 1093.428,
+     "busy_share": 0.8927942621509685
+    },
+    "stateSync": {
+     "per_s_per_worker": 5566.961107281164,
+     "mean_us": 6.45321335607636,
+     "p99_us": 16.52,
+     "max_us": 74.773,
+     "busy_share": 0.03592478777026445
+    },
+    "messagePhase": {
+     "per_s_per_worker": 5566.961107281164,
+     "mean_us": 7.441000093464495,
+     "p99_us": 17.750040000000002,
+     "max_us": 80.113,
+     "busy_share": 0.04142375811959235
+    },
+    "houseKeeping": {
+     "per_s_per_worker": 5566.961107281164,
+     "mean_us": 1.402703110031077,
+     "p99_us": 3.4600400000000007,
+     "max_us": 25.181,
+     "busy_share": 0.007808793658605337
+    },
+    "workProbe": {
+     "per_s_per_worker": 1465934.0787795128,
+     "mean_us": 0.0,
+     "p99_us": 0.0,
+     "max_us": 0.0,
+     "busy_share": 0.0
+    },
+    "zombieReap": {
+     "per_s_per_worker": 5566.961107281164,
+     "mean_us": 0.0446291796153936,
+     "p99_us": 0.14,
+     "max_us": 34.941,
+     "busy_share": 0.0002484489071687615
+    },
+    "adopt": {
+     "per_s_per_worker": 5566.961107281164,
+     "mean_us": 0.0777858962076781,
+     "p99_us": 0.23,
+     "max_us": 14.941,
+     "busy_share": 0.0004330310588831534
+    }
+   },
+   "gap_between_sweeps_us": [
+    1.182216376557948,
+    1.1616274115976801,
+    1.201563664794034,
+    1.2675596628820196
+   ],
+   "jobs_discarded_per_sync": {
+    "mean": 0.0,
+    "max": 0,
+    "syncs_with_discards": 0.0
+   },
+   "per_chain": [
+    {
+     "chain": 0,
+     "rate": 1250000.0,
+     "period_us": 819.1999999999999,
+     "batch_rt": {
+      "n": 2346,
+      "min_us": 58.628,
+      "max_us": 1870.184,
+      "mean_us": 112.36212830349531,
+      "std_us": 54.320001576389984,
+      "p50_us": 103.0895,
+      "p95_us": 170.26375,
+      "p99_us": 225.88760000000005,
+      "over_period": 2,
+      "over_period_ratio": 0.0008525149190110827,
+      "over_class_deadline": 2,
+      "over_class_deadline_ratio": 0.0008525149190110827
+     },
+     "frame_rt": {
+      "n": 2573,
+      "min_us": 196.457,
+      "max_us": 1330.696,
+      "mean_us": 521.888240575204,
+      "std_us": 382.7685312745359,
+      "p50_us": 283.97,
+      "p95_us": 1099.057,
+      "p99_us": 1128.7292
+     },
+     "saturated": false,
+     "edf": null
+    },
+    {
+     "chain": 1,
+     "rate": 1250000.0,
+     "period_us": 819.1999999999999,
+     "batch_rt": {
+      "n": 2336,
+      "min_us": 68.022,
+      "max_us": 1733.717,
+      "mean_us": 144.81065710616437,
+      "std_us": 55.064049020795785,
+      "p50_us": 137.027,
+      "p95_us": 209.905,
+      "p99_us": 245.64095,
+      "over_period": 2,
+      "over_period_ratio": 0.0008561643835616438,
+      "over_class_deadline": 2,
+      "over_class_deadline_ratio": 0.0008561643835616438
+     },
+     "frame_rt": {
+      "n": 2573,
+      "min_us": 204.817,
+      "max_us": 1373.006,
+      "mean_us": 547.742478041197,
+      "std_us": 365.539783011709,
+      "p50_us": 316.04,
+      "p95_us": 1104.997,
+      "p99_us": 1145.177
+     },
+     "saturated": false,
+     "edf": null
+    },
+    {
+     "chain": 2,
+     "rate": 2500000.0,
+     "period_us": 409.59999999999997,
+     "batch_rt": {
+      "n": 4688,
+      "min_us": 59.233,
+      "max_us": 2190.96,
+      "mean_us": 146.05292427474404,
+      "std_us": 67.42945007505857,
+      "p50_us": 142.467,
+      "p95_us": 220.46629999999988,
+      "p99_us": 278.09166000000016,
+      "over_period": 9,
+      "over_period_ratio": 0.0019197952218430034,
+      "over_class_deadline": 9,
+      "over_class_deadline_ratio": 0.0019197952218430034
+     },
+     "frame_rt": {
+      "n": 5146,
+      "min_us": 191.545,
+      "max_us": 3045.403,
+      "mean_us": 439.7172069568597,
+      "std_us": 204.74536060011624,
+      "p50_us": 344.0215,
+      "p95_us": 762.81375,
+      "p99_us": 811.5740000000001
+     },
+     "saturated": false,
+     "edf": null
+    },
+    {
+     "chain": 3,
+     "rate": 5000000.0,
+     "period_us": 204.79999999999998,
+     "batch_rt": {
+      "n": 9337,
+      "min_us": 58.094,
+      "max_us": 2282.381,
+      "mean_us": 156.48361218806897,
+      "std_us": 91.41832534777755,
+      "p50_us": 146.284,
+      "p95_us": 254.83059999999998,
+      "p99_us": 320.8140799999996,
+      "over_period": 1422,
+      "over_period_ratio": 0.15229731177037592,
+      "over_class_deadline": 1422,
+      "over_class_deadline_ratio": 0.15229731177037592
+     },
+     "frame_rt": {
+      "n": 10293,
+      "min_us": 177.786,
+      "max_us": 2311.869,
+      "mean_us": 330.2636408238609,
+      "std_us": 111.47841088799055,
+      "p50_us": 288.69,
+      "p95_us": 546.1703999999999,
+      "p99_us": 598.58252
+     },
+     "saturated": false,
+     "edf": null
+    }
+   ],
+   "occupancy": {
+    "0": 0.7969361727118637,
+    "1": 0.796711874012238,
+    "2": 0.8368834342644441,
+    "3": 0.783717780042212
+   }
+  },
+  "edf_r16": {
+   "policy": "edf",
+   "sched_ratio": 16,
+   "max_pass_duration_us": 51,
+   "window_s": 5.63309411,
+   "kinds": {
+    "sweep": {
+     "per_s_per_worker": 99562.64515523956,
+     "mean_us": 6.0374569473870485,
+     "p99_us": 66.561,
+     "max_us": 2063.631,
+     "busy_share": 0.6011051836927326
+    },
+    "stateSync": {
+     "per_s_per_worker": 6222.734666863217,
+     "mean_us": 45.90253828817585,
+     "p99_us": 72.593,
+     "max_us": 447.306,
+     "busy_share": 0.285639316302848
+    },
+    "messagePhase": {
+     "per_s_per_worker": 6222.734666863217,
+     "mean_us": 47.20749959704164,
+     "p99_us": 74.25972000000009,
+     "max_us": 448.776,
+     "busy_share": 0.2937597442784424
+    },
+    "houseKeeping": {
+     "per_s_per_worker": 6222.690286280341,
+     "mean_us": 1.5951451516275355,
+     "p99_us": 3.27,
+     "max_us": 37.921,
+     "busy_share": 0.009926094240239845
+    },
+    "releaseScan": {
+     "per_s_per_worker": 225438.8485620383,
+     "mean_us": 0.6328587074404198,
+     "p99_us": 1.9,
+     "max_us": 156.745,
+     "busy_share": 0.14267093830782812
+    },
+    "select": {
+     "per_s_per_worker": 125876.15902621587,
+     "mean_us": 0.0,
+     "p99_us": 0.0,
+     "max_us": 0.0,
+     "busy_share": 0.0
+    },
+    "selectEmpty": {
+     "per_s_per_worker": 99056.83965219605,
+     "mean_us": 0.0,
+     "p99_us": 0.0,
+     "max_us": 0.0,
+     "busy_share": 0.0
+    },
+    "workProbe": {
+     "per_s_per_worker": 82048.07002594175,
+     "mean_us": 0.0,
+     "p99_us": 0.0,
+     "max_us": 0.0,
+     "busy_share": 0.0
+    },
+    "zombieReap": {
+     "per_s_per_worker": 6222.734666863217,
+     "mean_us": 0.043528303367020175,
+     "p99_us": 0.13,
+     "max_us": 15.08,
+     "busy_share": 0.00027086508235169536
+    },
+    "adopt": {
+     "per_s_per_worker": 6222.734666863217,
+     "mean_us": 0.07472307132719505,
+     "p99_us": 0.19,
+     "max_us": 14.651,
+     "busy_share": 0.0004649818463622295
+    }
+   },
+   "gap_between_sweeps_us": [
+    3.778288924237895,
+    3.8538058082359057,
+    4.216340635039224,
+    4.241485455857998
+   ],
+   "jobs_discarded_per_sync": {
+    "mean": 0.0011482530150556654,
+    "max": 7,
+    "syncs_with_discards": 0.0008059167124303738
+   },
+   "per_chain": [
+    {
+     "chain": 0,
+     "rate": 1250000.0,
+     "period_us": 819.1999999999999,
+     "batch_rt": {
+      "n": 6877,
+      "min_us": 90.163,
+      "max_us": 2928.573,
+      "mean_us": 301.3863934855315,
+      "std_us": 107.00573878943493,
+      "p50_us": 282.861,
+      "p95_us": 483.46040000000005,
+      "p99_us": 583.5405999999997,
+      "over_period": 8,
+      "over_period_ratio": 0.0011632979496873637,
+      "over_class_deadline": 8,
+      "over_class_deadline_ratio": 0.0011632979496873637
+     },
+     "frame_rt": {
+      "n": 2573,
+      "min_us": 300.39,
+      "max_us": 1867.194,
+      "mean_us": 816.8598048970074,
+      "std_us": 415.21720134930393,
+      "p50_us": 594.16,
+      "p95_us": 1489.187,
+      "p99_us": 1586.4736000000003
+     },
+     "saturated": false,
+     "edf": {
+      "releases": 109739,
+      "misses": 0,
+      "miss_ratio": 0.0
+     }
+    },
+    {
+     "chain": 1,
+     "rate": 1250000.0,
+     "period_us": 819.1999999999999,
+     "batch_rt": {
+      "n": 6876,
+      "min_us": 120.013,
+      "max_us": 3762.348,
+      "mean_us": 337.1244038685282,
+      "std_us": 119.52428581479619,
+      "p50_us": 324.941,
+      "p95_us": 525.04575,
+      "p99_us": 650.24075,
+      "over_period": 13,
+      "over_period_ratio": 0.0018906340895869691,
+      "over_class_deadline": 13,
+      "over_class_deadline_ratio": 0.0018906340895869691
+     },
+     "frame_rt": {
+      "n": 2573,
+      "min_us": 285.869,
+      "max_us": 1993.078,
+      "mean_us": 865.8144026428294,
+      "std_us": 431.2306292017107,
+      "p50_us": 661.562,
+      "p95_us": 1572.3390000000002,
+      "p99_us": 1694.84488
+     },
+     "saturated": false,
+     "edf": {
+      "releases": 109796,
+      "misses": 1,
+      "miss_ratio": 9.10779991985136e-06
+     }
+    },
+    {
+     "chain": 2,
+     "rate": 2500000.0,
+     "period_us": 409.59999999999997,
+     "batch_rt": {
+      "n": 13753,
+      "min_us": 64.826,
+      "max_us": 2399.522,
+      "mean_us": 270.13257340216677,
+      "std_us": 80.10999876328431,
+      "p50_us": 264.057,
+      "p95_us": 393.8406,
+      "p99_us": 471.57647999999995,
+      "over_period": 496,
+      "over_period_ratio": 0.03606485857631062,
+      "over_class_deadline": 496,
+      "over_class_deadline_ratio": 0.03606485857631062
+     },
+     "frame_rt": {
+      "n": 5147,
+      "min_us": 241.498,
+      "max_us": 1283.004,
+      "mean_us": 612.8912867689916,
+      "std_us": 221.94647335194028,
+      "p50_us": 525.848,
+      "p95_us": 1008.6826999999997,
+      "p99_us": 1087.9712
+     },
+     "saturated": false,
+     "edf": {
+      "releases": 219442,
+      "misses": 0,
+      "miss_ratio": 0.0
+     }
+    },
+    {
+     "chain": 3,
+     "rate": 5000000.0,
+     "period_us": 204.79999999999998,
+     "batch_rt": {
+      "n": 27505,
+      "min_us": 71.167,
+      "max_us": 2152.304,
+      "mean_us": 205.99345289947283,
+      "std_us": 57.402361760223016,
+      "p50_us": 199.368,
+      "p95_us": 294.9548,
+      "p99_us": 352.55987999999996,
+      "over_period": 12484,
+      "over_period_ratio": 0.45388111252499547,
+      "over_class_deadline": 12484,
+      "over_class_deadline_ratio": 0.45388111252499547
+     },
+     "frame_rt": {
+      "n": 10293,
+      "min_us": 212.997,
+      "max_us": 1132.429,
+      "mean_us": 446.6598309530749,
+      "std_us": 113.90550463984376,
+      "p50_us": 425.455,
+      "p95_us": 660.0845999999999,
+      "p99_us": 725.219
+     },
+     "saturated": false,
+     "edf": {
+      "releases": 438747,
+      "misses": 1,
+      "miss_ratio": 2.2792178635979276e-06
+     }
+    }
+   ],
+   "occupancy": {
+    "0": 0.36451343522822843,
+    "1": 0.4025121266791688,
+    "2": 0.5242151159445124,
+    "3": 0.3368599792485981
+   }
+  },
+  "rm_r16": {
+   "policy": "rm",
+   "sched_ratio": 16,
+   "max_pass_duration_us": 51,
+   "window_s": 1.896575629,
+   "kinds": {
+    "sweep": {
+     "per_s_per_worker": 77688.57078359094,
+     "mean_us": 11.664601529771671,
+     "p99_us": 103.23651999999943,
+     "max_us": 416.924,
+     "busy_share": 0.9062062216080496
+    },
+    "stateSync": {
+     "per_s_per_worker": 4855.593343702088,
+     "mean_us": 6.360192203279401,
+     "p99_us": 16.087150000000015,
+     "max_us": 161.045,
+     "busy_share": 0.030882506926909373
+    },
+    "messagePhase": {
+     "per_s_per_worker": 4855.593343702088,
+     "mean_us": 7.337883945053751,
+     "p99_us": 17.444000000000027,
+     "max_us": 162.065,
+     "busy_share": 0.03562978044046142
+    },
+    "houseKeeping": {
+     "per_s_per_worker": 4855.593343702088,
+     "mean_us": 1.2657724780106419,
+     "p99_us": 1.73,
+     "max_us": 32.68,
+     "busy_share": 0.00614607641886977
+    },
+    "workProbe": {
+     "per_s_per_worker": 1312411.016961349,
+     "mean_us": 0.0,
+     "p99_us": 0.0,
+     "max_us": 0.0,
+     "busy_share": 0.0
+    },
+    "zombieReap": {
+     "per_s_per_worker": 4855.593343702088,
+     "mean_us": 0.04168880985991964,
+     "p99_us": 0.07,
+     "max_us": 14.1,
+     "busy_share": 0.0002024239076626878
+    },
+    "adopt": {
+     "per_s_per_worker": 4855.593343702088,
+     "mean_us": 0.06939950048865241,
+     "p99_us": 0.16,
+     "max_us": 11.311,
+     "busy_share": 0.00033697575262895036
+    }
+   },
+   "gap_between_sweeps_us": [
+    1.2254243095946298,
+    1.150581457133438,
+    1.2725054142533367,
+    1.1988664785286476
+   ],
+   "jobs_discarded_per_sync": {
+    "mean": 0.0,
+    "max": 0,
+    "syncs_with_discards": 0.0
+   },
+   "per_chain": [
+    {
+     "chain": 0,
+     "rate": 1250000.0,
+     "period_us": 819.1999999999999,
+     "batch_rt": {
+      "n": 2311,
+      "min_us": 61.944,
+      "max_us": 533.346,
+      "mean_us": 158.87451795759412,
+      "std_us": 62.59712383411449,
+      "p50_us": 143.273,
+      "p95_us": 283.055,
+      "p99_us": 327.6408000000001,
+      "over_period": 0,
+      "over_period_ratio": 0.0,
+      "over_class_deadline": 0,
+      "over_class_deadline_ratio": 0.0
+     },
+     "frame_rt": {
+      "n": 2573,
+      "min_us": 206.967,
+      "max_us": 3358.645,
+      "mean_us": 666.4167889623009,
+      "std_us": 405.2027689594489,
+      "p50_us": 448.676,
+      "p95_us": 1281.058,
+      "p99_us": 1403.2819600000034
+     },
+     "saturated": false,
+     "edf": null
+    },
+    {
+     "chain": 1,
+     "rate": 1250000.0,
+     "period_us": 819.1999999999999,
+     "batch_rt": {
+      "n": 2315,
+      "min_us": 62.317,
+      "max_us": 532.534,
+      "mean_us": 237.49806738660908,
+      "std_us": 62.29401170155596,
+      "p50_us": 229.94,
+      "p95_us": 343.9002999999998,
+      "p99_us": 420.3196400000003,
+      "over_period": 0,
+      "over_period_ratio": 0.0,
+      "over_class_deadline": 0,
+      "over_class_deadline_ratio": 0.0
+     },
+     "frame_rt": {
+      "n": 2573,
+      "min_us": 257.419,
+      "max_us": 2701.392,
+      "mean_us": 658.9919599689078,
+      "std_us": 370.0117754313729,
+      "p50_us": 426.475,
+      "p95_us": 1202.184,
+      "p99_us": 1306.6810000000025
+     },
+     "saturated": false,
+     "edf": null
+    },
+    {
+     "chain": 2,
+     "rate": 2500000.0,
+     "period_us": 409.59999999999997,
+     "batch_rt": {
+      "n": 4618,
+      "min_us": 60.725,
+      "max_us": 613.609,
+      "mean_us": 133.4848243828497,
+      "std_us": 51.26247678256646,
+      "p50_us": 122.2725,
+      "p95_us": 248.53074999999995,
+      "p99_us": 281.85853,
+      "over_period": 1,
+      "over_period_ratio": 0.00021654395842355997,
+      "over_class_deadline": 1,
+      "over_class_deadline_ratio": 0.00021654395842355997
+     },
+     "frame_rt": {
+      "n": 5147,
+      "min_us": 196.526,
+      "max_us": 1955.076,
+      "mean_us": 498.8621750534292,
+      "std_us": 188.82454172377334,
+      "p50_us": 436.075,
+      "p95_us": 781.2683,
+      "p99_us": 889.0043999999999
+     },
+     "saturated": false,
+     "edf": null
+    },
+    {
+     "chain": 3,
+     "rate": 5000000.0,
+     "period_us": 204.79999999999998,
+     "batch_rt": {
+      "n": 9247,
+      "min_us": 60.293,
+      "max_us": 409.381,
+      "mean_us": 115.17620384989726,
+      "std_us": 31.7596288498762,
+      "p50_us": 108.692,
+      "p95_us": 173.194,
+      "p99_us": 210.74199999999985,
+      "over_period": 120,
+      "over_period_ratio": 0.012977181788688223,
+      "over_class_deadline": 120,
+      "over_class_deadline_ratio": 0.012977181788688223
+     },
+     "frame_rt": {
+      "n": 10293,
+      "min_us": 185.116,
+      "max_us": 1402.588,
+      "mean_us": 323.1258901194987,
+      "std_us": 99.26497226983115,
+      "p50_us": 277.74,
+      "p95_us": 496.4319999999999,
+      "p99_us": 573.413
+     },
+     "saturated": false,
+     "edf": null
+    }
+   ],
+   "occupancy": {
+    "0": 0.808733795555906,
+    "1": 0.818355971292511,
+    "2": 0.8589103182027652,
+    "3": 0.8029000835589669
+   }
+  },
+  "rr_r4096": {
+   "policy": "rr",
+   "sched_ratio": 4096,
+   "max_pass_duration_us": 51,
+   "window_s": 1.856787046,
+   "kinds": {
+    "sweep": {
+     "per_s_per_worker": 93394.12420696089,
+     "mean_us": 9.812833866261467,
+     "p99_us": 67.80740999999992,
+     "max_us": 695.684,
+     "busy_share": 0.9164610249278957
+    },
+    "stateSync": {
+     "per_s_per_worker": 22.61971834114142,
+     "mean_us": 33.559666666666665,
+     "p99_us": 55.70390000000002,
+     "max_us": 56.823,
+     "busy_share": 0.0007591102076225924
+    },
+    "messagePhase": {
+     "per_s_per_worker": 22.61971834114142,
+     "mean_us": 35.697339285714285,
+     "p99_us": 58.00920000000003,
+     "max_us": 59.392,
+     "busy_share": 0.0008074637601710196
+    },
+    "houseKeeping": {
+     "per_s_per_worker": 22.61971834114142,
+     "mean_us": 6.371238095238096,
+     "p99_us": 10.203140000000001,
+     "max_us": 11.17,
+     "busy_share": 0.00014411561119863608
+    },
+    "workProbe": {
+     "per_s_per_worker": 1543477.485031959,
+     "mean_us": 0.0,
+     "p99_us": 0.0,
+     "max_us": 0.0,
+     "busy_share": 0.0
+    },
+    "zombieReap": {
+     "per_s_per_worker": 22.61971834114142,
+     "mean_us": 0.12935714285714286,
+     "p99_us": 0.4265000000000006,
+     "max_us": 0.64,
+     "busy_share": 2.9260221368433656e-06
+    },
+    "adopt": {
+     "per_s_per_worker": 22.61971834114142,
+     "mean_us": 0.5937142857142856,
+     "p99_us": 1.48033,
+     "max_us": 1.511,
+     "busy_share": 1.3429649917969107e-05
+    }
+   },
+   "gap_between_sweeps_us": [
+    0.7665481120454181,
+    0.7574060498181538,
+    0.9696449236196057,
+    1.10204831691119
+   ],
+   "jobs_discarded_per_sync": {
+    "mean": 0.0,
+    "max": 0,
+    "syncs_with_discards": 0.0
+   },
+   "per_chain": [
+    {
+     "chain": 0,
+     "rate": 1250000.0,
+     "period_us": 819.1999999999999,
+     "batch_rt": {
+      "n": 2266,
+      "min_us": 65.239,
+      "max_us": 739.567,
+      "mean_us": 132.88936187113856,
+      "std_us": 38.729503419215355,
+      "p50_us": 126.2525,
+      "p95_us": 200.93925,
+      "p99_us": 236.17769999999985,
+      "over_period": 0,
+      "over_period_ratio": 0.0,
+      "over_class_deadline": 0,
+      "over_class_deadline_ratio": 0.0
+     },
+     "frame_rt": {
+      "n": 2573,
+      "min_us": 202.287,
+      "max_us": 1342.835,
+      "mean_us": 530.6386335017489,
+      "std_us": 375.20897635911984,
+      "p50_us": 295.89,
+      "p95_us": 1096.9716,
+      "p99_us": 1221.3961200000003
+     },
+     "saturated": false,
+     "edf": null
+    },
+    {
+     "chain": 1,
+     "rate": 1250000.0,
+     "period_us": 819.1999999999999,
+     "batch_rt": {
+      "n": 2266,
+      "min_us": 63.519,
+      "max_us": 404.326,
+      "mean_us": 125.05739320388349,
+      "std_us": 28.38970926556084,
+      "p50_us": 121.456,
+      "p95_us": 172.5035,
+      "p99_us": 203.38354999999996,
+      "over_period": 0,
+      "over_period_ratio": 0.0,
+      "over_class_deadline": 0,
+      "over_class_deadline_ratio": 0.0
+     },
+     "frame_rt": {
+      "n": 2573,
+      "min_us": 180.137,
+      "max_us": 1330.986,
+      "mean_us": 509.76904119704625,
+      "std_us": 377.34093968076354,
+      "p50_us": 261.419,
+      "p95_us": 1086.6904000000002,
+      "p99_us": 1124.3284000000003
+     },
+     "saturated": false,
+     "edf": null
+    },
+    {
+     "chain": 2,
+     "rate": 2500000.0,
+     "period_us": 409.59999999999997,
+     "batch_rt": {
+      "n": 4528,
+      "min_us": 68.76,
+      "max_us": 462.643,
+      "mean_us": 153.54873299469963,
+      "std_us": 39.80117281537275,
+      "p50_us": 150.697,
+      "p95_us": 228.50685,
+      "p99_us": 267.05559999999997,
+      "over_period": 2,
+      "over_period_ratio": 0.00044169611307420494,
+      "over_class_deadline": 2,
+      "over_class_deadline_ratio": 0.00044169611307420494
+     },
+     "frame_rt": {
+      "n": 5147,
+      "min_us": 199.936,
+      "max_us": 1344.975,
+      "mean_us": 432.6406817563629,
+      "std_us": 187.7168657986654,
+      "p50_us": 330.811,
+      "p95_us": 734.187,
+      "p99_us": 768.0074000000001
+     },
+     "saturated": false,
+     "edf": null
+    },
+    {
+     "chain": 3,
+     "rate": 5000000.0,
+     "period_us": 204.79999999999998,
+     "batch_rt": {
+      "n": 9049,
+      "min_us": 56.33,
+      "max_us": 443.594,
+      "mean_us": 151.44687037241684,
+      "std_us": 43.77305671071668,
+      "p50_us": 147.576,
+      "p95_us": 230.82600000000002,
+      "p99_us": 281.9754400000002,
+      "over_period": 1007,
+      "over_period_ratio": 0.11128301469775666,
+      "over_class_deadline": 1007,
+      "over_class_deadline_ratio": 0.11128301469775666
+     },
+     "frame_rt": {
+      "n": 10293,
+      "min_us": 170.566,
+      "max_us": 1274.083,
+      "mean_us": 330.71400476051684,
+      "std_us": 101.14289550751391,
+      "p50_us": 309.17,
+      "p95_us": 502.415,
+      "p99_us": 575.4026
+     },
+     "saturated": false,
+     "edf": null
+    }
+   ],
+   "occupancy": {
+    "0": 0.823028735735805,
+    "1": 0.8280863803484332,
+    "2": 0.849912252673051,
+    "3": 0.7913128595792671
+   }
+  },
+  "edf_r4096": {
+   "policy": "edf",
+   "sched_ratio": 4096,
+   "max_pass_duration_us": 51,
+   "window_s": 3.572389582,
+   "kinds": {
+    "sweep": {
+     "per_s_per_worker": 199943.89850395662,
+     "mean_us": 4.003207565337002,
+     "p99_us": 36.129280000001195,
+     "max_us": 226.358,
+     "busy_share": 0.8004169271340127
+    },
+    "stateSync": {
+     "per_s_per_worker": 48.84685614336225,
+     "mean_us": 92.80600143266476,
+     "p99_us": 226.08069999999995,
+     "max_us": 350.831,
+     "busy_share": 0.004533281401222046
+    },
+    "messagePhase": {
+     "per_s_per_worker": 48.84685614336225,
+     "mean_us": 94.6517893982808,
+     "p99_us": 227.72559999999996,
+     "max_us": 352.201,
+     "busy_share": 0.004623442340449643
+    },
+    "houseKeeping": {
+     "per_s_per_worker": 48.84685614336225,
+     "mean_us": 4.060224928366762,
+     "p99_us": 7.101069999999989,
+     "max_us": 17.172,
+     "busy_share": 0.00019832922298562453
+    },
+    "releaseScan": {
+     "per_s_per_worker": 384100.2551664031,
+     "mean_us": 0.7181248599147727,
+     "p99_us": 1.44,
+     "max_us": 63.602,
+     "busy_share": 0.2758319419346017
+    },
+    "select": {
+     "per_s_per_worker": 184156.4266436157,
+     "mean_us": 0.0,
+     "p99_us": 0.0,
+     "max_us": 0.0,
+     "busy_share": 0.0
+    },
+    "selectEmpty": {
+     "per_s_per_worker": 199888.12351205654,
+     "mean_us": 0.0,
+     "p99_us": 0.0,
+     "max_us": 0.0,
+     "busy_share": 0.0
+    },
+    "workProbe": {
+     "per_s_per_worker": 140321.62184264258,
+     "mean_us": 0.0,
+     "p99_us": 0.0,
+     "max_us": 0.0,
+     "busy_share": 0.0
+    },
+    "zombieReap": {
+     "per_s_per_worker": 48.84685614336225,
+     "mean_us": 0.09114183381088826,
+     "p99_us": 0.24,
+     "max_us": 0.84,
+     "busy_share": 4.451992044802688e-06
+    },
+    "adopt": {
+     "per_s_per_worker": 48.84685614336225,
+     "mean_us": 0.37372206303724925,
+     "p99_us": 0.8605999999999995,
+     "max_us": 1.421,
+     "busy_share": 1.8255147850781074e-05
+    }
+   },
+   "gap_between_sweeps_us": [
+    0.9337495021685756,
+    0.9684218321686086,
+    1.0037532195274796,
+    1.077960723969352
+   ],
+   "jobs_discarded_per_sync": {
+    "mean": 0.0,
+    "max": 0,
+    "syncs_with_discards": 0.0
+   },
+   "per_chain": [
+    {
+     "chain": 0,
+     "rate": 1250000.0,
+     "period_us": 819.1999999999999,
+     "batch_rt": {
+      "n": 4361,
+      "min_us": 74.151,
+      "max_us": 594.296,
+      "mean_us": 163.64972047695483,
+      "std_us": 57.328736655019796,
+      "p50_us": 148.519,
+      "p95_us": 279.643,
+      "p99_us": 350.11239999999975,
+      "over_period": 0,
+      "over_period_ratio": 0.0,
+      "over_class_deadline": 0,
+      "over_class_deadline_ratio": 0.0
+     },
+     "frame_rt": {
+      "n": 2573,
+      "min_us": 206.157,
+      "max_us": 1550.493,
+      "mean_us": 612.7976136805286,
+      "std_us": 409.3823852879364,
+      "p50_us": 378.022,
+      "p95_us": 1237.2194,
+      "p99_us": 1293.0739199999998
+     },
+     "saturated": false,
+     "edf": {
+      "releases": 69587,
+      "misses": 0,
+      "miss_ratio": 0.0
+     }
+    },
+    {
+     "chain": 1,
+     "rate": 1250000.0,
+     "period_us": 819.1999999999999,
+     "batch_rt": {
+      "n": 4361,
+      "min_us": 85.7,
+      "max_us": 649.469,
+      "mean_us": 164.70954138958956,
+      "std_us": 46.55863155022424,
+      "p50_us": 163.861,
+      "p95_us": 248.709,
+      "p99_us": 329.32299999999987,
+      "over_period": 0,
+      "over_period_ratio": 0.0,
+      "over_class_deadline": 0,
+      "over_class_deadline_ratio": 0.0
+     },
+     "frame_rt": {
+      "n": 2573,
+      "min_us": 193.827,
+      "max_us": 1375.217,
+      "mean_us": 543.3634317916828,
+      "std_us": 352.44711010510144,
+      "p50_us": 346.841,
+      "p95_us": 1067.324,
+      "p99_us": 1126.7824
+     },
+     "saturated": false,
+     "edf": {
+      "releases": 69595,
+      "misses": 0,
+      "miss_ratio": 0.0
+     }
+    },
+    {
+     "chain": 2,
+     "rate": 2500000.0,
+     "period_us": 409.59999999999997,
+     "batch_rt": {
+      "n": 8722,
+      "min_us": 63.697,
+      "max_us": 621.347,
+      "mean_us": 127.19721096078881,
+      "std_us": 52.031551682352514,
+      "p50_us": 114.465,
+      "p95_us": 243.56819999999996,
+      "p99_us": 272.6809599999999,
+      "over_period": 1,
+      "over_period_ratio": 0.00011465260261407934,
+      "over_class_deadline": 1,
+      "over_class_deadline_ratio": 0.00011465260261407934
+     },
+     "frame_rt": {
+      "n": 5147,
+      "min_us": 182.337,
+      "max_us": 908.51,
+      "mean_us": 429.8196739848455,
+      "std_us": 180.92286492487872,
+      "p50_us": 370.902,
+      "p95_us": 728.0516,
+      "p99_us": 781.7058
+     },
+     "saturated": false,
+     "edf": {
+      "releases": 139142,
+      "misses": 0,
+      "miss_ratio": 0.0
+     }
+    },
+    {
+     "chain": 3,
+     "rate": 5000000.0,
+     "period_us": 204.79999999999998,
+     "batch_rt": {
+      "n": 17444,
+      "min_us": 61.741,
+      "max_us": 411.645,
+      "mean_us": 126.73056174042651,
+      "std_us": 34.8226257632791,
+      "p50_us": 119.317,
+      "p95_us": 195.5690499999999,
+      "p99_us": 230.17412,
+      "over_period": 635,
+      "over_period_ratio": 0.03640220132997019,
+      "over_class_deadline": 635,
+      "over_class_deadline_ratio": 0.03640220132997019
+     },
+     "frame_rt": {
+      "n": 10293,
+      "min_us": 168.564,
+      "max_us": 746.755,
+      "mean_us": 311.52002195666955,
+      "std_us": 91.14144196715678,
+      "p50_us": 270.409,
+      "p95_us": 468.14239999999995,
+      "p99_us": 503.03340000000003
+     },
+     "saturated": false,
+     "edf": {
+      "releases": 278316,
+      "misses": 1,
+      "miss_ratio": 3.5930381293206285e-06
+     }
+    }
+   ],
+   "occupancy": {
+    "0": 0.3561625678819932,
+    "1": 0.48192391436662746,
+    "2": 0.5868724706184634,
+    "3": 0.33064146137687395
+   }
+  },
+  "rm_r4096": {
+   "policy": "rm",
+   "sched_ratio": 4096,
+   "max_pass_duration_us": 51,
+   "window_s": 1.796469256,
+   "kinds": {
+    "sweep": {
+     "per_s_per_worker": 80936.11928753208,
+     "mean_us": 11.41562208883471,
+     "p99_us": 97.45436000000034,
+     "max_us": 372.342,
+     "busy_share": 0.9239361511233121
+    },
+    "stateSync": {
+     "per_s_per_worker": 19.621822016863952,
+     "mean_us": 32.0405390070922,
+     "p99_us": 44.47099999999999,
+     "max_us": 46.141,
+     "busy_share": 0.0006286937537215498
+    },
+    "messagePhase": {
+     "per_s_per_worker": 19.621822016863952,
+     "mean_us": 34.035716312056735,
+     "p99_us": 47.08539999999999,
+     "max_us": 48.811,
+     "busy_share": 0.0006678427676916504
+    },
+    "houseKeeping": {
+     "per_s_per_worker": 19.621822016863952,
+     "mean_us": 6.168297872340426,
+     "p99_us": 9.042,
+     "max_us": 12.5,
+     "busy_share": 0.00012103324299806442
+    },
+    "workProbe": {
+     "per_s_per_worker": 1375537.8733851262,
+     "mean_us": 0.0,
+     "p99_us": 0.0,
+     "max_us": 0.0,
+     "busy_share": 0.0
+    },
+    "zombieReap": {
+     "per_s_per_worker": 19.621822016863952,
+     "mean_us": 0.11616312056737589,
+     "p99_us": 0.3799999999999997,
+     "max_us": 0.63,
+     "busy_share": 2.2793320766965578e-06
+    },
+    "adopt": {
+     "per_s_per_worker": 19.621822016863952,
+     "mean_us": 0.5296453900709219,
+     "p99_us": 1.6499999999999986,
+     "max_us": 1.77,
+     "busy_share": 1.0392607576024112e-05
+    }
+   },
+   "gap_between_sweeps_us": [
+    0.7871262010267661,
+    0.8228733894575596,
+    1.032496780010304,
+    1.1494998307541975
+   ],
+   "jobs_discarded_per_sync": {
+    "mean": 0.0,
+    "max": 0,
+    "syncs_with_discards": 0.0
+   },
+   "per_chain": [
+    {
+     "chain": 0,
+     "rate": 1250000.0,
+     "period_us": 819.1999999999999,
+     "batch_rt": {
+      "n": 2193,
+      "min_us": 78.096,
+      "max_us": 470.753,
+      "mean_us": 175.80827906976745,
+      "std_us": 51.37999574015906,
+      "p50_us": 172.132,
+      "p95_us": 261.209,
+      "p99_us": 283.91299999999995,
+      "over_period": 0,
+      "over_period_ratio": 0.0,
+      "over_class_deadline": 0,
+      "over_class_deadline_ratio": 0.0
+     },
+     "frame_rt": {
+      "n": 2573,
+      "min_us": 210.958,
+      "max_us": 1749.729,
+      "mean_us": 623.260531286436,
+      "std_us": 384.01518131646486,
+      "p50_us": 395.464,
+      "p95_us": 1207.7976,
+      "p99_us": 1283.2094800000004
+     },
+     "saturated": false,
+     "edf": null
+    },
+    {
+     "chain": 1,
+     "rate": 1250000.0,
+     "period_us": 819.1999999999999,
+     "batch_rt": {
+      "n": 2192,
+      "min_us": 68.638,
+      "max_us": 649.755,
+      "mean_us": 178.94643795620436,
+      "std_us": 49.892490457775466,
+      "p50_us": 175.3365,
+      "p95_us": 253.0684499999999,
+      "p99_us": 338.42688000000084,
+      "over_period": 0,
+      "over_period_ratio": 0.0,
+      "over_class_deadline": 0,
+      "over_class_deadline_ratio": 0.0
+     },
+     "frame_rt": {
+      "n": 2573,
+      "min_us": 197.226,
+      "max_us": 2106.691,
+      "mean_us": 615.4435227361057,
+      "std_us": 394.009702007043,
+      "p50_us": 403.633,
+      "p95_us": 1231.4836,
+      "p99_us": 1311.0934000000002
+     },
+     "saturated": false,
+     "edf": null
+    },
+    {
+     "chain": 2,
+     "rate": 2500000.0,
+     "period_us": 409.59999999999997,
+     "batch_rt": {
+      "n": 4386,
+      "min_us": 62.262,
+      "max_us": 373.61,
+      "mean_us": 129.40590902872776,
+      "std_us": 41.05832006940229,
+      "p50_us": 122.122,
+      "p95_us": 207.335,
+      "p99_us": 252.87534999999994,
+      "over_period": 0,
+      "over_period_ratio": 0.0,
+      "over_class_deadline": 0,
+      "over_class_deadline_ratio": 0.0
+     },
+     "frame_rt": {
+      "n": 5147,
+      "min_us": 187.756,
+      "max_us": 1157.448,
+      "mean_us": 407.3745442005051,
+      "std_us": 176.4063209728721,
+      "p50_us": 316.071,
+      "p95_us": 684.7513,
+      "p99_us": 736.8274
+     },
+     "saturated": false,
+     "edf": null
+    },
+    {
+     "chain": 3,
+     "rate": 5000000.0,
+     "period_us": 204.79999999999998,
+     "batch_rt": {
+      "n": 8772,
+      "min_us": 57.503,
+      "max_us": 369.957,
+      "mean_us": 115.49635373917008,
+      "std_us": 30.672206000094782,
+      "p50_us": 110.6095,
+      "p95_us": 169.45079999999993,
+      "p99_us": 197.40569999999985,
+      "over_period": 54,
+      "over_period_ratio": 0.006155950752393981,
+      "over_class_deadline": 54,
+      "over_class_deadline_ratio": 0.006155950752393981
+     },
+     "frame_rt": {
+      "n": 10293,
+      "min_us": 182.836,
+      "max_us": 1771.42,
+      "mean_us": 320.67049635674726,
+      "std_us": 96.20547533518162,
+      "p50_us": 285.791,
+      "p95_us": 480.6826,
+      "p99_us": 518.4002
+     },
+     "saturated": false,
+     "edf": null
+    }
+   ],
+   "occupancy": {
+    "0": 0.8335776802183137,
+    "1": 0.8374749987928543,
+    "2": 0.8694103507663924,
+    "3": 0.8060783462692332
+   }
+  }
+ }
+}
