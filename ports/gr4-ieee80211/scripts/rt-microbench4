@@ -19,7 +19,10 @@
       rotation 1, 20 s) under RR, EDF and RM at process_stream_to_message_ratio 16 (the default)
       and 4096, with every event category traced -> per worker, the rate, mean and p99 duration
       and the busy share of every scheduler event kind (sweep, stateSync, messagePhase,
-      releaseScan, ...) inside the analysis window, next to the batch RT of every receiver
+      releaseScan, ...) inside the analysis window, next to the batch RT of every receiver.
+      The selection pass carries an explicit wall-clock budget (M6_PASS_US): the count bound is
+      left at its default, but the budget's own auto rule reads the declared period, which this
+      workload sets to 1 us to disarm the release gate -- see M6_PASS_US below
   M5  trace overhead at an unsaturated point: 1 receiver, 1 worker, 2.5 Msps, N = 1024, 30 s,
       every policy, every category live against no category -> frame response time
 Writes DIR/micro.json and DIR/MICRO.md (tables).  Takes about ten minutes; run it with the
@@ -134,6 +137,13 @@ def m5(cell, out, log):
 
 M6_KINDS = ("sweep", "stateSync", "messagePhase", "houseKeeping", "releaseScan", "select", "selectEmpty", "workProbe", "zombieReap", "adopt")
 M6_RATES = "1250000,1250000,2500000,5000000"
+M6_BATCH = 1024
+# A quarter of the fastest receiver's batch period, which is what the scheduler's own auto rule
+# would pick if it could see that period. It cannot: every block here declares a 1 us `period` so
+# that EDF's release gate never paces the pipeline (src/chain.cpp), and the deadlines carry the real
+# timing instead -- so the auto budget would come out at 250 ns and end every pass after a single
+# selection. Stated rather than derived, because the deadline is what this workload means by period.
+M6_PASS_US = round(0.25 * M6_BATCH / max(float(r) for r in M6_RATES.split(",")) * 1e6)
 
 
 def m6(cell, out, log):
@@ -142,8 +152,8 @@ def m6(cell, out, log):
         for pol in ("rr", "edf", "rm"):
             d = os.path.join(out, f"m6_{pol}_r{ratio}")
             os.makedirs(d, exist_ok=True)
-            cmd = [RX, "--run-dir", cell, "--out-dir", d, "--chains", "4", "--threads", "4", "--policy", pol, "--fixed-batch", "1024", "--rates", M6_RATES, "--run-s", "20", "--rotate", "1",
-                   "--sched-ratio", str(ratio), "--timeout-s", "200", "--trace-categories", "all", "--trace-buffer", "16777216", "--trace-limit-mb", "1024", "--trace-out", os.path.join(d, "trace.gr4trace")]
+            cmd = [RX, "--run-dir", cell, "--out-dir", d, "--chains", "4", "--threads", "4", "--policy", pol, "--fixed-batch", str(M6_BATCH), "--rates", M6_RATES, "--run-s", "20", "--rotate", "1",
+                   "--sched-ratio", str(ratio), "--max-pass-duration", str(M6_PASS_US), "--timeout-s", "200", "--trace-categories", "all", "--trace-buffer", "16777216", "--trace-limit-mb", "1024", "--trace-out", os.path.join(d, "trace.gr4trace")]
             sh(cmd, log)
             sh([EXP, os.path.join(d, "trace.gr4trace"), "--out-dir", d, "--meta", os.path.join(d, "trace_meta.json"), "--all-events"], log)
             sh([sys.executable, ANALYSE, d, "--warmup", "3", "--window", "12", "--quiet"], log)
@@ -163,7 +173,7 @@ def m6(cell, out, log):
                 st = g.start_ns.to_numpy(); en = st + g.dur_ns.to_numpy()
                 if len(st) > 1:
                     gaps.append(float(np.mean(st[1:] - en[:-1]) / 1e3))
-            res[f"{pol}_r{ratio}"] = {"policy": pol, "sched_ratio": ratio, "window_s": span, "kinds": kinds, "gap_between_sweeps_us": gaps, "jobs_discarded_per_sync": discarded,
+            res[f"{pol}_r{ratio}"] = {"policy": pol, "sched_ratio": ratio, "max_pass_duration_us": M6_PASS_US, "window_s": span, "kinds": kinds, "gap_between_sweeps_us": gaps, "jobs_discarded_per_sync": discarded,
                                       "per_chain": [{"chain": pc["chain"], "rate": pc.get("rate"), "period_us": pc.get("batch_period_us"), "batch_rt": pc.get("batch_rt"), "frame_rt": pc.get("frame_rt"), "saturated": pc.get("saturated"), "edf": pc.get("edf")} for pc in b["per_chain"]],
                                       "occupancy": b.get("utilization", {}).get("per_worker_occupancy")}
             for f in glob.glob(os.path.join(d, "trace_*.csv")) + [os.path.join(d, "trace.gr4trace")]:
@@ -209,7 +219,7 @@ def write_md(res, out):
             if u and t:
                 L.append(f"| {pol} | {u['frame_rt']['mean_us']:.0f} | {t['frame_rt']['mean_us']:.0f} | {t['frame_rt']['mean_us'] - u['frame_rt']['mean_us']:+.0f} | {u['frame_rt']['std_us']:.0f} | {t['frame_rt']['std_us']:.0f} | {u['realtime_ratio']:.3f} | {t['realtime_ratio']:.3f} |\n")
     if "M6" in res:
-        L.append("\n## M6 — scheduler pass cost on four workers (light mix 1.25/1.25/2.5/5 Msps, N = 1024, rotation 1, 20 s, every category traced)\n")
+        L.append(f"\n## M6 — scheduler pass cost on four workers (light mix 1.25/1.25/2.5/5 Msps, N = {M6_BATCH}, rotation 1, 20 s, every category traced, selection pass bounded at {M6_PASS_US} µs)\n")
         L.append("\nBatch response time per receiver (mean µs, and the fraction of batches later than the receiver's own period):\n\n| policy | ratio | rx 0 | rx 1 | rx 2 | rx 3 (5 Msps) | EDF pipeline misses |\n|---|---|---|---|---|---|---|\n")
         for key, r in res["M6"].items():
             cells = []

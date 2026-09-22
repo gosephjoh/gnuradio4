@@ -213,6 +213,18 @@ sets the scheduler's `process_stream_to_message_ratio`, the number of
 passes between two house-keeping rounds (default 16): §5 says why it
 matters to EDF.
 
+`--max-pass-duration` sets the scheduler's `max_pass_duration_us`, the
+wall-clock budget after which a selection pass returns to the backstop scan
+that releases the sources. It applies to EDF alone; round robin has no
+bound and rate monotonic keeps the count one. Left at auto the scheduler
+takes a quarter of the shortest `period` declared on the worker, and in
+fixed-batch mode that is `--tiny-period` (1 µs), declared so short
+precisely so that EDF's release gate never paces the pipeline — the real
+timing is carried by `relative_deadline` instead. The budget would then be
+250 ns and every pass would end after one `work()` call, so give it the
+batch period the workload actually means: a quarter of `N`/rate of the
+fastest receiver.
+
 `--smoke` (with `--cell data/rt_300_300_10000_QPSK_1_2_s1`, a 5.8 s cell
 `gen4` makes in four seconds) runs the probes and a one-point, one-repeat
 matrix to prove the pipeline in a few minutes.
