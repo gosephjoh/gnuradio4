@@ -1150,4 +1150,62 @@ const boost::ut::suite<"feedback self-successor"> selfLoopTests = [] {
     };
 };
 
+namespace {
+/// `ReadyEntry` is protected, and `buildReleaseStorage` takes a vector of it; this only re-exports the
+/// name so a test can drive the release-storage path without a running worker.
+struct TopologyCacheProbe : gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded, gr::profiling::null::Profiler, gr::scheduler::EdfPolicy> {
+    using Simple::ReadyEntry;
+};
+} // namespace
+
+const boost::ut::suite<"topology cache"> topologyCacheTests = [] {
+    "successors are rebuilt when work quiescence is released, and not before"_test = [] {
+        // The cache is invalidated by one hook -- releasing work quiescence -- because every structural
+        // change is made under a quiescence guard. Both directions are asserted: a missed invalidation
+        // leaves a block's successors stale, which under a release-tracking policy means it stops being
+        // released and nothing reports it; an over-eager one silently restores the cost the cache removes.
+        gr::Graph graph;
+        auto&     src   = graph.emplaceBlock<gr::testing::ConstantSource<float>>();
+        auto&     first = graph.emplaceBlock<gr::testing::Copy<float>>();
+        auto&     later = graph.emplaceBlock<gr::testing::Copy<float>>();
+        expect(graph.connect<"out", "in">(src, first).has_value() >> fatal);
+
+        TopologyCacheProbe sched;
+        expect(sched.exchange(std::move(graph)).has_value() >> fatal);
+
+        const std::vector<std::shared_ptr<gr::BlockModel>> blocks(sched.graph().blocks().begin(), sched.graph().blocks().end());
+        const auto                                         indexOf    = [&blocks](std::string_view name) { return static_cast<std::size_t>(std::ranges::find(blocks, name, &gr::BlockModel::uniqueName) - blocks.begin()); };
+        const std::size_t                                  srcIndex   = indexOf(src.unique_name);
+        const std::size_t                                  firstIndex = indexOf(first.unique_name);
+        const std::size_t                                  laterIndex = indexOf(later.unique_name);
+        expect(lt(std::max({srcIndex, firstIndex, laterIndex}), blocks.size()) >> fatal);
+
+        std::vector<SchedState>                     states;
+        std::vector<Job>                            jobArena;
+        std::vector<std::size_t>                    successorArena;
+        std::vector<TopologyCacheProbe::ReadyEntry> readyHeap;
+        TopologyCacheProbe::TopologyCache           topology;
+        const auto                                  successorsOfSource = [&] {
+            sched.syncSchedStates(blocks, states);
+            sched.buildReleaseStorage(blocks, states, jobArena, successorArena, readyHeap, topology);
+            std::vector<std::size_t> successors(states[srcIndex].successors.begin(), states[srcIndex].successors.end());
+            std::ranges::sort(successors);
+            return successors;
+        };
+
+        expect(successorsOfSource() == std::vector{firstIndex}) << "the first build must see the graph as it is";
+
+        // Edited directly, bypassing the quiescence protocol, so nothing has told the cache. That makes
+        // a stale answer the *witness* that no rebuild happened, rather than a defect: were the graph
+        // re-flattened here, the new edge would appear.
+        expect(sched.graph().connect<"out", "in">(src, later).has_value() >> fatal);
+        expect(successorsOfSource() == std::vector{firstIndex}) << "no quiescence was released, so the cached topology must have been reused";
+
+        sched.releaseWorkQuiescence();
+        std::vector<std::size_t> expected{firstIndex, laterIndex};
+        std::ranges::sort(expected);
+        expect(successorsOfSource() == expected) << "releasing quiescence must invalidate the cache, so the new edge is seen";
+    };
+};
+
 int main() { /* tests are statically executed */ }
