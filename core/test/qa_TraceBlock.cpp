@@ -920,6 +920,60 @@ const boost::ut::suite<"TraceBlock"> traceBlockTests = [] {
         expect(json.find(R"("latencyFlows":"0")") != std::string::npos);
     };
 
+    "the timeline draws an invocation and its exact counts on one lane"_test = [] {
+        // The user-visible half of the fix, and a hop the record-level check does not cover: the
+        // records agreeing about the worker is one thing, the converter actually mapping that onto
+        // the viewer's thread id is another. Before the fix a block's workExact span was drawn on
+        // worker 0's track while the workEnd span enclosing it sat on the track that really ran it --
+        // one invocation, two lanes, for a marker whose whole purpose is to nest inside the other.
+        DecimatingRun run;
+        run.run(categoryMask(Category::work, Category::workExact));
+
+        Capture capture;
+        capture.events         = run.events;
+        const std::string json = catapultJson(capture);
+
+        const auto tidsFor = [&json](std::string_view category) {
+            std::set<std::string> tids;
+            for (std::size_t at = json.find(std::format(R"("cat":"{}")", category)); at != std::string::npos; at = json.find(std::format(R"("cat":"{}")", category), at + 1UZ)) {
+                const std::size_t key = json.find(R"("tid":)", at);
+                if (key == std::string::npos) {
+                    continue;
+                }
+                const std::size_t start = key + 6UZ;
+                tids.insert(json.substr(start, json.find_first_of(",}", start) - start));
+            }
+            return tids;
+        };
+
+        const std::set<std::string> boundaryTids = tidsFor("work");
+        const std::set<std::string> blockTids    = tidsFor("workExact");
+        expect(gt(boundaryTids.size(), 0UZ) >> fatal) << "the boundary spans must reach the timeline";
+        expect(gt(blockTids.size(), 0UZ) >> fatal) << "and so must the block-side spans";
+        expect(boundaryTids == blockTids) << "both must be drawn on the same lanes, or one invocation appears as two on different threads";
+    };
+
+    "a block run outside any scheduler reports no worker and no identity"_test = [] {
+        // The block-side markers take their worker from what the scheduler pushed down, so a block
+        // nobody scheduled has nothing to report. Worker 0 and `kNoEntity` are the honest answers
+        // there -- there is no worker and no interned identity -- and the defaults must say exactly
+        // that rather than some other number that would read as a real thread.
+        reset();
+        setCategories(categoryMask(Category::workExact));
+
+        gr::testing::Copy<float> loose;
+        std::ignore = loose.work(64UZ); // never adopted, never re-synced, no setTraceContext call
+
+        const std::vector<Event> events = ofKind(collect(), Kind::workExact);
+        setCategories(0U);
+
+        expect(gt(events.size(), 0UZ) >> fatal) << "an invocation outside a scheduler must still record itself";
+        for (const Event& event : events) {
+            expect(eq(event.workerId, std::uint8_t{0U})) << "no scheduler means no worker, which is 0 -- not an arbitrary default";
+            expect(eq(event.entity, kNoEntity)) << "and no interned identity";
+        }
+    };
+
     "a fused group is named as a group, not as a block"_test = [] {
         // A Merge<> unit is one BlockModel, so it interns once and its internal stages emit nothing.
         // The figures are the group's, and a report that labelled them a block's would invite exactly
