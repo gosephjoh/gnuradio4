@@ -553,6 +553,84 @@ public:
         }
     }
 
+    /// Release state that a re-sync must not throw away when nothing it depends on has changed.
+    ///
+    /// `syncSchedStates()` assigns whole states and `buildReleaseStorage()` re-slices the job arena, so
+    /// on their own they drop every admitted-but-unexecuted job and reset each block's last release --
+    /// which lets a periodic block be released early, since a zeroed `lastRelease` makes its temporal
+    /// gate vacuous. Correct after a mutation; wrong on the message phases where nothing changed, which
+    /// is nearly all of them. Carried only when the worker's list is pointer-identical *and* the
+    /// topology generation has not moved, so a job never outlives the input it was admitted over.
+    struct ReleaseCarry {
+        struct Saved {
+            const BlockModel*                     block    = nullptr;
+            std::size_t                           firstJob = 0UZ;
+            std::size_t                           jobCount = 0UZ;
+            std::chrono::steady_clock::time_point lastRelease{};
+            std::size_t                           overruns = 0UZ;
+        };
+        std::vector<Saved>             saved; // scratch, kept between phases so a steady state does not allocate
+        std::vector<Job>               jobs;  // oldest first within each block
+        std::vector<const BlockModel*> resynced;
+        std::size_t                    topologyGeneration = 0UZ;
+        std::size_t                    discarding         = 0UZ; // what the pending re-sync drops when not carrying
+        bool                           carrying           = false;
+    };
+
+    /// Call before `syncSchedStates()`: `states` still describes the list as it was last re-synced.
+    void saveOutstandingJobs(const std::vector<std::shared_ptr<BlockModel>>& blocks, const std::vector<SchedState>& states, ReleaseCarry& carry) {
+        carry.saved.clear();
+        carry.jobs.clear();
+        carry.discarding = 0UZ;
+        carry.carrying   = carry.topologyGeneration == gr::atomic_ref(_topologyGeneration).load_acquire() && std::ranges::equal(blocks, carry.resynced, {}, [](const std::shared_ptr<BlockModel>& block) { return static_cast<const BlockModel*>(block.get()); });
+        if (!carry.carrying) {
+            for (const SchedState& state : states) {
+                carry.discarding += state.jobs.size;
+            }
+            return;
+        }
+        for (std::size_t i = 0UZ; i < states.size(); ++i) {
+            const JobQueue& queue = states[i].jobs;
+            carry.saved.push_back(typename ReleaseCarry::Saved{.block = carry.resynced[i], .firstJob = carry.jobs.size(), .jobCount = queue.size, .lastRelease = states[i].lastRelease, .overruns = states[i].overruns});
+            for (std::size_t k = 0UZ; k < queue.size; ++k) {
+                carry.jobs.push_back(queue.storage[(queue.head + k) % queue.capacity()]);
+            }
+        }
+    }
+
+    /// Call after `buildReleaseStorage()`. Returns the jobs this re-sync discarded: all of them when the
+    /// list or the topology changed, otherwise only those a shrunken ring could no longer hold.
+    /// `assignedSamples` is rebuilt from the jobs actually restored, which is its invariant anyway.
+    [[nodiscard]] std::size_t restoreOutstandingJobs(const std::vector<std::shared_ptr<BlockModel>>& blocks, std::vector<SchedState>& states, ReleaseCarry& carry) {
+        std::size_t discarded = carry.discarding;
+        if (carry.carrying) {
+            for (std::size_t i = 0UZ; i < blocks.size(); ++i) {
+                // `applyStaticOrder()` may have permuted the list since the save; it almost never has.
+                const BlockModel* block = blocks[i].get();
+                const auto        saved = i < carry.saved.size() && carry.saved[i].block == block ? carry.saved.begin() + static_cast<std::ptrdiff_t>(i) : std::ranges::find(carry.saved, block, &ReleaseCarry::Saved::block);
+                if (saved == carry.saved.end()) {
+                    continue;
+                }
+                states[i].lastRelease = saved->lastRelease;
+                states[i].overruns    = saved->overruns;
+                for (const Job& job : std::span<const Job>{carry.jobs}.subspan(saved->firstJob, saved->jobCount)) {
+                    if (states[i].jobs.push(job)) {
+                        states[i].assignedSamples += job.batch;
+                    } else {
+                        ++discarded;
+                    }
+                }
+            }
+        }
+        carry.resynced.clear();
+        for (const std::shared_ptr<BlockModel>& block : blocks) {
+            carry.resynced.push_back(block.get());
+        }
+        carry.topologyGeneration = gr::atomic_ref(_topologyGeneration).load_acquire();
+        carry.carrying           = false;
+        return discarded;
+    }
+
     void requestWorkQuiescence() {
         gr::atomic_ref(_workQuiescenceRequested).store_release(true);
         // _nWorkersInWork load may not be reordered before _workQuiescenceRequested store
@@ -1721,11 +1799,13 @@ protected:
         std::vector<std::size_t> localSuccessorArena;
         std::vector<ReadyEntry>  localReadyHeap;
         TopologyCache            localTopology;
+        ReleaseCarry             localCarry;
 
         syncSchedStates(localBlockList, localStates, gr::trace::workerIdOf(runnerID));
         gr::scheduler::detail::applyStaticOrder<TPolicy>(localBlockList, localStates); // no-op for RoundRobinPolicy: its key is the position itself
         if constexpr (needsReleaseTracking(TPolicy::kPriorityClass)) {
             buildReleaseStorage(localBlockList, localStates, localJobArena, localSuccessorArena, localReadyHeap, localTopology);
+            std::ignore = restoreOutstandingJobs(localBlockList, localStates, localCarry); // records the baseline; there is nothing to carry yet
         }
 
         if (localBlockList.empty()) {
@@ -1845,19 +1925,15 @@ protected:
                     // a removal and an adoption in the same pass leave the size unchanged while the
                     // *contents* differ, so a size comparison would silently hand each block its
                     // neighbour's ceiling. This runs on the house-keeping cadence, not per pass.
-                    // The re-sync rides the message/house-keeping cadence, not an actual mutation, and
-                    // it assigns whole states -- so it also discards every outstanding job and resets
-                    // each block's last-release time. A known defect, recorded rather than papered over.
+                    // The re-sync rides the message/house-keeping cadence, not an actual mutation. Under a
+                    // release-tracking policy, outstanding jobs and each block's last release are carried
+                    // across it unless the list or the topology actually changed (`ReleaseCarry`).
                     {
                         // Described *before* the scope opens: the fingerprint walk is the cost of
                         // recording the re-sync, and a marker that spans it measures the observer
                         // along with the observed.
-                        std::uint64_t discardedJobs = 0UL;
-                        std::uint8_t  listChanged   = 0U;
+                        std::uint8_t listChanged = 0U;
                         if constexpr (gr::trace::kEnabled) {
-                            for (const SchedState& state : localStates) {
-                                discardedJobs += state.jobs.size;
-                            }
                             // Over the block *pointers*: a removal and an adoption in the same pass
                             // leave the size identical while the contents differ.
                             listChanged = (localBlockList.size() != traceListFingerprint.size() || !std::ranges::equal(localBlockList, traceListFingerprint, {}, [](const auto& b) { return b.get(); }, [](const void* p) { return p; })) ? gr::trace::flag::kListChanged : std::uint8_t{0U};
@@ -1872,7 +1948,11 @@ protected:
                         // own, this scope ran to the end of the message phase, so `stateSync` also
                         // covered `processScheduledMessages()` and buffer house-keeping and read as
                         // very nearly the whole phase.
-                        [[maybe_unused]] gr::trace::Scope syncScope{gr::trace::Event{.payload0 = gr::trace::saturate(localBlockList.size()), .payload1 = gr::trace::saturate(discardedJobs), .kind = gr::trace::Kind::stateSync, .workerId = gr::trace::workerIdOf(runnerID), .flags = listChanged}};
+                        [[maybe_unused]] gr::trace::Scope syncScope{gr::trace::Event{.payload0 = gr::trace::saturate(localBlockList.size()), .kind = gr::trace::Kind::stateSync, .workerId = gr::trace::workerIdOf(runnerID), .flags = listChanged}};
+
+                        if constexpr (needsReleaseTracking(TPolicy::kPriorityClass)) {
+                            saveOutstandingJobs(localBlockList, localStates, localCarry);
+                        }
 
                         syncSchedStates(localBlockList, localStates, gr::trace::workerIdOf(runnerID));
 
@@ -1882,6 +1962,10 @@ protected:
 
                         if constexpr (needsReleaseTracking(TPolicy::kPriorityClass)) {
                             buildReleaseStorage(localBlockList, localStates, localJobArena, localSuccessorArena, localReadyHeap, localTopology);
+                            [[maybe_unused]] const std::size_t discarded = restoreOutstandingJobs(localBlockList, localStates, localCarry);
+                            if constexpr (gr::trace::kEnabled) {
+                                syncScope.event().payload1 = gr::trace::saturate(discarded);
+                            }
                         }
                     }
 

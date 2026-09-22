@@ -723,10 +723,11 @@ const boost::ut::suite<"TraceScheduler"> traceSchedulerTests = [] {
         setCategories(0U);
     };
 
-    "under a release-tracking policy the same cadence throws admitted work away"_test = [] {
+    "under a release-tracking policy the re-sync reports the admitted work it discards"_test = [] {
         // The round-robin case above is the control: it tracks no jobs, so a re-sync costs only the
-        // rebuild. Earliest-deadline-first admits jobs ahead of running them, and the same wholesale
-        // assignment discards every one that has not executed yet. This measures what that costs.
+        // rebuild. Earliest-deadline-first admits jobs ahead of running them. Those are carried across
+        // a re-sync in which nothing changed, and dropped only when the list or the topology did; the
+        // marker's payload counts what was actually dropped, not what was merely outstanding.
         reset();
         setCategories(categoryMask(Category::schedulerLoop));
 
@@ -763,10 +764,10 @@ const boost::ut::suite<"TraceScheduler"> traceSchedulerTests = [] {
         expect(gt(syncs, 0UZ) >> fatal) << "a running pool worker must re-sync";
         expect(lt(syncsChanged, syncs)) << "the cadence, not a mutation, is what triggers the re-sync";
 
-        // Deliberately not asserted as a bound. Whether any admitted job is outstanding when the
-        // cadence fires is a race between the worker and the house-keeping interval, so a threshold
-        // here would be flaky. What is asserted is that the marker reports the quantity at all, so
-        // the cost is visible to anyone who looks rather than having to be inferred.
+        // Deliberately not asserted as a bound. A drop needs a job outstanding at the moment the list or
+        // the topology changes, which is a race between the worker and the mutation, and a topology
+        // change is not flagged on the record -- so a threshold here would be flaky. The carry itself
+        // is pinned deterministically in `qa_SchedulingJobs`; this only keeps the quantity visible.
         std::ignore = jobsLost;
         std::ignore = syncsLosing;
 

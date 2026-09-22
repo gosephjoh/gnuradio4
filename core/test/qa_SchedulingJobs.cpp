@@ -1153,7 +1153,7 @@ const boost::ut::suite<"feedback self-successor"> selfLoopTests = [] {
 namespace {
 /// `ReadyEntry` is protected, and `buildReleaseStorage` takes a vector of it; this only re-exports the
 /// name so a test can drive the release-storage path without a running worker.
-struct TopologyCacheProbe : gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded, gr::profiling::null::Profiler, gr::scheduler::EdfPolicy> {
+struct ReleaseStorageProbe : gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::externalStep, gr::profiling::null::Profiler, gr::scheduler::EdfPolicy> {
     using Simple::ReadyEntry;
 };
 } // namespace
@@ -1170,7 +1170,7 @@ const boost::ut::suite<"topology cache"> topologyCacheTests = [] {
         auto&     later = graph.emplaceBlock<gr::testing::Copy<float>>();
         expect(graph.connect<"out", "in">(src, first).has_value() >> fatal);
 
-        TopologyCacheProbe sched;
+        ReleaseStorageProbe sched;
         expect(sched.exchange(std::move(graph)).has_value() >> fatal);
 
         const std::vector<std::shared_ptr<gr::BlockModel>> blocks(sched.graph().blocks().begin(), sched.graph().blocks().end());
@@ -1183,8 +1183,8 @@ const boost::ut::suite<"topology cache"> topologyCacheTests = [] {
         std::vector<SchedState>                     states;
         std::vector<Job>                            jobArena;
         std::vector<std::size_t>                    successorArena;
-        std::vector<TopologyCacheProbe::ReadyEntry> readyHeap;
-        TopologyCacheProbe::TopologyCache           topology;
+        std::vector<ReleaseStorageProbe::ReadyEntry> readyHeap;
+        ReleaseStorageProbe::TopologyCache           topology;
         const auto                                  successorsOfSource = [&] {
             sched.syncSchedStates(blocks, states);
             sched.buildReleaseStorage(blocks, states, jobArena, successorArena, readyHeap, topology);
@@ -1205,6 +1205,78 @@ const boost::ut::suite<"topology cache"> topologyCacheTests = [] {
         std::vector<std::size_t> expected{firstIndex, laterIndex};
         std::ranges::sort(expected);
         expect(successorsOfSource() == expected) << "releasing quiescence must invalidate the cache, so the new edge is seen";
+    };
+};
+
+const boost::ut::suite<"release state across a re-sync"> releaseCarryTests = [] {
+    "outstanding jobs survive a re-sync in which nothing changed, and only then"_test = [] {
+        // A re-sync rides the message-phase cadence, not a mutation. Assigning whole states used to drop
+        // every admitted-but-unexecuted job and zero each block's last release -- the latter making a
+        // periodic block's temporal gate vacuous, so it could be released early. Both must now survive a
+        // phase where nothing changed, and both must still be dropped when something did.
+        gr::Graph graph;
+        auto&     src  = graph.emplaceBlock<gr::testing::ConstantSource<float>>();
+        auto&     copy = graph.emplaceBlock<gr::testing::Copy<float>>();
+        expect(graph.connect<"out", "in">(src, copy).has_value() >> fatal);
+
+        ReleaseStorageProbe sched;
+        expect(sched.exchange(std::move(graph)).has_value() >> fatal);
+        // Started, because a ring's capacity is derived from its input buffer and edges are only given
+        // buffers on start. `externalStep` starts without running anything, so the states below are the
+        // test's alone.
+        expect(sched.changeStateTo(gr::lifecycle::State::INITIALISED).has_value() >> fatal);
+        expect(sched.changeStateTo(gr::lifecycle::State::RUNNING).has_value() >> fatal);
+
+        std::vector<std::shared_ptr<gr::BlockModel>> blocks(sched.graph().blocks().begin(), sched.graph().blocks().end());
+        const std::string_view                       copyName  = copy.unique_name;
+        const std::size_t                            copyIndex = static_cast<std::size_t>(std::ranges::find(blocks, copyName, &gr::BlockModel::uniqueName) - blocks.begin());
+        expect(lt(copyIndex, blocks.size()) >> fatal);
+
+        std::vector<SchedState>                      states;
+        std::vector<Job>                             jobArena;
+        std::vector<std::size_t>                     successorArena;
+        std::vector<ReleaseStorageProbe::ReadyEntry> readyHeap;
+        ReleaseStorageProbe::TopologyCache           topology;
+        ReleaseStorageProbe::ReleaseCarry            carry;
+        const auto                                   resync = [&] {
+            sched.saveOutstandingJobs(blocks, states, carry);
+            sched.syncSchedStates(blocks, states);
+            sched.buildReleaseStorage(blocks, states, jobArena, successorArena, readyHeap, topology);
+            return sched.restoreOutstandingJobs(blocks, states, carry);
+        };
+
+        expect(eq(resync(), 0UZ)) << "the first derivation has nothing to discard";
+        expect(ge(states[copyIndex].jobs.capacity(), 2UZ) >> fatal) << "the ring must hold the two jobs this test admits";
+
+        const Clock::time_point released = Clock::now();
+        const auto              admit    = [&] {
+            for (const std::size_t batch : {3UZ, 5UZ}) {
+                expect(states[copyIndex].jobs.push(Job{.batch = batch, .releaseTime = released}) >> fatal);
+                states[copyIndex].assignedSamples += batch;
+            }
+            states[copyIndex].lastRelease = released;
+            states[copyIndex].overruns    = 2UZ;
+        };
+
+        admit();
+        expect(eq(resync(), 0UZ)) << "nothing changed, so nothing may be discarded";
+        expect(eq(states[copyIndex].jobs.size, 2UZ)) << "both admitted jobs must survive";
+        expect(eq(states[copyIndex].jobs.front().batch, 3UZ)) << "in the order they were admitted";
+        expect(eq(states[copyIndex].assignedSamples, 8UZ)) << "the assignment must match the jobs, or two jobs could claim the same data";
+        expect(states[copyIndex].lastRelease == released) << "a zeroed last release would let a periodic block be released early";
+        expect(eq(states[copyIndex].overruns, 2UZ));
+
+        sched.releaseWorkQuiescence(); // what every structural change ends with
+        expect(eq(resync(), 2UZ)) << "after a topology change the jobs must be dropped, and the drop reported";
+        expect(eq(states[copyIndex].jobs.size, 0UZ));
+        expect(eq(states[copyIndex].assignedSamples, 0UZ));
+        expect(states[copyIndex].lastRelease == Clock::time_point{});
+
+        admit();
+        std::ranges::rotate(blocks, blocks.begin() + 1); // a list whose order changed between phases
+        expect(eq(resync(), 2UZ)) << "a changed list is re-derived from scratch, and its jobs dropped";
+
+        std::ignore = sched.changeStateTo(gr::lifecycle::State::STOPPED);
     };
 };
 
