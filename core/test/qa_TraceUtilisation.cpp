@@ -377,6 +377,13 @@ const boost::ut::suite<"TraceUtilisationLive"> traceUtilisationLiveTests = [] {
     }
 
     "a real worker loop yields a decomposition that holds together"_test = [] {
+        // Warmed up first, because the *first* run in a process is not the steady state this
+        // assertion is about. A cold process pays ring allocation, first-touch page faults and arena
+        // construction inside the worker's lifetime and outside every recorded scope, which lands --
+        // correctly -- in `unaccounted`: measured cold, the worker is alive 4.6 ms, accounts for
+        // 1.75 ms of it, and is on a core for 99.7 % of the difference. Nothing is missing; the
+        // process is simply starting up. Warmed, the same run accounts for 99.5 % of its life.
+        std::ignore                                 = runLive(categoryMask(Category::work), gr::Size_t{1000U});
         const std::vector<Event>             events = runLive(categoryMask(Category::work, Category::schedulerLoop, Category::lifecycle), gr::Size_t{200000U});
         const std::vector<WorkerUtilisation> all    = workerUtilisation(events, 0UL);
         expect(eq(all.size(), 1UZ) >> fatal) << "singleThreaded runs exactly one worker";
@@ -463,7 +470,7 @@ const boost::ut::suite<"TraceUtilisationLive"> traceUtilisationLiveTests = [] {
         // shape, since the job split depends on the pool size -- but the relationships must hold for
         // every worker independently, and the attribution must not blur between them.
         reset();
-        setCategories(categoryMask(Category::work, Category::schedulerLoop, Category::lifecycle));
+        setCategories(categoryMask(Category::work, Category::schedulerLoop, Category::lifecycle, Category::workExact));
 
         gr::Graph graph;
         auto&     src = graph.emplaceBlock<gr::testing::ConstantSource<float>>({{"name", std::string("src")}, {"n_samples_max", gr::Size_t{200000U}}});
@@ -503,6 +510,32 @@ const boost::ut::suite<"TraceUtilisationLive"> traceUtilisationLiveTests = [] {
             }
         }
         expect(gt(computed, 0UZ) >> fatal) << "at least one worker must have a usable decomposition";
+
+        // I1 - the two sides must agree about who ran each block. `workEnd` is emitted at the
+        // scheduler boundary, which knows the worker; `workExact` is emitted from inside work(),
+        // which does not and has to be told. They describe the same invocations, so the set of
+        // workers naming a block must be identical on both -- and if the block-side markers were
+        // not given the worker they would all say 0 while the boundary said the truth.
+        std::map<EntityId, std::set<std::uint8_t>> boundarySide;
+        std::map<EntityId, std::set<std::uint8_t>> blockSide;
+        for (const Event& event : events) {
+            if (event.entity == kNoEntity) {
+                continue;
+            }
+            if (event.kind == Kind::workEnd) {
+                boundarySide[event.entity].insert(event.workerId);
+            } else if (event.kind == Kind::workExact) {
+                blockSide[event.entity].insert(event.workerId);
+            }
+        }
+        if (!blockSide.empty()) {
+            expect(eq(blockSide.size(), boundarySide.size())) << "both sides must describe the same blocks";
+            for (const auto& [entity, workers] : blockSide) {
+                const auto boundary = boundarySide.find(entity);
+                expect((boundary != boundarySide.end()) >> fatal) << "entity " << entity << " has block-side records but no boundary records";
+                expect(workers == boundary->second) << "entity " << entity << ": the block-side markers name a different worker than the boundary did";
+            }
+        }
 
         // F4 - each block belongs to one job set, so its records must come from one worker. A block
         // surfacing under two means the identity or the worker attribution is wrong, which is the

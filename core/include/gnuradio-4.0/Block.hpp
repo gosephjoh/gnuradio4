@@ -796,6 +796,7 @@ public:
     // block by value or by pointer, never at that address. Two bytes, kept unconditionally rather than
     // behind a conditional member, which would put a std::conditional_t in the most-read struct here.
     gr::trace::EntityId _traceEntityId = gr::trace::kNoEntity;
+    std::uint8_t        _traceWorkerId = 0U;
 
     // intermediate non-real-time<->real-time setting states
     CtxSettings<Derived> _settings;
@@ -2049,7 +2050,7 @@ public:
         // record none of those. The payload is filled by an `on_scope_exit` declared *after* the
         // scope, so it destructs *before* it -- every path emits a complete record without a line
         // before each return that could drift out of step with the others.
-        [[maybe_unused]] gr::trace::Scope exactScope{gr::trace::Event{.entity = _traceEntityId, .kind = gr::trace::Kind::workExact}};
+        [[maybe_unused]] gr::trace::Scope exactScope{gr::trace::Event{.entity = _traceEntityId, .kind = gr::trace::Kind::workExact, .workerId = _traceWorkerId}};
         [[maybe_unused]] std::size_t      tracedIn       = 0UZ;
         [[maybe_unused]] std::size_t      tracedOut      = 0UZ;
         [[maybe_unused]] std::size_t      tracedPosition = 0UZ;
@@ -2090,7 +2091,7 @@ public:
         // `workInternal` and nest inside `exactScope` by construction.
         SampleLimits limits;
         {
-            [[maybe_unused]] gr::trace::Scope phaseScope{gr::trace::Event{.payload0 = std::to_underlying(gr::trace::Phase::computeSampleLimits), .entity = _traceEntityId, .kind = gr::trace::Kind::workPhase}};
+            [[maybe_unused]] gr::trace::Scope phaseScope{gr::trace::Event{.payload0 = std::to_underlying(gr::trace::Phase::computeSampleLimits), .entity = _traceEntityId, .kind = gr::trace::Kind::workPhase, .workerId = _traceWorkerId}};
             limits = computeSampleLimits(requestedWork);
         }
 
@@ -2156,7 +2157,7 @@ public:
         std::size_t processedIn  = limits.resampledIn;
         std::size_t processedOut = limits.resampledOut;
 
-        [[maybe_unused]] gr::trace::Scope prepareScope{gr::trace::Event{.payload0 = std::to_underlying(gr::trace::Phase::prepareStreams), .payload1 = gr::trace::saturate(processedIn), .payload2 = gr::trace::saturate(processedOut), .entity = _traceEntityId, .kind = gr::trace::Kind::workPhase}};
+        [[maybe_unused]] gr::trace::Scope prepareScope{gr::trace::Event{.payload0 = std::to_underlying(gr::trace::Phase::prepareStreams), .payload1 = gr::trace::saturate(processedIn), .payload2 = gr::trace::saturate(processedOut), .entity = _traceEntityId, .kind = gr::trace::Kind::workPhase, .workerId = _traceWorkerId}};
         auto                              inputSpans  = prepareStreams(inputPorts<PortType::STREAM>(&self()), processedIn);
         auto                              outputSpans = prepareStreams(outputPorts<PortType::STREAM>(&self()), processedOut);
         prepareScope.finish();
@@ -2260,7 +2261,7 @@ public:
         {
             // The block's own arithmetic. Separating this from the three framework phases either
             // side of it is what measures I_v directly instead of inferring it from a regression.
-            [[maybe_unused]] gr::trace::Scope phaseScope{gr::trace::Event{.payload0 = std::to_underlying(gr::trace::Phase::dispatchProcessing), .entity = _traceEntityId, .kind = gr::trace::Kind::workPhase}};
+            [[maybe_unused]] gr::trace::Scope phaseScope{gr::trace::Event{.payload0 = std::to_underlying(gr::trace::Phase::dispatchProcessing), .entity = _traceEntityId, .kind = gr::trace::Kind::workPhase, .workerId = _traceWorkerId}};
             userReturnStatus            = dispatchProcessing(inputSpans, outputSpans, processedIn, processedOut);
             phaseScope.event().payload1 = gr::trace::saturate(processedIn);
             phaseScope.event().payload2 = gr::trace::saturate(processedOut);
@@ -2275,7 +2276,7 @@ public:
         }
         work::sanitiseProcessStatus(userReturnStatus, processedIn, processedOut);
         {
-            [[maybe_unused]] gr::trace::Scope phaseScope{gr::trace::Event{.payload0 = std::to_underlying(gr::trace::Phase::finaliseIO), .payload1 = gr::trace::saturate(processedIn), .payload2 = gr::trace::saturate(processedOut), .entity = _traceEntityId, .kind = gr::trace::Kind::workPhase}};
+            [[maybe_unused]] gr::trace::Scope phaseScope{gr::trace::Event{.payload0 = std::to_underlying(gr::trace::Phase::finaliseIO), .payload1 = gr::trace::saturate(processedIn), .payload2 = gr::trace::saturate(processedOut), .entity = _traceEntityId, .kind = gr::trace::Kind::workPhase, .workerId = _traceWorkerId}};
             finaliseIO(inputSpans, outputSpans, userReturnStatus, processedIn, processedOut, limits.resampledIn);
         }
 
