@@ -4,6 +4,7 @@
 #include <bit>
 #include <chrono>
 #include <mutex>
+#include <optional>
 #include <queue>
 #include <set>
 #include <unordered_set>
@@ -194,7 +195,8 @@ protected:
     };
 
     meta::indirect<gr::Graph>     _graph{};
-    std::size_t                   _graphGeneration{0}; // incremented on exchange()
+    std::size_t                   _graphGeneration{0};    // incremented on exchange()
+    std::size_t                   _topologyGeneration{0}; // incremented whenever work quiescence is released
     TProfiler                     _profiler{};
     ProfileHandle                 _profilerHandler{_profiler.forThisThread()};
     std::shared_ptr<TaskExecutor> _pool{gr::thread_pool::Manager::instance().defaultCpuPool()};
@@ -458,11 +460,12 @@ public:
         }
 
         if constexpr (needsReleaseTracking(TPolicy::kPriorityClass)) {
+            TopologyCache topology; // one flatten for every job list, rather than one each
             _jobArena.resize(_executionOrder->size());
             _successorArena.resize(_executionOrder->size());
             _readyHeapArena.resize(_executionOrder->size());
             for (std::size_t job = 0UZ; job < _executionOrder->size(); ++job) {
-                buildReleaseStorage((*_executionOrder)[job], _schedStates[job], _jobArena[job], _successorArena[job], _readyHeapArena[job]);
+                buildReleaseStorage((*_executionOrder)[job], _schedStates[job], _jobArena[job], _successorArena[job], _readyHeapArena[job], topology);
             }
         }
     }
@@ -475,7 +478,25 @@ public:
     /// are two state paths -- `_schedStates` for `step()`, and the worker-local copies `poolWorker`
     /// derives -- and both must go through here, or a policy that tracks releases finds every job
     /// ring empty and never runs a block at all.
-    void buildReleaseStorage(const std::vector<std::shared_ptr<BlockModel>>& blocks, std::vector<SchedState>& states, std::vector<Job>& jobArena, std::vector<std::size_t>& successorArena, std::vector<ReadyEntry>& readyHeap) const {
+    /// The flattened graph and its adjacency, held across message phases because neither can change
+    /// unless the graph is structurally modified.
+    ///
+    /// Owned by the caller and never shared between workers. The quiescence protocol makes concurrent
+    /// *reads* of the graph safe -- a structural change waits for every `WorkGuard` to be released --
+    /// but it does not serialise several workers rebuilding one shared cache, which is what the first
+    /// phase after a mutation would have them all do. A copy per worker sidesteps that, for the price
+    /// of a few rebuilds per mutation against the tens of thousands per second this removes.
+    ///
+    /// `adjacency` holds `const Edge*` into `flatGraph`, so the two are replaced together, in that
+    /// order, and never one without the other.
+    struct TopologyCache {
+        std::optional<gr::Graph> flatGraph;
+        gr::graph::AdjacencyList adjacency;
+        std::size_t              generation = 0UZ;
+        bool                     built      = false;
+    };
+
+    void buildReleaseStorage(const std::vector<std::shared_ptr<BlockModel>>& blocks, std::vector<SchedState>& states, std::vector<Job>& jobArena, std::vector<std::size_t>& successorArena, std::vector<ReadyEntry>& readyHeap, TopologyCache& topology) {
         jobArena.clear();
         successorArena.clear();
         readyHeap.assign(blocks.size(), ReadyEntry{});
@@ -483,8 +504,18 @@ public:
             return;
         }
 
-        const gr::Graph                flatGraph = gr::graph::flatten(*_graph);
-        const gr::graph::AdjacencyList adjacency = gr::graph::computeAdjacencyList(flatGraph);
+        // Flattening the graph and rebuilding its adjacency is the expensive part of this function, and
+        // it reads the one input a message phase cannot have changed -- so it happens only when the
+        // generation says the graph was actually modified.
+        const std::size_t generation = gr::atomic_ref(_topologyGeneration).load_acquire();
+        if (!topology.built || topology.generation != generation) {
+            topology.adjacency.clear(); // its pointers alias the graph replaced on the next line
+            topology.flatGraph.emplace(gr::graph::flatten(*_graph));
+            topology.adjacency  = gr::graph::computeAdjacencyList(*topology.flatGraph);
+            topology.generation = generation;
+            topology.built      = true;
+        }
+        const gr::graph::AdjacencyList& adjacency = topology.adjacency;
 
         std::unordered_map<const BlockModel*, std::size_t> localIndex;
         localIndex.reserve(blocks.size());
@@ -531,7 +562,14 @@ public:
         }
     }
 
-    void releaseWorkQuiescence() { gr::atomic_ref(_workQuiescenceRequested).store_release(false); }
+    /// Bumping the topology generation here rather than at each structural change is deliberate: every
+    /// such change is made under a `WorkQuiescenceGuard`, whose destructor lands here, so a mutation
+    /// that follows the existing protocol cannot forget to invalidate. Quiescence taken for a reason
+    /// that changed no topology invalidates too, which costs one rebuild and cannot be wrong.
+    void releaseWorkQuiescence() {
+        gr::atomic_ref(_topologyGeneration).fetch_add(1);
+        gr::atomic_ref(_workQuiescenceRequested).store_release(false);
+    }
 
     /// Invokes blockUntilWorking(), do not call when scheduler is not running or being started
     /// as it will block until it sees a worker thread/call to poolWorker
@@ -1682,11 +1720,12 @@ protected:
         std::vector<Job>         localJobArena;
         std::vector<std::size_t> localSuccessorArena;
         std::vector<ReadyEntry>  localReadyHeap;
+        TopologyCache            localTopology;
 
         syncSchedStates(localBlockList, localStates, gr::trace::workerIdOf(runnerID));
         gr::scheduler::detail::applyStaticOrder<TPolicy>(localBlockList, localStates); // no-op for RoundRobinPolicy: its key is the position itself
         if constexpr (needsReleaseTracking(TPolicy::kPriorityClass)) {
-            buildReleaseStorage(localBlockList, localStates, localJobArena, localSuccessorArena, localReadyHeap);
+            buildReleaseStorage(localBlockList, localStates, localJobArena, localSuccessorArena, localReadyHeap, localTopology);
         }
 
         if (localBlockList.empty()) {
@@ -1808,37 +1847,42 @@ protected:
                     // neighbour's ceiling. This runs on the house-keeping cadence, not per pass.
                     // The re-sync rides the message/house-keeping cadence, not an actual mutation, and
                     // it assigns whole states -- so it also discards every outstanding job and resets
-                    // each block's last-release time. Whether that is a real cost depends on how often
-                    // it fires with nothing having changed, which nobody had measured. The comparison
-                    // is over the block *pointers*, because a removal and an adoption in the same pass
-                    // leave the size identical while the contents differ.
-                    [[maybe_unused]] gr::trace::Scope syncScope{gr::trace::Event{.payload0 = gr::trace::saturate(localBlockList.size()), .kind = gr::trace::Kind::stateSync, .workerId = gr::trace::workerIdOf(runnerID)}};
-                    if constexpr (gr::trace::kEnabled) {
-                        std::uint64_t discarded = 0UL;
-                        for (const SchedState& state : localStates) {
-                            discarded += state.jobs.size;
+                    // each block's last-release time. A known defect, recorded rather than papered over.
+                    {
+                        // Described *before* the scope opens: the fingerprint walk is the cost of
+                        // recording the re-sync, and a marker that spans it measures the observer
+                        // along with the observed.
+                        std::uint64_t discardedJobs = 0UL;
+                        std::uint8_t  listChanged   = 0U;
+                        if constexpr (gr::trace::kEnabled) {
+                            for (const SchedState& state : localStates) {
+                                discardedJobs += state.jobs.size;
+                            }
+                            // Over the block *pointers*: a removal and an adoption in the same pass
+                            // leave the size identical while the contents differ.
+                            listChanged = (localBlockList.size() != traceListFingerprint.size() || !std::ranges::equal(localBlockList, traceListFingerprint, {}, [](const auto& b) { return b.get(); }, [](const void* p) { return p; })) ? gr::trace::flag::kListChanged : std::uint8_t{0U};
+                            traceListFingerprint.clear();
+                            traceListFingerprint.reserve(localBlockList.size());
+                            for (const auto& block : localBlockList) {
+                                traceListFingerprint.push_back(static_cast<const void*>(block.get()));
+                            }
                         }
-                        syncScope.event().payload1 = gr::trace::saturate(discarded);
-                        syncScope.event().flags    = (localBlockList.size() != traceListFingerprint.size() || !std::ranges::equal(localBlockList, traceListFingerprint, {}, [](const auto& b) { return b.get(); }, [](const void* p) { return p; })) ? gr::trace::flag::kListChanged : std::uint8_t{0U};
-                        traceListFingerprint.clear();
-                        traceListFingerprint.reserve(localBlockList.size());
-                        for (const auto& block : localBlockList) {
-                            traceListFingerprint.push_back(static_cast<const void*>(block.get()));
+
+                        // Brackets the state rebuild and nothing else. Declared without a block of its
+                        // own, this scope ran to the end of the message phase, so `stateSync` also
+                        // covered `processScheduledMessages()` and buffer house-keeping and read as
+                        // very nearly the whole phase.
+                        [[maybe_unused]] gr::trace::Scope syncScope{gr::trace::Event{.payload0 = gr::trace::saturate(localBlockList.size()), .payload1 = gr::trace::saturate(discardedJobs), .kind = gr::trace::Kind::stateSync, .workerId = gr::trace::workerIdOf(runnerID), .flags = listChanged}};
+
+                        syncSchedStates(localBlockList, localStates, gr::trace::workerIdOf(runnerID));
+
+                        // Re-order after the mutations: adoption appends to the end of the list, so
+                        // without this a newly adopted block would run last whatever its priority. A no-op for `RoundRobinPolicy`, whose key is the position.
+                        gr::scheduler::detail::applyStaticOrder<TPolicy>(localBlockList, localStates);
+
+                        if constexpr (needsReleaseTracking(TPolicy::kPriorityClass)) {
+                            buildReleaseStorage(localBlockList, localStates, localJobArena, localSuccessorArena, localReadyHeap, localTopology);
                         }
-                    }
-
-                    syncSchedStates(localBlockList, localStates, gr::trace::workerIdOf(runnerID));
-
-                    // Re-order after the mutations: adoption appends to the end of the list, so
-                    // without this a newly adopted block would run last whatever its priority. A no-op for `RoundRobinPolicy`, whose key is the position.
-                    gr::scheduler::detail::applyStaticOrder<TPolicy>(localBlockList, localStates);
-
-                    // N.B. `syncSchedStates()` assigns whole `SchedState`s, so this also discards
-                    // every outstanding job and resets `lastRelease`. That is correct on an actual
-                    // graph mutation, but it rides the house-keeping cadence and so fires even when
-                    // nothing changed -- a known defect, recorded rather than papered over.
-                    if constexpr (needsReleaseTracking(TPolicy::kPriorityClass)) {
-                        buildReleaseStorage(localBlockList, localStates, localJobArena, localSuccessorArena, localReadyHeap);
                     }
 
                     std::ranges::for_each(localBlockList, &BlockModel::processScheduledMessages);
