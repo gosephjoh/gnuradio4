@@ -428,12 +428,16 @@ public:
             if constexpr (needsReleaseTracking(TPolicy::kPriorityClass)) {
                 // The gates' inputs. A block the analysis does not know keeps period and deadline at
                 // zero, which leaves it released on data alone -- the same
-                // deliberately-imperfect treatment adopted blocks already receive for priority.
-                states[i].batchFloor = gr::scheduler::detail::releaseThreshold(*blocks[i]);
+                // deliberately-imperfect treatment adopted blocks already receive for priority. Its
+                // floor is worked out from its own ports only then: for an analysed block the
+                // analysis's floor wins, and computing the other on every re-sync only to discard it
+                // was about 2 % of a release-tracking worker.
                 if (attributes != nullptr) {
                     states[i].batchFloor              = std::max(attributes->batchFloor, 1UZ);
                     states[i].periodSeconds           = static_cast<double>(attributes->period);
                     states[i].relativeDeadlineSeconds = static_cast<double>(attributes->relativeDeadline);
+                } else {
+                    states[i].batchFloor = gr::scheduler::detail::releaseThreshold(*blocks[i]);
                 }
             }
         }

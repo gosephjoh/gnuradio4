@@ -1351,6 +1351,30 @@ const boost::ut::suite<"topology cache"> topologyCacheTests = [] {
     };
 };
 
+const boost::ut::suite<"batch floor"> batchFloorTests = [] {
+    "a block the analysis does not know still gets the floor its ports demand"_test = [] {
+        // The re-sync takes an analysed block's floor from the analysis, and computes one from the block's
+        // own ports only for a block the analysis never saw -- one adopted at run time. Before `init()` the
+        // analysis is empty, which makes every block such a block.
+        gr::Graph graph;
+        auto&     src       = graph.emplaceBlock<gr::testing::ConstantSource<float>>();
+        auto&     copy      = graph.emplaceBlock<gr::testing::Copy<float>>();
+        copy.in.min_samples = 16UZ; // before anything reads the type-erased ports, which copy it once
+        expect(graph.connect<"out", "in">(src, copy).has_value() >> fatal);
+
+        ReleaseStorageProbe sched;
+        expect(sched.exchange(std::move(graph)).has_value() >> fatal);
+
+        const std::vector<std::shared_ptr<gr::BlockModel>> blocks(sched.graph().blocks().begin(), sched.graph().blocks().end());
+        const std::string_view                             copyName  = copy.unique_name;
+        const std::size_t                                  copyIndex = static_cast<std::size_t>(std::ranges::find(blocks, copyName, &gr::BlockModel::uniqueName) - blocks.begin());
+        std::vector<SchedState>                            states;
+        sched.syncSchedStates(blocks, states);
+
+        expect(eq(states[copyIndex].batchFloor, 16UZ)) << "an unanalysed block must be released only once its port minimum is met";
+    };
+};
+
 const boost::ut::suite<"release state across a re-sync"> releaseCarryTests = [] {
     "outstanding jobs survive a re-sync in which nothing changed, and only then"_test = [] {
         // A re-sync rides the message-phase cadence, not a mutation. Assigning whole states used to drop
