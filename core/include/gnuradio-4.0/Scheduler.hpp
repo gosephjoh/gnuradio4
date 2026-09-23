@@ -428,12 +428,16 @@ public:
             if constexpr (needsReleaseTracking(TPolicy::kPriorityClass)) {
                 // The gates' inputs. A block the analysis does not know keeps period and deadline at
                 // zero, which leaves it released on data alone -- the same
-                // deliberately-imperfect treatment adopted blocks already receive for priority.
-                states[i].batchFloor = gr::scheduler::detail::releaseThreshold(*blocks[i]);
+                // deliberately-imperfect treatment adopted blocks already receive for priority. Its
+                // floor is worked out from its own ports only then: for an analysed block the
+                // analysis's floor wins, and computing the other on every re-sync only to discard it
+                // was about 2 % of a release-tracking worker.
                 if (attributes != nullptr) {
                     states[i].batchFloor              = std::max(attributes->batchFloor, 1UZ);
                     states[i].periodSeconds           = static_cast<double>(attributes->period);
                     states[i].relativeDeadlineSeconds = static_cast<double>(attributes->relativeDeadline);
+                } else {
+                    states[i].batchFloor = gr::scheduler::detail::releaseThreshold(*blocks[i]);
                 }
             }
         }
@@ -483,6 +487,7 @@ public:
     struct TopologyCache {
         std::vector<const BlockModel*> derivedFor;
         std::vector<std::size_t>       successorOffsets; // into the caller's successor arena, one entry past each block
+        std::vector<std::uint8_t>      checkedEveryPass; // per block: a source, or fed from another worker
         std::size_t                    generation = 0UZ;
         bool                           built      = false;
     };
@@ -535,6 +540,35 @@ public:
                 }
                 topology.successorOffsets[i + 1UZ] = successorArena.size();
             }
+
+            // Which blocks the backstop must evaluate on every pass: those no same-worker producer's walk
+            // can reach. A block with no incoming stream edge is gated on its output, like a source; one
+            // with a stream edge from outside this list is fed by another worker. Stream edges only,
+            // because readiness counts stream inputs only: a message edge must not make a block look fed.
+            // Both are read off the same flattened graph as the successors, so they are right for exactly
+            // as long as the successors are.
+            std::vector<std::uint8_t> hasIncoming(blocks.size(), 0U);
+            topology.checkedEveryPass.assign(blocks.size(), 0U);
+            for (const auto& [source, ports] : adjacency) {
+                const bool sourceIsLocal = localIndex.contains(source.get());
+                for (const std::vector<const gr::Edge*>& edges : ports | std::views::values) {
+                    for (const gr::Edge* edge : edges) {
+                        if (edge->edgeType() != PortType::STREAM) {
+                            continue;
+                        }
+                        if (const auto local = localIndex.find(edge->destinationBlock().get()); local != localIndex.end()) {
+                            hasIncoming[local->second] = 1U;
+                            if (!sourceIsLocal) {
+                                topology.checkedEveryPass[local->second] = 1U;
+                            }
+                        }
+                    }
+                }
+            }
+            for (std::size_t i = 0UZ; i < blocks.size(); ++i) {
+                topology.checkedEveryPass[i] = hasIncoming[i] == 0U ? 1U : topology.checkedEveryPass[i];
+            }
+
             topology.derivedFor.clear();
             for (const std::shared_ptr<BlockModel>& block : blocks) {
                 topology.derivedFor.push_back(block.get());
@@ -554,7 +588,8 @@ public:
         // Spans are taken only now: both vectors are complete, so no later growth can invalidate them.
         const std::vector<std::size_t>& successorOffsets = topology.successorOffsets;
         for (std::size_t i = 0UZ; i < blocks.size(); ++i) {
-            states[i].successors   = std::span<const std::size_t>{successorArena}.subspan(successorOffsets[i], successorOffsets[i + 1UZ] - successorOffsets[i]);
+            states[i].successors              = std::span<const std::size_t>{successorArena}.subspan(successorOffsets[i], successorOffsets[i + 1UZ] - successorOffsets[i]);
+            states[i].releaseCheckedEveryPass = topology.checkedEveryPass[i] != 0U;
             states[i].jobs.storage = std::span<Job>{jobArena}.subspan(jobOffsets[i], jobOffsets[i + 1UZ] - jobOffsets[i]);
         }
     }
@@ -1039,6 +1074,12 @@ public:
     requires(executionPolicy() == ExecutionPolicy::externalStep)
     {
         processScheduledMessages();
+        // Every block's messages were just handled, and one may have paused, stopped or fed a block. On
+        // the pool path a re-sync follows the message phase and resets the backstop's flags; `step()`
+        // never re-syncs, so it resets them itself.
+        if (!_schedStates.empty()) {
+            std::ranges::for_each(_schedStates[0], [](SchedState& state) { state.releaseCheckDue = true; });
+        }
         return traverseBlockListOnce((*_executionOrder)[0], _schedStates.empty() ? std::span<SchedState>{} : std::span<SchedState>{_schedStates[0]}, _readyHeapArena.empty() ? std::span<ReadyEntry>{} : std::span<ReadyEntry>{_readyHeapArena[0]});
     }
 
@@ -1243,14 +1284,32 @@ protected:
             // A complete record, and emitted whether or not anything was released. A scan that finds
             // nothing is the *cost* side of "did event-driven detection earn its keep" -- recording
             // only the productive scans would make both paths look free and answer the question wrong.
-            [[maybe_unused]] gr::trace::Scope scanScope{gr::trace::Event{.payload0 = gr::trace::saturate(nScanned), .kind = gr::trace::Kind::releaseScan, .workerId = traceWorkerId}};
-            [[maybe_unused]] std::size_t      nReleased = 0UZ;
+            // `payload0` counts the blocks actually evaluated, which since the scan skips blocks it
+            // cannot help is the scan's real cost rather than the length of the list.
+            [[maybe_unused]] gr::trace::Scope scanScope{gr::trace::Event{.kind = gr::trace::Kind::releaseScan, .workerId = traceWorkerId}};
+            [[maybe_unused]] std::size_t      nReleased  = 0UZ;
+            [[maybe_unused]] std::size_t      nEvaluated = 0UZ;
 
             for (std::size_t i = 0UZ; i < nScanned; ++i) {
-                nReleased += releaseAndCount(*blocks[i], states[i], now, 0U /* backstop */);
+                SchedState& state = states[i];
+                if (state.finished) {
+                    continue; // a release check would return at once
+                }
+                // Skipped when its data gate was last found shut and nothing that could open it has
+                // happened since: new input from a producer on this worker re-checks it through the
+                // successor walk, its own execution sets the flag, a re-sync resets it, and a block fed
+                // from elsewhere or fed by nothing is never skipped. Its lifecycle is read here instead,
+                // because another thread can change that.
+                if (!state.releaseCheckDue && !state.releaseCheckedEveryPass && blocks[i]->state() == lifecycle::State::RUNNING) {
+                    assert(gr::scheduler::evaluateDataGate(*blocks[i], state).shut && "the backstop skipped a block that had become releasable");
+                    continue;
+                }
+                ++nEvaluated;
+                nReleased += releaseAndCount(*blocks[i], state, now, 0U /* backstop */);
             }
 
             if constexpr (gr::trace::kEnabled) {
+                scanScope.event().payload0 = gr::trace::saturate(nEvaluated);
                 scanScope.event().payload1 = gr::trace::saturate(nReleased);
             }
         }
@@ -1516,6 +1575,9 @@ protected:
 
                 traceDeadline(chosen); // while the job that ran is still the front one
                 gr::scheduler::retireFrontJob(states[chosen]);
+                // The successor walk below re-checks what this block feeds, never the block itself -- yet
+                // what it just consumed, and the job it just retired, change its own answer.
+                states[chosen].releaseCheckDue = true;
 
                 // Unconditional, and ahead of the DONE branch. `performed_work` cannot be used as the
                 // trigger: `computePerformedWork()` returns 0 for any status other than OK, so a
@@ -2832,6 +2894,11 @@ protected:
     void cleanupRemovedBlocks(std::size_t runnerID, std::vector<std::shared_ptr<BlockModel>>& localBlockList) {
         MovedBlockList& ourMovedBlockList = _movedBlocks[runnerID];
         std::lock_guard lockGuard(*ourMovedBlockList.mutex);
+        if (ourMovedBlockList.blocks.empty()) {
+            // The common case, on every pass: blocks move between workers only when grouped or ungrouped.
+            // Building the sets below to erase nothing cost an allocation per block, every pass.
+            return;
+        }
 
         auto ourMovedBlockListSet = ourMovedBlockList.blocks | std::ranges::to<std::unordered_set>();
         auto localBlockListSet    = localBlockList | std::ranges::to<std::unordered_set>();

@@ -374,11 +374,34 @@ inline constexpr double kMaxRepresentableDeadlineSeconds = static_cast<double>(s
     return shortestPeriodSeconds > 0.0 ? std::chrono::nanoseconds{static_cast<std::uint64_t>(shortestPeriodSeconds * 0.25 * 1e9)} : std::chrono::nanoseconds{0};
 }
 
+/// The data gate, on its own and without side effects, so the scheduler can also check in Debug builds
+/// that a block it skipped really was still shut.
+struct DataGate {
+    std::size_t unassigned = 0UZ;
+    bool        draining   = false; /// the stream has ended, so the floor is waived
+    bool        shut       = false;
+};
+
+[[nodiscard]] inline DataGate evaluateDataGate(BlockModel& block, const SchedState& state) {
+    const Readiness   readiness  = inputReadiness(block, state.batchFloor);
+    const std::size_t unassigned = unassignedSamples(readiness.available, state.assignedSamples);
+    const std::size_t floor      = std::max(state.batchFloor, 1UZ);
+    // Only with an empty ring: a shut gate can equally mean the samples are committed to outstanding
+    // jobs rather than absent, and waiving then would commit them twice.
+    const bool draining = unassigned < floor && state.jobs.empty() && block.inputStreamEnded();
+    return {.unassigned = unassigned, .draining = draining, .shut = unassigned < floor && !draining};
+}
+
 /// `traceFlags` carries what only the caller knows: which detection path this is. Clear means the
 /// per-sweep backstop, `gr::trace::flag::kViaSuccessorWalk` the event-driven walk. Defaulted because
 /// the backstop is the neutral answer and the unit tests that drive this function directly are not
 /// testing the detection path; the two scheduler call sites both pass it explicitly.
+///
+/// Also keeps `state.releaseCheckDue`, for every caller alike: cleared only when the data gate is found
+/// shut, since every other reason not to release -- the period, the lifecycle, a full ring -- can
+/// change without any new input arriving.
 inline void releaseIfEligible(BlockModel& block, SchedState& state, std::chrono::steady_clock::time_point now, [[maybe_unused]] std::uint8_t traceFlags = 0U) {
+    state.releaseCheckDue = true;
     if (state.finished) {
         return;
     }
@@ -395,24 +418,26 @@ inline void releaseIfEligible(BlockModel& block, SchedState& state, std::chrono:
 
     // End of stream makes the batch floor unsatisfiable: no more data is coming, so waiting for it
     // is waiting for ever, and the block would never run, never report DONE and never let its worker
-    // conclude the graph had finished. Only checked when the gate is about to shut, so it costs
-    // nothing while data is flowing.
+    // conclude the graph had finished. `evaluateDataGate()` waives the floor then. It asks only when the
+    // gate is about to shut -- which for an idle block is every scan it is evaluated in, so
+    // `inputStreamEnded()` answers from its tag readers' cursors alone unless a tag is actually waiting.
     //
-    // Only with an empty ring: a shut gate can equally mean the samples are committed to outstanding
-    // jobs rather than absent, and waiving then would commit them twice.
-    const Readiness   readiness  = inputReadiness(block, state.batchFloor);
-    const std::size_t unassigned = unassignedSamples(readiness.available, state.assignedSamples);
-    const bool        draining   = unassigned < std::max(state.batchFloor, 1UZ) && state.jobs.empty() && block.inputStreamEnded();
+    // The data gate is judged before the period gate. Either one shut means no release, so the order
+    // changes no decision -- but only a shut data gate lets the backstop stop looking at the block
+    // until its input changes, so it must not be masked by a shut period gate.
+    const DataGate gate = evaluateDataGate(block, state);
+    if (gate.shut) {
+        state.releaseCheckDue = false;
+        return;
+    }
+    const std::size_t unassigned = gate.unassigned;
+    const bool        draining   = gate.draining;
 
     if (!draining && state.periodSeconds > 0.0) { // a zero period imposes no temporal gate
         const std::chrono::duration<double> elapsed = now - state.lastRelease;
         if (elapsed.count() < state.periodSeconds) {
             return; // ... and a terminating block does not wait out a period to run its last job
         }
-    }
-
-    if (unassigned < std::max(state.batchFloor, 1UZ) && !draining) {
-        return;
     }
 
     // At least one, so a drain job can run on an empty-but-ended port and observe the end-of-stream

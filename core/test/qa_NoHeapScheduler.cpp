@@ -110,4 +110,61 @@ const boost::ut::suite<"Graph + Scheduler heap-discipline tracking"> _noHeapSche
     };
 };
 
+namespace {
+/// Reaches the per-worker moved-block lists, which are protected: `step()` never visits them, so the
+/// superloop scenario above cannot say anything about their cost.
+struct MovedBlocksProbe : gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded> {
+    using Simple::_movedBlocks;
+    using Simple::cleanupRemovedBlocks;
+};
+
+struct MovedBlocksFixture {
+    MovedBlocksProbe                             sched;
+    std::vector<std::shared_ptr<gr::BlockModel>> list;
+
+    MovedBlocksFixture() {
+        gr::Graph graph;
+        auto&     src  = graph.emplaceBlock<gr::testing::ConstantSource<float>>();
+        auto&     copy = graph.emplaceBlock<gr::testing::Copy<float>>();
+        auto&     sink = graph.emplaceBlock<gr::testing::NullSink<float>>();
+        expect(graph.connect<"out", "in">(src, copy).has_value() >> fatal);
+        expect(graph.connect<"out", "in">(copy, sink).has_value() >> fatal);
+        expect(sched.exchange(std::move(graph)).has_value() >> fatal);
+        sched._movedBlocks.resize(1UZ); // one worker; the pool path sizes this on worker start
+        list.assign(sched.graph().blocks().begin(), sched.graph().blocks().end());
+    }
+};
+} // namespace
+
+const boost::ut::suite<"moved-block cleanup"> _movedBlockCleanup = [] {
+    "clearing moved blocks allocates nothing when none were moved"_test = [] {
+        // Every pool-worker pass calls this, and a block is moved between workers only by grouping and
+        // ungrouping, which is rare. Building sets to erase nothing cost an allocation per block per pass.
+        MovedBlocksFixture fixture;
+        const std::size_t  before = fixture.list.size();
+        {
+            GlobalNewSentinel sentinel;
+            fixture.sched.cleanupRemovedBlocks(0UZ, fixture.list);
+            expect(eq(sentinel.delta(), 0UZ)) << "with nothing moved away, a pass must not allocate to find that out";
+        }
+        expect(eq(fixture.list.size(), before)) << "and must leave the worker's list alone";
+    };
+
+    "clearing moved blocks still removes the ones that were moved"_test = [] {
+        // The guard against the fix being too eager: a moved block leaves the worker's list and the moved
+        // list; one the worker never held stays listed as moved, for the worker that does hold it.
+        MovedBlocksFixture                    fixture;
+        const std::shared_ptr<gr::BlockModel> moved   = fixture.list[1];
+        const auto                            foreign = std::make_shared<gr::BlockWrapper<gr::testing::Copy<float>>>();
+        fixture.sched._movedBlocks[0].blocks          = {moved, foreign};
+
+        fixture.sched.cleanupRemovedBlocks(0UZ, fixture.list);
+
+        expect(eq(fixture.list.size(), 2UZ));
+        expect(std::ranges::find(fixture.list, moved) == fixture.list.end()) << "a moved block must leave the worker's list";
+        expect(eq(fixture.sched._movedBlocks[0].blocks.size(), 1UZ)) << "and the moved list, once this worker has let go of it";
+        expect(fixture.sched._movedBlocks[0].blocks.front() == foreign) << "a block this worker never held stays listed as moved";
+    };
+};
+
 int main() { /* tests are statically executed */ }

@@ -206,6 +206,16 @@ struct SchedState {
     /// right scope: a graph mutation invalidates the conclusion.
     bool finished = false;
 
+    /// Whether the backstop release scan must evaluate this block on its next pass. Cleared only when
+    /// the last evaluation found the data gate shut, since then nothing but new input, the block's own
+    /// execution, a lifecycle change or a re-sync can open it -- and each of those sets this again or
+    /// is checked directly. True by default, so every re-derivation starts with a full scan.
+    bool releaseCheckDue = true;
+
+    /// Evaluated on every pass regardless: a source, which no producer's walk can reach, or a block fed
+    /// from another worker, whose producer must not write this worker's state.
+    bool releaseCheckedEveryPass = false;
+
     /// Release bookkeeping, used only where the policy's class calls for it
     /// (`needsReleaseTracking`). A round-robin scheduler leaves all of it untouched and pays only
     /// the storage, which is fixed and small.
