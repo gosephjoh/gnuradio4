@@ -120,6 +120,10 @@ Then in each `batch_rt.json`, no receiver should be marked `saturated`. The
 light mix at four workers has ample capacity, so a saturated receiver means
 something else was running on the machine.
 
+Note each run's `window_covered_s` and `window_shifted` from the same file.
+They say how much of the run the trace-based figures describe, and §9 says
+why that is usually far less than the 12 s asked for.
+
 ## 7. Why the selection pass is bounded explicitly
 
 The driver passes `--max-pass-duration 51`, a quarter of the fastest
@@ -180,6 +184,16 @@ a batch floor it then discards (`3eb2f59c`), and the costs that sat on every
 pass, outside the message phase, are gone or reduced (§9). So the ratio-16
 versus ratio-4096 contrast is no longer the headline. Read the pass period
 first, per §9, and `stateSync` second.
+
+**A new baseline cannot say which change moved a number.** The run of
+2026-09-23 (afternoon) changed the scheduler (reason 4) and the platform
+(reason 5) at once. Its EDF `stateSync` fell by more than the scheduler
+changes account for, and its slow receivers and EDF at 4096 were late more
+often than before. None of that can be attributed yet. To attribute a
+difference, vary one factor at a time: rerun the previous core commit on the
+new platform, or the new commit on the old one, with the same cell and flags.
+Repeat each run, because one 20 s run per cell cannot separate a real shift of
+a percent or two from run-to-run spread.
 
 ## 9. What the numbers mean, and what they do not
 
@@ -246,6 +260,55 @@ actually evaluated, not the length of the worker's list. The driver reads only
 durations and counts, but anyone reading a capture directly should know.) For an absolute
 cost, use an untraced profile, or a capture of `schedulerLoop` alone, which
 adds one scope per pass and is the same in both builds being compared.
+
+### The trace covers seconds, not the run
+
+Each thread's ring keeps its last 16 777 216 records, and M6 asks for 12 s
+after a 3 s warm-up. With every category live, a worker writes several million
+records per second, so the rings hold much less than that. `trace-batch-rt.py`
+then moves the window into the span every ring still covers and sets
+`window_shifted`. On the isolated guest that span was 1.6–1.8 s for round
+robin and rate monotonic and 2.4–2.7 s for EDF. The faster the passes, the
+shorter the span, so a scheduler fix shortens the window its own figures come
+from.
+
+Two groups of figures therefore describe different stretches of the same run:
+
+- **Over the short span:** every scheduler-event row in `MICRO.md`, the
+  utilisation, and every batch response time and late share in
+  `batch_rt.json` (`batches_in_window` counts only the batches inside it).
+- **Over the full 12 s:** `frame_rt`, because frame latencies come from
+  `latency.csv` and need no trace. The window is fixed before it is shifted.
+
+Do not set a batch late share beside a frame late share as if they measured
+the same interval. A report states `window_covered_s` beside every batch-RT
+table.
+
+A larger ring is not the remedy. At 32 bytes a record, the ring is already
+512 MB per thread. 12 s of an EDF worker would need about 2.4 GB per thread,
+beyond the driver's per-thread ceiling (`--trace-limit-mb 1024`) and about
+10 GB across four workers. If a figure must cover the whole run, repeat
+the cell by hand with a narrower `--trace-categories`: `schedulerLoop` (`0x8`)
+alone for the pass period, or `work` and `workExact` (`0x104`) with it
+(`0x10c`) for batch response times. Check `window_covered_s` again afterwards
+rather than assume the narrower mask fits.
+
+### A late batch is not always the scheduler's
+
+A batch's response time is measured from its nominal release, the instant
+the throttle *should* have published it. If the throttle published late, the
+batch starts late through no fault of the pipeline behind it. `batch_rt.json`
+separates the two for every receiver:
+
+- `batch_rt_from_publish` measures from when the throttle actually
+  published, so it holds the pipeline's share alone;
+- `throttle_lag` is how late the publication itself was.
+
+When `batch_rt`'s late share is well above `batch_rt_from_publish`'s, most of
+the lateness comes from the source side. On the isolated guest, EDF's fastest
+receiver at ratio 16 was late for 1.7 % of batches from release but 0.49 %
+from publication, with a throttle lag of 55 µs at p99. Read both before
+blaming a policy.
 
 ### A mean that disagrees with its median
 
