@@ -308,18 +308,19 @@ const boost::ut::suite<"TraceScheduler"> traceSchedulerTests = [] {
         reset();
         setCategories(categoryMask(Category::work));
 
+        // Results are carried out of the thread and asserted here: a fatal assertion throws, and an
+        // exception escaping a `std::thread` terminates the whole suite rather than failing one test.
         std::optional<std::uint64_t> createdNs;
-        std::thread                  fresh([&createdNs] {
+        bool                         started = false;
+        std::thread                  fresh([&createdNs, &started] {
             gr::Graph graph;
             auto&     source = graph.emplaceBlock<gr::testing::ConstantSource<float>>({{"name", std::string("src")}, {"n_samples_max", gr::Size_t{2048U}}});
             auto&     sink   = graph.emplaceBlock<gr::testing::NullSink<float>>({{"name", std::string("snk")}});
             std::ignore      = graph.connect<"out", "in">(source, sink);
 
             TestScheduler scheduler;
-            expect(scheduler.exchange(std::move(graph)).has_value() >> fatal);
-            expect(scheduler.changeStateTo(gr::lifecycle::State::INITIALISED).has_value() >> fatal);
-            expect(scheduler.changeStateTo(gr::lifecycle::State::RUNNING).has_value() >> fatal);
-            for (std::size_t pass = 0UZ; pass < 4UZ; ++pass) {
+            started = scheduler.exchange(std::move(graph)).has_value() && scheduler.changeStateTo(gr::lifecycle::State::INITIALISED).has_value() && scheduler.changeStateTo(gr::lifecycle::State::RUNNING).has_value();
+            for (std::size_t pass = 0UZ; started && pass < 4UZ; ++pass) {
                 std::ignore = scheduler.step();
             }
             createdNs   = gr::trace::detail::threadRingCreatedNs();
@@ -328,6 +329,7 @@ const boost::ut::suite<"TraceScheduler"> traceSchedulerTests = [] {
         fresh.join();
 
         const std::vector<Event> recorded = collect();
+        expect(started >> fatal) << "the scheduler must start on the fresh thread";
         expect(createdNs.has_value() >> fatal) << "the thread must have recorded, or this scenario tests nothing";
         expect(gt(std::ranges::count(recorded, Kind::workBegin, &Event::kind), 0) >> fatal);
         for (const Event& event : recorded) {
