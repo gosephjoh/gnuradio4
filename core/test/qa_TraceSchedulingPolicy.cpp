@@ -513,6 +513,40 @@ const boost::ut::suite<"TraceSchedulingPolicy"> policyMarkerTests = [] {
         reset();
     };
 
+    "the backstop stops evaluating a block that is waiting for data"_test = [] {
+        // The point of skipping, stated as a count: a block found short of its floor is not evaluated
+        // again until something could have changed that. The copy needs 1024 samples and is fed 64 at a
+        // time, so it waits through many passes. Only the first half of the run is read, before anything
+        // has finished -- a finished block is skipped too, and would make the count fall for the wrong
+        // reason.
+        reset();
+        setCategories(categoryMask(Category::release));
+
+        gr::Graph graph;
+        auto&     source    = graph.emplaceBlock<gr::testing::ConstantSource<float>>({{"name", std::string("src")}, {"n_samples_max", gr::Size_t{65536U}}, {"max_batch_size", gr::Size_t{64U}}});
+        auto&     copy      = graph.emplaceBlock<gr::testing::Copy<float>>({{"name", std::string("mid")}});
+        auto&     sink      = graph.emplaceBlock<gr::testing::NullSink<float>>({{"name", std::string("snk")}});
+        copy.in.min_samples = 1024UZ;
+        std::ignore         = graph.connect<"out", "in">(source, copy);
+        std::ignore         = graph.connect<"out", "in">(copy, sink);
+
+        gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded, gr::profiling::null::Profiler, gr::scheduler::EdfPolicy> scheduler;
+        expect(scheduler.exchange(std::move(graph)).has_value() >> fatal);
+        expect(scheduler.runAndWait().has_value() >> fatal);
+
+        std::vector<std::uint32_t> evaluated;
+        for (const Event& scan : ofKind(Kind::releaseScan)) {
+            if ((scan.flags & flag::kViaSuccessorWalk) == 0U) {
+                evaluated.push_back(scan.payload0);
+            }
+        }
+        expect(gt(evaluated.size(), 16UZ) >> fatal) << "the run must span enough passes to wait";
+        const auto firstHalf = std::span<const std::uint32_t>{evaluated}.first(evaluated.size() / 2UZ);
+        expect(lt(std::ranges::min(firstHalf), 3U)) << "some scan before anything finished must have skipped a block that was waiting for data";
+
+        setCategories(0U);
+    };
+
     "a job-backed execution is always preceded by the release that admitted it"_test = [] {
         // The ordering the whole release category rests on: under a job-driven policy a block runs
         // *because* a job was released for it, so every execution must have a release behind it. If

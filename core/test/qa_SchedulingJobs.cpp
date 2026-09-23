@@ -1162,6 +1162,46 @@ namespace {
 
 /// Feeds its own asynchronous input from its output, so it is its own successor. Asynchronous, so
 /// the loop port never gates the block and no feedback priming is needed.
+/// A `ConstantSource` with a reflected message input. Its readiness is still its output, because
+/// readiness counts stream inputs alone -- which is what makes it a source to the release scan.
+template<typename T>
+struct MessageFedSource : gr::Block<MessageFedSource<T>> {
+    gr::MsgPortIn  ctrl;
+    gr::PortOut<T> out;
+    gr::Size_t     n_samples_max = 0U;
+
+    GR_MAKE_REFLECTABLE(MessageFedSource, ctrl, out, n_samples_max);
+
+    gr::Size_t _count = 0U;
+
+    [[nodiscard]] constexpr T processOne() noexcept {
+        if (++_count >= n_samples_max) {
+            this->requestStop();
+        }
+        return T{1};
+    }
+};
+
+/// A short-lived source with a reflected message output, so a message edge can run from a block that
+/// finishes early and never runs again.
+template<typename T>
+struct ControlSource : gr::Block<ControlSource<T>> {
+    gr::PortOut<T> out;
+    gr::MsgPortOut ctrl;
+    gr::Size_t     n_samples_max = 0U;
+
+    GR_MAKE_REFLECTABLE(ControlSource, out, ctrl, n_samples_max);
+
+    gr::Size_t _count = 0U;
+
+    [[nodiscard]] constexpr T processOne() noexcept {
+        if (++_count >= n_samples_max) {
+            this->requestStop();
+        }
+        return T{1};
+    }
+};
+
 template<typename T>
 struct SelfLoop : gr::Block<SelfLoop<T>> {
     gr::PortIn<T>            in;
@@ -1403,6 +1443,33 @@ const boost::ut::suite<"backstop release scan"> backstopTests = [] {
         expect(sched.exchange(std::move(graph)).has_value() >> fatal);
         expect(sched.runAndWait().has_value() >> fatal);
         expect(eq(sink.count.value, kSamples)) << "every sample the source could produce must arrive";
+    };
+
+    "a block fed only by messages is a source for the scan, however it is connected"_test = [] {
+        // Readiness counts stream inputs alone: a block with no connected stream input is gated on its
+        // output, exactly as a source is, and no producer's walk reaches it when its consumer makes room.
+        // A message edge into it must not make it look fed. Otherwise it is found output-gated, skipped,
+        // and never looked at again until the next re-sync. The scenario is the source test's, plus one
+        // idle message edge into the source, from a block that finishes long before the source ever fills
+        // its buffer. Were it from the source's own consumer, that block's successor walk would re-check
+        // the source every time it consumed, and the test would pass by the accident of its wiring; were
+        // it from a block that never runs, that block would never finish and neither would the run.
+        constexpr gr::Size_t kSamples = 4U * 65536U;
+        gr::Graph            graph;
+        auto&                src    = graph.emplaceBlock<MessageFedSource<float>>({{"n_samples_max", kSamples}});
+        auto&                copy   = graph.emplaceBlock<gr::testing::Copy<float>>();
+        auto&                sink   = graph.emplaceBlock<gr::testing::CountingSink<float>>();
+        auto&                sender = graph.emplaceBlock<ControlSource<float>>({{"n_samples_max", gr::Size_t{16U}}});
+        auto&                spill  = graph.emplaceBlock<gr::testing::NullSink<float>>();
+        expect(graph.connect<"out", "in">(src, copy).has_value() >> fatal);
+        expect(graph.connect<"out", "in">(copy, sink).has_value() >> fatal);
+        expect(graph.connect<"out", "in">(sender, spill).has_value() >> fatal);
+        expect(graph.connect<"ctrl", "ctrl">(sender, src).has_value() >> fatal);
+
+        SingleEdf sched{gr::property_map{{"max_selections_per_pass", gr::Size_t{2U}}}};
+        expect(sched.exchange(std::move(graph)).has_value() >> fatal);
+        expect(sched.runAndWait().has_value() >> fatal);
+        expect(eq(sink.count.value, kSamples)) << "a source with a message input must still be released once there is room";
     };
 
     "a block that consumes less than its job is looked at again after running it"_test = [] {

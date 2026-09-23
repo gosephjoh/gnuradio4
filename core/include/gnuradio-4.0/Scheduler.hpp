@@ -542,15 +542,20 @@ public:
             }
 
             // Which blocks the backstop must evaluate on every pass: those no same-worker producer's walk
-            // can reach. A block with no incoming edge is a source; one with an edge from outside this
-            // list is fed by another worker. Both are read off the same flattened graph as the successors,
-            // so they are right for exactly as long as the successors are.
+            // can reach. A block with no incoming stream edge is gated on its output, like a source; one
+            // with a stream edge from outside this list is fed by another worker. Stream edges only,
+            // because readiness counts stream inputs only: a message edge must not make a block look fed.
+            // Both are read off the same flattened graph as the successors, so they are right for exactly
+            // as long as the successors are.
             std::vector<std::uint8_t> hasIncoming(blocks.size(), 0U);
             topology.checkedEveryPass.assign(blocks.size(), 0U);
             for (const auto& [source, ports] : adjacency) {
                 const bool sourceIsLocal = localIndex.contains(source.get());
                 for (const std::vector<const gr::Edge*>& edges : ports | std::views::values) {
                     for (const gr::Edge* edge : edges) {
+                        if (edge->edgeType() != PortType::STREAM) {
+                            continue;
+                        }
                         if (const auto local = localIndex.find(edge->destinationBlock().get()); local != localIndex.end()) {
                             hasIncoming[local->second] = 1U;
                             if (!sourceIsLocal) {

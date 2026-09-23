@@ -374,18 +374,6 @@ inline constexpr double kMaxRepresentableDeadlineSeconds = static_cast<double>(s
     return shortestPeriodSeconds > 0.0 ? std::chrono::nanoseconds{static_cast<std::uint64_t>(shortestPeriodSeconds * 0.25 * 1e9)} : std::chrono::nanoseconds{0};
 }
 
-/// Why a release check did or did not release. Only `dataGated` lets the backstop skip the block until
-/// something changes its input: every other answer can change with time, a lifecycle transition or the
-/// block's own execution, none of which is a data event.
-enum class ReleaseOutcome : std::uint8_t {
-    released,
-    dataGated,  /// too few unassigned samples, and the stream has not ended
-    timeGated,  /// data enough, but inside the block's period
-    notRunning, /// paused, stopping or stopped
-    finished,   /// already `DONE`
-    refused,    /// data enough, but no job could be admitted: the ring was full, or the batch was not one
-};
-
 /// The data gate, on its own and without side effects, so the scheduler can also check in Debug builds
 /// that a block it skipped really was still shut.
 struct DataGate {
@@ -404,16 +392,18 @@ struct DataGate {
     return {.unassigned = unassigned, .draining = draining, .shut = unassigned < floor && !draining};
 }
 
-namespace detail {
-/// The release itself; `releaseIfEligible()` is the entry point.
-///
 /// `traceFlags` carries what only the caller knows: which detection path this is. Clear means the
-/// per-sweep backstop, `gr::trace::flag::kViaSuccessorWalk` the event-driven walk. Defaulted at the
-/// entry point because the backstop is the neutral answer and the unit tests that drive it directly
-/// are not testing the detection path; the two scheduler call sites both pass it explicitly.
-inline ReleaseOutcome releaseDecided(BlockModel& block, SchedState& state, std::chrono::steady_clock::time_point now, [[maybe_unused]] std::uint8_t traceFlags) {
+/// per-sweep backstop, `gr::trace::flag::kViaSuccessorWalk` the event-driven walk. Defaulted because
+/// the backstop is the neutral answer and the unit tests that drive this function directly are not
+/// testing the detection path; the two scheduler call sites both pass it explicitly.
+///
+/// Also keeps `state.releaseCheckDue`, for every caller alike: cleared only when the data gate is found
+/// shut, since every other reason not to release -- the period, the lifecycle, a full ring -- can
+/// change without any new input arriving.
+inline void releaseIfEligible(BlockModel& block, SchedState& state, std::chrono::steady_clock::time_point now, [[maybe_unused]] std::uint8_t traceFlags = 0U) {
+    state.releaseCheckDue = true;
     if (state.finished) {
-        return ReleaseOutcome::finished;
+        return;
     }
     if (block.state() != lifecycle::State::RUNNING) {
         // A block that stopped itself -- a source reaching `n_samples_max`, say -- will never be
@@ -423,7 +413,7 @@ inline ReleaseOutcome releaseDecided(BlockModel& block, SchedState& state, std::
         if (lifecycle::isShuttingDown(block.state()) || block.state() == lifecycle::State::ERROR) {
             state.finished = true;
         }
-        return ReleaseOutcome::notRunning; // otherwise merely paused: it may yet resume, and would only accumulate jobs meanwhile
+        return; // otherwise merely paused: it may yet resume, and would only accumulate jobs meanwhile
     }
 
     // End of stream makes the batch floor unsatisfiable: no more data is coming, so waiting for it
@@ -433,11 +423,12 @@ inline ReleaseOutcome releaseDecided(BlockModel& block, SchedState& state, std::
     // `inputStreamEnded()` answers from its tag readers' cursors alone unless a tag is actually waiting.
     //
     // The data gate is judged before the period gate. Either one shut means no release, so the order
-    // changes no decision -- but it decides the *reason* reported, and only a shut data gate lets the
-    // backstop stop looking at the block until its input changes.
+    // changes no decision -- but only a shut data gate lets the backstop stop looking at the block
+    // until its input changes, so it must not be masked by a shut period gate.
     const DataGate gate = evaluateDataGate(block, state);
     if (gate.shut) {
-        return ReleaseOutcome::dataGated;
+        state.releaseCheckDue = false;
+        return;
     }
     const std::size_t unassigned = gate.unassigned;
     const bool        draining   = gate.draining;
@@ -445,7 +436,7 @@ inline ReleaseOutcome releaseDecided(BlockModel& block, SchedState& state, std::
     if (!draining && state.periodSeconds > 0.0) { // a zero period imposes no temporal gate
         const std::chrono::duration<double> elapsed = now - state.lastRelease;
         if (elapsed.count() < state.periodSeconds) {
-            return ReleaseOutcome::timeGated; // ... and a terminating block does not wait out a period to run its last job
+            return; // ... and a terminating block does not wait out a period to run its last job
         }
     }
 
@@ -456,7 +447,7 @@ inline ReleaseOutcome releaseDecided(BlockModel& block, SchedState& state, std::
         // Defence in depth. `combineGating()` only ever folds in *connected* ports, so availability
         // cannot come back as `undefined_size` and this cannot currently fire -- but `work(SIZE_MAX)`
         // is not a batch, and the guard is one comparison.
-        return ReleaseOutcome::refused;
+        return;
     }
 
     const double deadlineSeconds = state.relativeDeadlineSeconds > 0.0 ? state.relativeDeadlineSeconds : state.periodSeconds;
@@ -484,7 +475,7 @@ inline ReleaseOutcome releaseDecided(BlockModel& block, SchedState& state, std::
                     .flags                                = traceFlags});
             }
         }
-        return ReleaseOutcome::refused;
+        return;
     }
     state.assignedSamples += batch;
     state.lastRelease = now;
@@ -522,17 +513,6 @@ inline ReleaseOutcome releaseDecided(BlockModel& block, SchedState& state, std::
                 .flags                                = static_cast<std::uint8_t>(traceFlags | (draining ? gr::trace::flag::kEosWaived : 0U) | packedDepth)});
         }
     }
-    return ReleaseOutcome::released;
-}
-} // namespace detail
-
-/// `traceFlags` carries what only the caller knows: see `detail::releaseDecided()`. Also keeps
-/// `state.releaseCheckDue`: cleared only when the answer is `dataGated`, so every release check -- the
-/// backstop's, the successor walk's, or a test's -- leaves the flag telling the truth.
-inline ReleaseOutcome releaseIfEligible(BlockModel& block, SchedState& state, std::chrono::steady_clock::time_point now, [[maybe_unused]] std::uint8_t traceFlags = 0U) {
-    const ReleaseOutcome outcome = detail::releaseDecided(block, state, now, traceFlags);
-    state.releaseCheckDue        = outcome != ReleaseOutcome::dataGated;
-    return outcome;
 }
 
 /// Retires the job at the head of the queue, returning its whole assignment to the unassigned pool.
