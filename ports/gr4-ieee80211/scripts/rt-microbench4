@@ -138,7 +138,8 @@ def m5(cell, out, log):
     return res
 
 
-M6_KINDS = ("sweep", "stateSync", "messagePhase", "houseKeeping", "releaseScan", "select", "selectEmpty", "workProbe", "zombieReap", "adopt", "schedulerMessages", "removalCleanup", "blockMessages")
+M6_KINDS = ("sweep", "stateSync", "messagePhase", "houseKeeping", "releaseScan", "select", "selectEmpty", "workProbe", "zombieReap", "adopt", "schedulerMessages", "removalCleanup", "blockMessages", "selectionBoundHit")
+K_BOUND_WAS_TIME = 1 << 2  # gr::trace::flag::kBoundWasTime: the pass budget, not the selection count, ended the pass
 M6_RATES = "1250000,1250000,2500000,5000000"
 M6_BATCH = 1024
 # A quarter of the fastest receiver's batch period, which is what the scheduler's own auto rule
@@ -179,12 +180,15 @@ def m6(cell, out, log):
                     kinds[k] = {"per_s_per_worker": len(x) / span / T, "mean_us": float(x.dur_ns.mean() / 1e3), "p99_us": float(x.dur_ns.quantile(0.99) / 1e3), "max_us": float(x.dur_ns.max() / 1e3), "busy_share": float(x.dur_ns.sum() / 1e9 / span / T)}
             ss = E[E.kind == "stateSync"]
             discarded = {"mean": float(ss.p1.mean()), "max": int(ss.p1.max()), "syncs_with_discards": float((ss.p1 > 0).mean())} if len(ss) else None
+            bh = E[E.kind == "selectionBoundHit"]
+            by_time = (bh["flags"] & K_BOUND_WAS_TIME) != 0
+            bound_hits = {"time_per_s_per_worker": int(by_time.sum()) / span / T, "count_per_s_per_worker": int((~by_time).sum()) / span / T}
             sw = E[E.kind == "sweep"].sort_values(["worker", "start_ns"]); gaps = []
             for _, g in sw.groupby("worker"):
                 st = g.start_ns.to_numpy(); en = st + g.dur_ns.to_numpy()
                 if len(st) > 1:
                     gaps.append(float(np.mean(st[1:] - en[:-1]) / 1e3))
-            res[f"{pol}_r{ratio}"] = {"policy": pol, "sched_ratio": ratio, "max_pass_duration_us": M6_PASS_US, "worker_cpus": ls.get("worker_cpus", []), "window_s": span, "kinds": kinds, "gap_between_sweeps_us": gaps, "jobs_discarded_per_sync": discarded,
+            res[f"{pol}_r{ratio}"] = {"policy": pol, "sched_ratio": ratio, "max_pass_duration_us": M6_PASS_US, "worker_cpus": ls.get("worker_cpus", []), "window_s": span, "kinds": kinds, "gap_between_sweeps_us": gaps, "jobs_discarded_per_sync": discarded, "bound_hits": bound_hits,
                                       "per_chain": [{"chain": pc["chain"], "rate": pc.get("rate"), "period_us": pc.get("batch_period_us"), "batch_rt": pc.get("batch_rt"), "frame_rt": pc.get("frame_rt"), "saturated": pc.get("saturated"), "edf": pc.get("edf")} for pc in b["per_chain"]],
                                       "occupancy": b.get("utilization", {}).get("per_worker_occupancy")}
             for f in glob.glob(os.path.join(d, "trace_*.csv")) + [os.path.join(d, "trace.gr4trace")]:
@@ -247,6 +251,7 @@ def write_md(res, out):
                     L.append(f"| {r['policy']} | {r['sched_ratio']} | {k} | {v['per_s_per_worker']:.0f} | {v['mean_us']:.1f} | {v['p99_us']:.1f} | {100 * v['busy_share']:.1f} |\n")
         L.append("\nJobs discarded by the re-sync (EDF only tracks jobs; mean per re-sync, max, share of re-syncs that discarded any): " + "; ".join(f"{r['policy']} r{r['sched_ratio']}: {r['jobs_discarded_per_sync']['mean']:.2f}, {r['jobs_discarded_per_sync']['max']}, {100 * r['jobs_discarded_per_sync']['syncs_with_discards']:.0f}%" for r in res["M6"].values() if r.get("jobs_discarded_per_sync")) + "\n")
         L.append("\nMean gap between consecutive passes of a worker (µs, one value per worker): " + "; ".join(f"{r['policy']} r{r['sched_ratio']}: " + ", ".join(f"{g:.1f}" for g in r["gap_between_sweeps_us"]) for r in res["M6"].values()) + "\n")
+        L.append("\nPasses ended by a bound (per s per worker, time budget / selection count; round robin has no bound): " + "; ".join(f"{r['policy']} r{r['sched_ratio']}: {r['bound_hits']['time_per_s_per_worker']:.1f} / {r['bound_hits']['count_per_s_per_worker']:.1f}" for r in res["M6"].values() if r.get("bound_hits")) + "\n")
         L.append(M6_RATIO_NOTE)
         L.append("\n| policy | ratio | passes per s | mean pass µs | message phases per s | interval between message phases ms | stateSync busy % |\n|---|---|---|---|---|---|---|\n")
         for key, r in res["M6"].items():

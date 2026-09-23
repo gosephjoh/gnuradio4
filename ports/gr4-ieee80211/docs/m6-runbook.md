@@ -271,11 +271,12 @@ To tell the pass-exit reasons apart:
 - `selectionBoundHit` marks a pass stopped by a bound. The flag
   `kBoundWasTime` distinguishes the time budget from the count bound, and
   then `payload0` holds microseconds rather than selections.
-- The driver does not count `selectionBoundHit` (it is not in `M6_KINDS` in
-  `scripts/rt-microbench4`). Until it does, bound the EDF figure as passes
-  minus `selectEmpty` records. Round robin and rate monotonic emit neither
-  `select` nor `selectEmpty`, so their split needs `selectionBoundHit`
-  counted.
+- The driver counts `selectionBoundHit` and splits it on that flag: each
+  run's `bound_hits` in `micro.json`, and the line *Passes ended by a bound*
+  in `MICRO.md`. Results from before this was added lack it. For those,
+  bound the EDF figure as passes minus `selectEmpty` records. Round robin and
+  rate monotonic emit neither `select` nor `selectEmpty`, so for them the
+  count is the only direct figure.
 - The per-block `calls`, `probe_calls` and `zero_work_calls` in each
   `batch_rt.json` give the content of a pass. Under round robin they must add
   up to the block count per pass, which is a useful check.
