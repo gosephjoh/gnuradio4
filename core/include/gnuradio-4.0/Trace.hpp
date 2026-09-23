@@ -65,7 +65,12 @@ enum class Kind : std::uint8_t {
     blockStateChange,  /// a block left the schedule
     entityRetired,     /// an interned identity is no longer valid
     workExact,         /// intra-`work()`: one `workInternal` with exact sample counts
-    workPhase          /// intra-`work()`: one phase within it
+    workPhase,         /// intra-`work()`: one phase within it
+    // Appended, not slotted beside `messagePhase`: a `Kind` is a record's wire value, so renumbering
+    // would change what an already-written capture says.
+    schedulerMessages, /// the scheduler's and graph's own message handling, worker 0 only
+    removalCleanup,    /// releasing blocks removed from the graph, inside the message phase
+    blockMessages      /// every block's `processScheduledMessages()`, inside the message phase
 };
 
 /// Runtime mask bits. A tracing-enabled binary ships with a mask of `0` and is turned on live, so
@@ -87,8 +92,8 @@ enum class Category : std::uint32_t {
 
 /// One past the last `Kind`, so a test can walk every enumerator. `categoryOf`'s own completeness is
 /// guaranteed by `-Wswitch` rather than by this count.
-inline constexpr std::size_t kKindCount = 27UZ;
-static_assert(std::to_underlying(Kind::workPhase) + 1U == kKindCount, "a Kind was added or removed without updating kKindCount");
+inline constexpr std::size_t kKindCount = 30UZ;
+static_assert(std::to_underlying(Kind::blockMessages) + 1U == kKindCount, "a Kind was added or removed without updating kKindCount");
 
 /**
  * Every `Kind` belongs to exactly one `Category`, so the category is a property of the record rather
@@ -118,7 +123,10 @@ static_assert(std::to_underlying(Kind::workPhase) + 1U == kKindCount, "a Kind wa
     case Kind::houseKeeping:
     case Kind::stateSync:
     case Kind::quiescenceWait:
-    case Kind::idle: return Category::schedulerLoop;
+    case Kind::idle:
+    case Kind::schedulerMessages:
+    case Kind::removalCleanup:
+    case Kind::blockMessages: return Category::schedulerLoop;
 
     case Kind::jobRelease:
     case Kind::jobReleaseDropped:

@@ -45,6 +45,9 @@ namespace detail {
     case Kind::sweep: return "sweep";
     case Kind::messagePhase: return "messagePhase";
     case Kind::houseKeeping: return "houseKeeping";
+    case Kind::schedulerMessages: return "schedulerMessages";
+    case Kind::removalCleanup: return "removalCleanup";
+    case Kind::blockMessages: return "blockMessages";
     case Kind::stateSync: return "stateSync";
     case Kind::adopt: return "adopt";
     case Kind::zombieReap: return "zombieReap";
@@ -107,7 +110,10 @@ namespace detail {
     case Kind::idle:
     case Kind::releaseScan:
     case Kind::workExact:
-    case Kind::workPhase: return true;
+    case Kind::workPhase:
+    case Kind::schedulerMessages:
+    case Kind::removalCleanup:
+    case Kind::blockMessages: return true;
     default: return false;
     }
 }
