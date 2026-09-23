@@ -172,6 +172,15 @@ int main() {
     setCategories(0U);
     const double disabled = nanosPerOp([](std::uint32_t i) { emit(Event{.payload0 = i, .kind = Kind::workEnd}); });
 
+    // The cost *when inlined*, which the constructor now forces at every call site. This row documents
+    // the target; it cannot guard it, because inlining is decided per call site and this small loop
+    // would be inlined either way. The scheduler comparison below, compiled in against compiled out,
+    // is the guard.
+    const double scopeDisabled = nanosPerOp([](std::uint32_t i) {
+        Scope scope{Event{.payload0 = i, .kind = Kind::workEnd}};
+        (void)scope;
+    });
+
     setCategories(categoryMask(Category::deadline));
     const double otherCategory = nanosPerOp([](std::uint32_t i) { emit(Event{.payload0 = i, .kind = Kind::workEnd}); });
 
@@ -204,6 +213,7 @@ int main() {
 
     std::print("{:<44} {:>10}\n", "path", "ns/op");
     std::print("{:<44} {:>10.2f}\n", "emit(), tracing compiled in, mask 0", disabled);
+    std::print("{:<44} {:>10.2f}\n", "Scope, tracing compiled in, mask 0", scopeDisabled);
     std::print("{:<44} {:>10.2f}\n", "emit(), another category live", otherCategory);
     std::print("{:<44} {:>10.2f}\n", "emit(), category live (check + ring store)", enabled);
     std::print("{:<44} {:>10.2f}\n", "now(), one clock read", clockRead);
