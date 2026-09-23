@@ -30,12 +30,17 @@ Allow about five minutes of running and another few of export and analysis.
 | ≈ 2.5 GB RAM for one translation unit | `src/chain.cpp`; build with `-j4` or lower on a small machine |
 | ≈ 6 GB free disk | 4.7 GB for the stimulus cell, about 1 GB of capture per run (deleted after each analysis) |
 | at least 8 hardware threads | four workers plus the tracing and the driver; fewer and the workers contend with the harness |
+| four CPUs the workers can have to themselves | on a guest set up as `docs/e2e-sweep-runbook.md` §13 describes (CPUs 4–7 isolated, everything else confined to 0–3) the workers get them only if pinned: pass `--cpus 4-7` (§5). On a machine without that isolation, omit it |
 | the machine otherwise idle | this is a timing measurement: no other build, no other benchmark, nothing interactive |
 
 Record what the machine is — CPU, core count, kernel, whether it is a virtual
-machine, and whether frequency scaling is active. The published M6 ran on a
-KVM/QEMU guest with 8 vCPUs and no frequency control, and numbers from
-different machines are not comparable.
+machine, whether frequency scaling is active, and whether the workers' CPUs
+were isolated and the workers pinned. The published M6 and every run up to
+2026-09-23 ran on a KVM/QEMU guest with 8 vCPUs, no frequency control, a
+generic kernel and no isolation or pinning; from the run of 2026-09-23
+onwards the same guest runs an RT kernel (`7.0.11-rt`) with CPUs 4–7
+isolated and the workers pinned to them. Numbers from different machines —
+or from the same guest before and after that change — are not comparable.
 
 ## 3. Build
 
@@ -74,8 +79,15 @@ receiver sees.
 ## 5. Run
 
 ```
-./scripts/rt-microbench4 --out-dir results/sweep-<machine>/micro --only M6
+./scripts/rt-microbench4 --out-dir results/sweep-<machine>/micro --only M6 --cpus 4-7
 ```
+
+`--cpus 4-7` pins each run's four workers to CPUs 4, 5, 6, 7, one each,
+under `SCHED_OTHER` (`rx_latency4 --cpus`; no real-time priority — see
+`docs/e2e-sweep-runbook.md` §13 step 3b for why). Omit it on a machine
+without the isolation of §2: pinning workers onto CPUs the rest of the
+system also uses gains nothing. Whether a run was pinned is recorded as
+`worker_cpus` in its `latency_summary.json` and in `micro.json`.
 
 Name `<machine>` after the machine, not after the branch — the results
 directory is the record of where the numbers came from. The driver writes
@@ -101,6 +113,8 @@ each of the six `m6_*/latency_summary.json`:
   60 s cell, 102 934; a 20 s replay decodes 34 308 of them, so
   `decoded_total` is expected to be well below it.)
 - `elapsed_s` close to 20: a run that took appreciably longer did not keep up.
+- `worker_cpus` reads `[4, 5, 6, 7]` when the run was meant to be pinned,
+  and `rt_prio` 0.
 
 Then in each `batch_rt.json`, no receiver should be marked `saturated`. The
 light mix at four workers has ample capacity, so a saturated receiver means
@@ -143,9 +157,18 @@ for four reasons:
 2. The pass budget of §7 is new, and the earlier runs had no equivalent.
 3. The earlier runs were on a KVM/QEMU guest; unless this machine is that
    guest, the platforms differ.
-4. Every run up to and including 2026-09-23 predates the per-pass fixes this
-   branch now carries (`ea42d87f`, `1e898ad4`, `3eb2f59c`, `d09a1e74`,
-   `8fb0ed9f`). §9 says what they change, and which of M6's rows they move.
+4. Every run up to and including the morning of 2026-09-23 predates the
+   per-pass fixes this branch now carries (`ea42d87f`, `1e898ad4`,
+   `3eb2f59c`, `d09a1e74`, `8fb0ed9f`). §9 says what they change, and which
+   of M6's rows they move.
+5. From the run of 2026-09-23 (afternoon) onwards the guest itself is
+   different: an RT kernel (`7.0.11-rt`, `PREEMPT_RT`) instead of the
+   generic one, CPUs 4–7 isolated (`isolcpus`, `nohz_full`, `rcu_nocbs`,
+   `irqaffinity=0-3`), every other process confined to 0–3, and the four
+   workers pinned one per isolated CPU. The earlier runs shared all eight
+   vCPUs with the driver, the throttle timer threads, the trace export and
+   the guest's own housekeeping. A report on a pinned run says so beside
+   the platform line.
 
 What M6 was built to expose has since been largely fixed. The re-sync that
 rebuilt EDF's release storage on every message phase now reuses each worker's

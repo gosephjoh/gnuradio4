@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """rt-microbench4 -- the microbenchmarks that check the mechanisms behind the sweep's results.
 
-    ./scripts/rt-microbench4 --out-dir DIR [--cell CELL] [--only M1,M2,...]
+    ./scripts/rt-microbench4 --out-dir DIR [--cell CELL] [--only M1,M2,...] [--cpus LIST]
 
   M1  isolated per-block cost: the receiver unthrottled on one worker with a batch ceiling N,
       workExact tracing only -> mean/max ns per call and ns per input sample per block; the sum
@@ -26,7 +26,10 @@
   M5  trace overhead at an unsaturated point: 1 receiver, 1 worker, 2.5 Msps, N = 1024, 30 s,
       every policy, every category live against no category -> frame response time
 Writes DIR/micro.json and DIR/MICRO.md (tables).  Takes about ten minutes; run it with the
-machine otherwise idle.
+machine otherwise idle.  --cpus LIST pins every rx_latency4 run's workers to the first N CPUs of
+LIST (rx_latency4 --cpus; N = that run's --threads); on a guest with isolated CPUs this is the
+only way the workers get them (docs/e2e-sweep-runbook.md 13).  The list is recorded per run as
+worker_cpus in latency_summary.json and in the M6 section of micro.json.
 """
 import argparse, json, os, subprocess, sys, glob
 import numpy as np
@@ -146,6 +149,13 @@ M6_BATCH = 1024
 M6_PASS_US = round(0.25 * M6_BATCH / max(float(r) for r in M6_RATES.split(",")) * 1e6)
 
 
+CPUS = []  # --cpus LIST, appended to every rx_latency4 command
+
+
+def pin():
+    return ["--cpus", ",".join(map(str, CPUS))] if CPUS else []
+
+
 def m6(cell, out, log):
     res = {}
     for ratio in (16, 4096):
@@ -153,11 +163,12 @@ def m6(cell, out, log):
             d = os.path.join(out, f"m6_{pol}_r{ratio}")
             os.makedirs(d, exist_ok=True)
             cmd = [RX, "--run-dir", cell, "--out-dir", d, "--chains", "4", "--threads", "4", "--policy", pol, "--fixed-batch", str(M6_BATCH), "--rates", M6_RATES, "--run-s", "20", "--rotate", "1",
-                   "--sched-ratio", str(ratio), "--max-pass-duration", str(M6_PASS_US), "--timeout-s", "200", "--trace-categories", "all", "--trace-buffer", "16777216", "--trace-limit-mb", "1024", "--trace-out", os.path.join(d, "trace.gr4trace")]
+                   "--sched-ratio", str(ratio), "--max-pass-duration", str(M6_PASS_US), "--timeout-s", "200", "--trace-categories", "all", "--trace-buffer", "16777216", "--trace-limit-mb", "1024", "--trace-out", os.path.join(d, "trace.gr4trace")] + pin()
             sh(cmd, log)
             sh([EXP, os.path.join(d, "trace.gr4trace"), "--out-dir", d, "--meta", os.path.join(d, "trace_meta.json"), "--all-events"], log)
             sh([sys.executable, ANALYSE, d, "--warmup", "3", "--window", "12", "--quiet"], log)
             b = json.load(open(os.path.join(d, "batch_rt.json")))
+            ls = json.load(open(os.path.join(d, "latency_summary.json")))
             w0, w1 = b["window_ns"]; span = (w1 - w0) / 1e9
             E = pd.read_csv(os.path.join(d, "trace_events.csv")); E = E[(E.start_ns >= w0) & (E.start_ns < w1)]
             workers = sorted(E.worker.unique()); T = max(len(workers), 1)
@@ -173,7 +184,7 @@ def m6(cell, out, log):
                 st = g.start_ns.to_numpy(); en = st + g.dur_ns.to_numpy()
                 if len(st) > 1:
                     gaps.append(float(np.mean(st[1:] - en[:-1]) / 1e3))
-            res[f"{pol}_r{ratio}"] = {"policy": pol, "sched_ratio": ratio, "max_pass_duration_us": M6_PASS_US, "window_s": span, "kinds": kinds, "gap_between_sweeps_us": gaps, "jobs_discarded_per_sync": discarded,
+            res[f"{pol}_r{ratio}"] = {"policy": pol, "sched_ratio": ratio, "max_pass_duration_us": M6_PASS_US, "worker_cpus": ls.get("worker_cpus", []), "window_s": span, "kinds": kinds, "gap_between_sweeps_us": gaps, "jobs_discarded_per_sync": discarded,
                                       "per_chain": [{"chain": pc["chain"], "rate": pc.get("rate"), "period_us": pc.get("batch_period_us"), "batch_rt": pc.get("batch_rt"), "frame_rt": pc.get("frame_rt"), "saturated": pc.get("saturated"), "edf": pc.get("edf")} for pc in b["per_chain"]],
                                       "occupancy": b.get("utilization", {}).get("per_worker_occupancy")}
             for f in glob.glob(os.path.join(d, "trace_*.csv")) + [os.path.join(d, "trace.gr4trace")]:
@@ -304,7 +315,12 @@ def main():
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--cell", default=os.path.join(HERE, "data", "rt_300_300_102934_QPSK_1_2_s1"))
     ap.add_argument("--only", default="M1,M2,M3,M4,M5,M6")
+    ap.add_argument("--cpus", help="pin each run's workers to the first --threads CPUs of this list, e.g. 4-7 (rx_latency4 --cpus)")
     a = ap.parse_args()
+    if a.cpus:
+        for tok in a.cpus.split(","):
+            lo, _, hi = tok.partition("-")
+            CPUS.extend(range(int(lo), int(hi or lo) + 1))
     os.chdir(HERE)
     os.makedirs(a.out_dir, exist_ok=True)
     log = os.path.join(a.out_dir, "micro.log")
