@@ -1375,6 +1375,80 @@ const boost::ut::suite<"batch floor"> batchFloorTests = [] {
     };
 };
 
+const boost::ut::suite<"backstop release scan"> backstopTests = [] {
+    // The backstop skips a block whose data gate it last found shut, until something that could open
+    // the gate happens. Each scenario reaches one of the things that can, on a pool worker -- `step()`
+    // re-checks every block after its messages, so it never skips and cannot test this. The check that a
+    // skip was safe is in the scheduler itself: in a Debug build, every skipped block is evaluated and
+    // must still be shut. What these assert is only that nothing was lost; the assertion inside judges.
+    using SingleEdf = gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::singleThreaded, gr::profiling::null::Profiler, gr::scheduler::EdfPolicy>;
+
+    "a source that fills its output buffer is released again once there is room"_test = [] {
+        // No producer's walk ever reaches a source, so once its output is full and it is found shut,
+        // only being evaluated on every pass gets it released again when the consumer makes room.
+        // Four times the default 65 536-sample buffer, so the source must fill it -- and few selections per
+        // pass, so a pass can end soon after the source has filled it and the next pass's scan finds it
+        // full. Left to itself EDF runs the consumer in the same pass, and the source is never seen full.
+        // Two rather than one: at exactly one selection per pass this graph never finishes under EDF,
+        // with or without the skip -- a separate defect, recorded in the M5 dev log.
+        constexpr gr::Size_t kSamples = 4U * 65536U;
+        gr::Graph            graph;
+        auto&                src  = graph.emplaceBlock<gr::testing::ConstantSource<float>>({{"n_samples_max", kSamples}});
+        auto&                copy = graph.emplaceBlock<gr::testing::Copy<float>>();
+        auto&                sink = graph.emplaceBlock<gr::testing::CountingSink<float>>();
+        expect(graph.connect<"out", "in">(src, copy).has_value() >> fatal);
+        expect(graph.connect<"out", "in">(copy, sink).has_value() >> fatal);
+
+        SingleEdf sched{gr::property_map{{"max_selections_per_pass", gr::Size_t{2U}}}};
+        expect(sched.exchange(std::move(graph)).has_value() >> fatal);
+        expect(sched.runAndWait().has_value() >> fatal);
+        expect(eq(sink.count.value, kSamples)) << "every sample the source could produce must arrive";
+    };
+
+    "a block that consumes less than its job is looked at again after running it"_test = [] {
+        // The backstop skips a block found shut, and only a data event or the block's own execution may
+        // unskip it. This reaches the second. A job hands the block a batch; a block may consume less, and
+        // what it leaves goes back to the unassigned pool when the job retires -- so its own execution can
+        // open its gate, after its producer has finished and no walk will ever come.
+        //
+        // For that to matter the block must first be found shut while its job is still queued: one
+        // selection per pass, with the source's deadline the earlier, keeps the copy's job waiting a pass,
+        // and by then every sample it could see is assigned to that job. The port's `max_samples` is what
+        // makes each call take only 32 of it. (The source fits its buffer, which keeps this clear of the
+        // one-selection defect the source test above avoids.)
+        constexpr gr::Size_t kSamples = 256U;
+        gr::Graph            graph;
+        auto&                src  = graph.emplaceBlock<gr::testing::ConstantSource<float>>({{"n_samples_max", kSamples}, {"relative_deadline", 0.0001f}});
+        auto&                copy = graph.emplaceBlock<gr::testing::Copy<float>>({{"relative_deadline", 0.01f}});
+        auto&                sink = graph.emplaceBlock<gr::testing::CountingSink<float>>({{"relative_deadline", 0.01f}});
+        copy.in.max_samples       = 32UZ;
+        expect(graph.connect<"out", "in">(src, copy).has_value() >> fatal);
+        expect(graph.connect<"out", "in">(copy, sink).has_value() >> fatal);
+
+        SingleEdf sched{gr::property_map{{"max_selections_per_pass", gr::Size_t{1U}}}};
+        expect(sched.exchange(std::move(graph)).has_value() >> fatal);
+        expect(sched.runAndWait().has_value() >> fatal);
+        expect(eq(sink.count.value, kSamples)) << "what a job left unconsumed must be released again, not stranded";
+    };
+
+    "a block held back by its period is released once the period has passed"_test = [] {
+        // A block with data enough but inside its period is shut by time, not data, so it must keep being
+        // evaluated: nothing else will happen to it when the period runs out.
+        constexpr gr::Size_t kSamples = 16384U;
+        gr::Graph            graph;
+        auto&                src  = graph.emplaceBlock<gr::testing::ConstantSource<float>>({{"n_samples_max", kSamples}, {"max_batch_size", gr::Size_t{1024U}}});
+        auto&                copy = graph.emplaceBlock<gr::testing::Copy<float>>({{"period", 0.0005f}, {"max_batch_size", gr::Size_t{1024U}}});
+        auto&                sink = graph.emplaceBlock<gr::testing::CountingSink<float>>();
+        expect(graph.connect<"out", "in">(src, copy).has_value() >> fatal);
+        expect(graph.connect<"out", "in">(copy, sink).has_value() >> fatal);
+
+        SingleEdf sched;
+        expect(sched.exchange(std::move(graph)).has_value() >> fatal);
+        expect(sched.runAndWait().has_value() >> fatal);
+        expect(eq(sink.count.value, kSamples)) << "a block paced by its period must still move everything";
+    };
+};
+
 const boost::ut::suite<"release state across a re-sync"> releaseCarryTests = [] {
     "outstanding jobs survive a re-sync in which nothing changed, and only then"_test = [] {
         // A re-sync rides the message-phase cadence, not a mutation. Assigning whole states used to drop

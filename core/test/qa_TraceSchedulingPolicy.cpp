@@ -490,12 +490,20 @@ const boost::ut::suite<"TraceSchedulingPolicy"> policyMarkerTests = [] {
         const std::size_t        releases = ofKind(Kind::jobRelease).size();
         expect(gt(scans.size(), 0UZ) >> fatal);
 
+        // `payload0` counts the blocks a scan actually evaluated. The backstop skips blocks that have
+        // finished, and blocks whose data gate cannot have opened since it was last found shut, so it
+        // evaluates every block only when nothing has finished and every flag is fresh: the first pass.
         std::size_t countedReleases = 0UZ;
+        bool        firstBackstop   = true;
         for (const Event& scan : scans) {
             expect(le(scan.payload1, scan.payload0)) << "a scan cannot release more blocks than it looked at";
             countedReleases += scan.payload1;
             if ((scan.flags & flag::kViaSuccessorWalk) == 0U) {
-                expect(eq(scan.payload0, 3U)) << "the backstop scans every block on the worker, and this graph has three";
+                expect(le(scan.payload0, 3U)) << "the backstop cannot evaluate more blocks than the worker has, and this graph has three";
+                if (firstBackstop) {
+                    expect(eq(scan.payload0, 3U)) << "the first backstop scan evaluates every block: nothing has finished and nothing has been ruled out";
+                    firstBackstop = false;
+                }
             }
         }
         expect(eq(countedReleases, releases)) << "every release must be attributed to exactly one scan -- a mismatch means a release happened on a path nothing is costing";
