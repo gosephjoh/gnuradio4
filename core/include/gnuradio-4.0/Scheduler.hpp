@@ -1877,6 +1877,7 @@ protected:
             if (hasMessagesToProcess) {
                 [[maybe_unused]] gr::trace::Scope messageScope{gr::trace::Event{.payload0 = gr::trace::saturate(msgToCount), .payload1 = static_cast<std::uint32_t>(localBlockList.size()), .kind = gr::trace::Kind::messagePhase, .workerId = gr::trace::workerIdOf(runnerID)}};
                 if (runnerID == 0UZ) {
+                    [[maybe_unused]] gr::trace::Scope schedulerMessagesScope{gr::trace::Event{.kind = gr::trace::Kind::schedulerMessages, .workerId = gr::trace::workerIdOf(runnerID)}};
                     this->processScheduledMessages(); // execute the scheduler- and Graph-specific message handler only once globally
                     if (initialGeneration != gr::atomic_ref(_graphGeneration).load_acquire()) {
                         return; // we called exchange()
@@ -1900,7 +1901,10 @@ protected:
                 }
                 if (isWorking) {
                     // we must always clean up removed blocks before accessing localBlockList
-                    cleanupRemovedBlocks(runnerID, localBlockList);
+                    {
+                        [[maybe_unused]] gr::trace::Scope removalScope{gr::trace::Event{.payload0 = gr::trace::saturate(localBlockList.size()), .kind = gr::trace::Kind::removalCleanup, .workerId = gr::trace::workerIdOf(runnerID)}};
+                        cleanupRemovedBlocks(runnerID, localBlockList);
+                    }
 
                     // Zombies are cleaned per-thread, as we remove from the localBlockList as well.
                     // Cleaning zombies has low priority, so uses process_stream_to_message_ratio (a different ratio could be introduced)
@@ -1969,7 +1973,10 @@ protected:
                         }
                     }
 
-                    std::ranges::for_each(localBlockList, &BlockModel::processScheduledMessages);
+                    {
+                        [[maybe_unused]] gr::trace::Scope blockMessagesScope{gr::trace::Event{.payload0 = gr::trace::saturate(localBlockList.size()), .kind = gr::trace::Kind::blockMessages, .workerId = gr::trace::workerIdOf(runnerID)}};
+                        std::ranges::for_each(localBlockList, &BlockModel::processScheduledMessages);
+                    }
                     // Buffer housekeeping rides the same cadence as message handling. Light skips
                     // the scheduler-driven trigger entirely (intrinsic writer-pressure path still
                     // fires inside the buffer); Aggressive's post-consume hook is a follow-up.

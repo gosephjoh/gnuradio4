@@ -774,6 +774,102 @@ const boost::ut::suite<"TraceScheduler"> traceSchedulerTests = [] {
         setCategories(0U);
     };
 
+    "the message phase is accounted for by its parts"_test = [] {
+        // The message phase used to carry markers for only some of what it does, so a capture could say
+        // how long the phase took but not where the time went. Every part is now marked except the work
+        // guard's own handshake, which is what is left over. Asserted as an accounting rather than as
+        // presence: each part must nest inside exactly one phase on its own worker, the parts together
+        // must fit inside it, and a phase the guard refused must contain none of the guarded parts.
+        reset();
+        setCategories(categoryMask(Category::schedulerLoop, Category::lifecycle));
+
+        gr::Graph graph;
+        auto&     source = graph.emplaceBlock<gr::testing::ConstantSource<float>>({{"name", std::string("src")}, {"n_samples_max", gr::Size_t{65536U}}, {"relative_deadline", 0.002f}});
+        auto&     copy   = graph.emplaceBlock<gr::testing::Copy<float>>({{"name", std::string("mid")}, {"relative_deadline", 0.002f}});
+        auto&     sink   = graph.emplaceBlock<gr::testing::NullSink<float>>({{"name", std::string("snk")}, {"relative_deadline", 0.002f}});
+        std::ignore      = graph.connect<"out", "in">(source, copy);
+        std::ignore      = graph.connect<"out", "in">(copy, sink);
+
+        gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multiThreaded, gr::profiling::null::Profiler, gr::scheduler::EdfPolicy> scheduler;
+        expect(scheduler.exchange(std::move(graph)).has_value() >> fatal);
+        expect(scheduler.runAndWait().has_value() >> fatal);
+
+        const std::vector<Event> events = collect();
+        exportTimeline("m4-message-phase");
+
+        const auto isPart = [](Kind kind) {
+            switch (kind) {
+            case Kind::schedulerMessages:
+            case Kind::removalCleanup:
+            case Kind::zombieReap:
+            case Kind::adopt:
+            case Kind::stateSync:
+            case Kind::blockMessages:
+            case Kind::houseKeeping: return true;
+            default: return false;
+            }
+        };
+        const auto endOf = [](const Event& event) { return event.startNs + event.durationNs; };
+
+        struct Phase {
+            const Event*       record;
+            std::uint64_t      partsNs = 0UL;
+            std::array<int, 3> guarded{}; // removalCleanup, stateSync, blockMessages
+            int                schedulerMessages = 0;
+        };
+        std::vector<Phase> phases;
+        for (const Event& event : events) {
+            if (event.kind == Kind::messagePhase) {
+                phases.push_back(Phase{.record = &event});
+            }
+        }
+        expect(gt(phases.size(), 0UZ) >> fatal) << "a running pool worker must enter the message phase";
+
+        std::size_t            orphans = 0UZ;
+        std::set<std::uint8_t> schedulerMessageWorkers;
+        for (const Event& part : events) {
+            if (!isPart(part.kind)) {
+                continue;
+            }
+            if (part.kind == Kind::schedulerMessages) {
+                schedulerMessageWorkers.insert(part.workerId);
+            }
+            const auto owner = std::ranges::find_if(phases, [&](const Phase& phase) { return phase.record->workerId == part.workerId && phase.record->startNs <= part.startNs && endOf(part) <= endOf(*phase.record); });
+            if (owner == phases.end()) {
+                ++orphans;
+                continue;
+            }
+            owner->partsNs += part.durationNs;
+            if (part.kind == Kind::schedulerMessages) {
+                ++owner->schedulerMessages;
+            } else if (part.kind == Kind::removalCleanup) {
+                ++owner->guarded[0];
+            } else if (part.kind == Kind::stateSync) {
+                ++owner->guarded[1];
+            } else if (part.kind == Kind::blockMessages) {
+                ++owner->guarded[2];
+            }
+        }
+
+        expect(eq(orphans, 0UZ)) << "every part must nest inside a message phase on its own worker";
+        expect(eq(schedulerMessageWorkers.size(), 1UZ) >> fatal) << "the scheduler's own messages are handled by exactly one worker";
+        const std::uint8_t schedulerWorker = *schedulerMessageWorkers.begin();
+
+        std::size_t granted = 0UZ;
+        for (const Phase& phase : phases) {
+            expect(le(phase.partsNs, static_cast<std::uint64_t>(phase.record->durationNs))) << "the parts are consecutive, so together they cannot outlast their phase";
+            const bool denied = (phase.record->flags & flag::kQuiescenceDenied) != 0U;
+            const int  want   = denied ? 0 : 1;
+            expect(phase.guarded == std::array{want, want, want}) << "a granted phase runs each guarded part exactly once, a refused one runs none";
+            // Before the guard, so even a refused phase on that worker handles them.
+            expect(eq(phase.schedulerMessages, phase.record->workerId == schedulerWorker ? 1 : 0)) << "worker 0 handles the scheduler's messages once in every phase, and no other worker does";
+            granted += denied ? 0UZ : 1UZ;
+        }
+        expect(gt(granted, 0UZ)) << "at least one phase must have been granted, or the guarded parts were never exercised";
+
+        setCategories(0U);
+    };
+
     "a pool worker brackets its own life, and two workers are told apart"_test = [] {
         // Two independent chains so the graph partitions into two jobs and the pool runs two
         // workers. A single chain is one job, which would make the distinctness claim vacuous.
@@ -857,9 +953,14 @@ const boost::ut::suite<"TraceScheduler"> traceSchedulerTests = [] {
         std::ignore      = graph.connect<"out", "in">(source, copy);
         std::ignore      = graph.connect<"out", "in">(copy, sink);
 
-        // multiThreaded so the emitting threads are pool workers, created after the capacity was
-        // set. A ring already built at the old capacity would keep it and never wrap.
-        gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multiThreaded> scheduler;
+        // A pool of its own. A ring is sized when its thread first emits and never again, and the shared
+        // pool's threads have usually emitted in an earlier scenario, so they keep a full-size ring and
+        // never wrap. Whether this scenario held then depended on which threads earlier ones had warmed:
+        // adding one more multi-threaded scenario ahead of it was enough to break it.
+        constexpr std::string_view kOverrunPoolId = "qa_TraceScheduler_overrun";
+        std::ignore                               = gr::thread_pool::Manager::instance().registerPool(std::string(kOverrunPoolId), // already registered is fine: its threads still have 64-record rings
+                                          std::make_shared<gr::thread_pool::ThreadPoolWrapper>(std::make_unique<gr::thread_pool::BasicThreadPool>(std::string(kOverrunPoolId), gr::thread_pool::TaskType::CPU_BOUND, 2U, 2U), "CPU"));
+        gr::scheduler::Simple<gr::scheduler::ExecutionPolicy::multiThreaded> scheduler{gr::property_map{{"poolName", std::string(kOverrunPoolId)}}};
         expect(scheduler.exchange(std::move(graph)).has_value() >> fatal);
         expect(scheduler.runAndWait().has_value() >> fatal);
 
