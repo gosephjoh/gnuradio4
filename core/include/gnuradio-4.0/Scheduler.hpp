@@ -460,15 +460,32 @@ public:
         }
 
         if constexpr (needsReleaseTracking(TPolicy::kPriorityClass)) {
-            TopologyCache topology; // one flatten for every job list, rather than one each
             _jobArena.resize(_executionOrder->size());
             _successorArena.resize(_executionOrder->size());
             _readyHeapArena.resize(_executionOrder->size());
             for (std::size_t job = 0UZ; job < _executionOrder->size(); ++job) {
+                TopologyCache topology; // per list: the cache is keyed on the list it was derived for
                 buildReleaseStorage((*_executionOrder)[job], _schedStates[job], _jobArena[job], _successorArena[job], _readyHeapArena[job], topology);
             }
         }
     }
+
+    /// One worker's successor lists, kept across message phases so the whole graph is not flattened on
+    /// every one. Reused only while the worker's list is pointer-identical to the one they were derived
+    /// for *and* the topology generation has not moved. Both are needed: edge changes, grouping and
+    /// ungrouping take work quiescence and so move the generation, but emplacing, removing and replacing
+    /// a block do not -- they are seen instead through the list of the worker that adopts or reaps the
+    /// block, which is the only worker whose successors such a change can affect.
+    ///
+    /// Addresses only, never owners, so a removed block is not kept alive by the scaffolding used to
+    /// find its neighbours. An address cannot be recycled into the same list unnoticed: a replacement is
+    /// allocated while the block it replaces still exists, and anything adopted later changes the list.
+    struct TopologyCache {
+        std::vector<const BlockModel*> derivedFor;
+        std::vector<std::size_t>       successorOffsets; // into the caller's successor arena, one entry past each block
+        std::size_t                    generation = 0UZ;
+        bool                           built      = false;
+    };
 
     /// Sizes the job arena and the successor lists for one worker's blocks and hands each block a
     /// span into them.
@@ -478,75 +495,64 @@ public:
     /// are two state paths -- `_schedStates` for `step()`, and the worker-local copies `poolWorker`
     /// derives -- and both must go through here, or a policy that tracks releases finds every job
     /// ring empty and never runs a block at all.
-    /// The flattened graph and its adjacency, held across message phases because neither can change
-    /// unless the graph is structurally modified.
-    ///
-    /// Owned by the caller and never shared between workers. The quiescence protocol makes concurrent
-    /// *reads* of the graph safe -- a structural change waits for every `WorkGuard` to be released --
-    /// but it does not serialise several workers rebuilding one shared cache, which is what the first
-    /// phase after a mutation would have them all do. A copy per worker sidesteps that, for the price
-    /// of a few rebuilds per mutation against the tens of thousands per second this removes.
-    ///
-    /// `adjacency` holds `const Edge*` into `flatGraph`, so the two are replaced together, in that
-    /// order, and never one without the other.
-    struct TopologyCache {
-        std::optional<gr::Graph> flatGraph;
-        gr::graph::AdjacencyList adjacency;
-        std::size_t              generation = 0UZ;
-        bool                     built      = false;
-    };
-
     void buildReleaseStorage(const std::vector<std::shared_ptr<BlockModel>>& blocks, std::vector<SchedState>& states, std::vector<Job>& jobArena, std::vector<std::size_t>& successorArena, std::vector<ReadyEntry>& readyHeap, TopologyCache& topology) {
         jobArena.clear();
-        successorArena.clear();
         readyHeap.assign(blocks.size(), ReadyEntry{});
         if (blocks.empty()) {
+            successorArena.clear();
+            topology.built = false;
             return;
         }
 
-        // Flattening the graph and rebuilding its adjacency is the expensive part of this function, and
-        // it reads the one input a message phase cannot have changed -- so it happens only when the
-        // generation says the graph was actually modified.
         const std::size_t generation = gr::atomic_ref(_topologyGeneration).load_acquire();
-        if (!topology.built || topology.generation != generation) {
-            topology.adjacency.clear(); // its pointers alias the graph replaced on the next line
-            topology.flatGraph.emplace(gr::graph::flatten(*_graph));
-            topology.adjacency  = gr::graph::computeAdjacencyList(*topology.flatGraph);
-            topology.generation = generation;
-            topology.built      = true;
-        }
-        const gr::graph::AdjacencyList& adjacency = topology.adjacency;
+        const bool        reusable   = topology.built && topology.generation == generation && std::ranges::equal(blocks, topology.derivedFor, {}, [](const std::shared_ptr<BlockModel>& block) { return static_cast<const BlockModel*>(block.get()); });
+        if (!reusable) {
+            // The expensive part, and the reason for the cache: the whole graph is flattened to find the
+            // few edges between this worker's own blocks.
+            const gr::Graph                flatGraph = gr::graph::flatten(*_graph);
+            const gr::graph::AdjacencyList adjacency = gr::graph::computeAdjacencyList(flatGraph);
 
-        std::unordered_map<const BlockModel*, std::size_t> localIndex;
-        localIndex.reserve(blocks.size());
-        for (std::size_t i = 0UZ; i < blocks.size(); ++i) {
-            localIndex.emplace(blocks[i].get(), i);
-        }
+            std::unordered_map<const BlockModel*, std::size_t> localIndex;
+            localIndex.reserve(blocks.size());
+            for (std::size_t i = 0UZ; i < blocks.size(); ++i) {
+                localIndex.emplace(blocks[i].get(), i);
+            }
 
-        std::vector<std::size_t> successorOffsets(blocks.size() + 1UZ, 0UZ);
-        std::vector<std::size_t> jobOffsets(blocks.size() + 1UZ, 0UZ);
-
-        for (std::size_t i = 0UZ; i < blocks.size(); ++i) {
-            if (const auto entry = adjacency.find(blocks[i]); entry != adjacency.end()) {
-                for (const std::vector<const gr::Edge*>& edges : entry->second | std::views::values) {
-                    for (const gr::Edge* edge : edges) {
-                        // A successor on another worker is deliberately absent: its state belongs to
-                        // that worker and must not be written from here. The per-sweep backstop
-                        // covers those edges.
-                        if (const auto local = localIndex.find(edge->destinationBlock().get()); local != localIndex.end()) {
-                            successorArena.push_back(local->second);
+            successorArena.clear();
+            topology.successorOffsets.assign(blocks.size() + 1UZ, 0UZ);
+            for (std::size_t i = 0UZ; i < blocks.size(); ++i) {
+                if (const auto entry = adjacency.find(blocks[i]); entry != adjacency.end()) {
+                    for (const std::vector<const gr::Edge*>& edges : entry->second | std::views::values) {
+                        for (const gr::Edge* edge : edges) {
+                            // A successor on another worker is deliberately absent: its state belongs to
+                            // that worker and must not be written from here. The per-sweep backstop
+                            // covers those edges.
+                            if (const auto local = localIndex.find(edge->destinationBlock().get()); local != localIndex.end()) {
+                                successorArena.push_back(local->second);
+                            }
                         }
                     }
                 }
+                topology.successorOffsets[i + 1UZ] = successorArena.size();
             }
-            successorOffsets[i + 1UZ] = successorArena.size();
+            topology.derivedFor.clear();
+            for (const std::shared_ptr<BlockModel>& block : blocks) {
+                topology.derivedFor.push_back(block.get());
+            }
+            topology.generation = generation;
+            topology.built      = true;
+        }
 
+        // Always re-derived: a ring's capacity follows the block's batch floor, which is a setting.
+        std::vector<std::size_t> jobOffsets(blocks.size() + 1UZ, 0UZ);
+        for (std::size_t i = 0UZ; i < blocks.size(); ++i) {
             const std::size_t cap = max_outstanding_jobs == 0U ? kUnboundedBatch : static_cast<std::size_t>(max_outstanding_jobs);
             jobArena.resize(jobArena.size() + gr::scheduler::maxOutstandingJobs(*blocks[i], std::max(states[i].batchFloor, 1UZ), cap));
             jobOffsets[i + 1UZ] = jobArena.size();
         }
 
         // Spans are taken only now: both vectors are complete, so no later growth can invalidate them.
+        const std::vector<std::size_t>& successorOffsets = topology.successorOffsets;
         for (std::size_t i = 0UZ; i < blocks.size(); ++i) {
             states[i].successors   = std::span<const std::size_t>{successorArena}.subspan(successorOffsets[i], successorOffsets[i + 1UZ] - successorOffsets[i]);
             states[i].jobs.storage = std::span<Job>{jobArena}.subspan(jobOffsets[i], jobOffsets[i + 1UZ] - jobOffsets[i]);
@@ -559,8 +565,9 @@ public:
     /// on their own they drop every admitted-but-unexecuted job and reset each block's last release --
     /// which lets a periodic block be released early, since a zeroed `lastRelease` makes its temporal
     /// gate vacuous. Correct after a mutation; wrong on the message phases where nothing changed, which
-    /// is nearly all of them. Carried only when the worker's list is pointer-identical *and* the
-    /// topology generation has not moved, so a job never outlives the input it was admitted over.
+    /// is nearly all of them. Carried under exactly the condition that lets the worker's successors be
+    /// reused (`TopologyCache`), so a job never outlives the input it was admitted over, and the two
+    /// cannot disagree about whether anything changed.
     struct ReleaseCarry {
         struct Saved {
             const BlockModel*                     block    = nullptr;
@@ -569,20 +576,19 @@ public:
             std::chrono::steady_clock::time_point lastRelease{};
             std::size_t                           overruns = 0UZ;
         };
-        std::vector<Saved>             saved; // scratch, kept between phases so a steady state does not allocate
-        std::vector<Job>               jobs;  // oldest first within each block
-        std::vector<const BlockModel*> resynced;
-        std::size_t                    topologyGeneration = 0UZ;
-        std::size_t                    discarding         = 0UZ; // what the pending re-sync drops when not carrying
-        bool                           carrying           = false;
+        std::vector<Saved> saved;            // scratch, kept between phases so a steady state does not allocate
+        std::vector<Job>   jobs;             // oldest first within each block
+        std::size_t        discarding = 0UZ; // what the pending re-sync drops when not carrying
+        bool               carrying   = false;
     };
 
-    /// Call before `syncSchedStates()`: `states` still describes the list as it was last re-synced.
-    void saveOutstandingJobs(const std::vector<std::shared_ptr<BlockModel>>& blocks, const std::vector<SchedState>& states, ReleaseCarry& carry) {
+    /// Call before `syncSchedStates()`: `states` and `topology` still describe the list as it was last
+    /// re-synced.
+    void saveOutstandingJobs(const std::vector<std::shared_ptr<BlockModel>>& blocks, const std::vector<SchedState>& states, const TopologyCache& topology, ReleaseCarry& carry) {
         carry.saved.clear();
         carry.jobs.clear();
         carry.discarding = 0UZ;
-        carry.carrying   = carry.topologyGeneration == gr::atomic_ref(_topologyGeneration).load_acquire() && std::ranges::equal(blocks, carry.resynced, {}, [](const std::shared_ptr<BlockModel>& block) { return static_cast<const BlockModel*>(block.get()); });
+        carry.carrying   = topology.built && topology.generation == gr::atomic_ref(_topologyGeneration).load_acquire() && std::ranges::equal(blocks, topology.derivedFor, {}, [](const std::shared_ptr<BlockModel>& block) { return static_cast<const BlockModel*>(block.get()); });
         if (!carry.carrying) {
             for (const SchedState& state : states) {
                 carry.discarding += state.jobs.size;
@@ -591,7 +597,7 @@ public:
         }
         for (std::size_t i = 0UZ; i < states.size(); ++i) {
             const JobQueue& queue = states[i].jobs;
-            carry.saved.push_back(typename ReleaseCarry::Saved{.block = carry.resynced[i], .firstJob = carry.jobs.size(), .jobCount = queue.size, .lastRelease = states[i].lastRelease, .overruns = states[i].overruns});
+            carry.saved.push_back(typename ReleaseCarry::Saved{.block = topology.derivedFor[i], .firstJob = carry.jobs.size(), .jobCount = queue.size, .lastRelease = states[i].lastRelease, .overruns = states[i].overruns});
             for (std::size_t k = 0UZ; k < queue.size; ++k) {
                 carry.jobs.push_back(queue.storage[(queue.head + k) % queue.capacity()]);
             }
@@ -604,16 +610,15 @@ public:
     [[nodiscard]] std::size_t restoreOutstandingJobs(const std::vector<std::shared_ptr<BlockModel>>& blocks, std::vector<SchedState>& states, ReleaseCarry& carry) {
         std::size_t discarded = carry.discarding;
         if (carry.carrying) {
+            // Position for position: carrying requires the list unchanged, and `applyStaticOrder()` is a
+            // no-op for every policy that tracks releases -- none of them has a static key.
+            static_assert(!hasStaticKey(TPolicy::kPriorityClass) || !needsReleaseTracking(TPolicy::kPriorityClass));
             for (std::size_t i = 0UZ; i < blocks.size(); ++i) {
-                // `applyStaticOrder()` may have permuted the list since the save; it almost never has.
-                const BlockModel* block = blocks[i].get();
-                const auto        saved = i < carry.saved.size() && carry.saved[i].block == block ? carry.saved.begin() + static_cast<std::ptrdiff_t>(i) : std::ranges::find(carry.saved, block, &ReleaseCarry::Saved::block);
-                if (saved == carry.saved.end()) {
-                    continue;
-                }
-                states[i].lastRelease = saved->lastRelease;
-                states[i].overruns    = saved->overruns;
-                for (const Job& job : std::span<const Job>{carry.jobs}.subspan(saved->firstJob, saved->jobCount)) {
+                const typename ReleaseCarry::Saved& saved = carry.saved[i];
+                assert(saved.block == blocks[i].get());
+                states[i].lastRelease = saved.lastRelease;
+                states[i].overruns    = saved.overruns;
+                for (const Job& job : std::span<const Job>{carry.jobs}.subspan(saved.firstJob, saved.jobCount)) {
                     if (states[i].jobs.push(job)) {
                         states[i].assignedSamples += job.batch;
                     } else {
@@ -622,12 +627,7 @@ public:
                 }
             }
         }
-        carry.resynced.clear();
-        for (const std::shared_ptr<BlockModel>& block : blocks) {
-            carry.resynced.push_back(block.get());
-        }
-        carry.topologyGeneration = gr::atomic_ref(_topologyGeneration).load_acquire();
-        carry.carrying           = false;
+        carry.carrying = false;
         return discarded;
     }
 
@@ -640,10 +640,11 @@ public:
         }
     }
 
-    /// Bumping the topology generation here rather than at each structural change is deliberate: every
-    /// such change is made under a `WorkQuiescenceGuard`, whose destructor lands here, so a mutation
-    /// that follows the existing protocol cannot forget to invalidate. Quiescence taken for a reason
-    /// that changed no topology invalidates too, which costs one rebuild and cannot be wrong.
+    /// Bumping the topology generation here, rather than at each edge change, means an edge change made
+    /// under a `WorkQuiescenceGuard` cannot forget to invalidate. It does not cover every structural
+    /// change: emplacing, removing and replacing a block take no quiescence, and are caught through the
+    /// worker's list instead (`TopologyCache`). Quiescence taken for any other reason invalidates too,
+    /// which costs one rebuild and cannot be wrong.
     void releaseWorkQuiescence() {
         gr::atomic_ref(_topologyGeneration).fetch_add(1);
         gr::atomic_ref(_workQuiescenceRequested).store_release(false);
@@ -1125,6 +1126,11 @@ protected:
         // `step()` passes an empty span -- so identity falls back to `kNoEntity`, which is a valid
         // worker-scoped record rather than an out-of-range read.
         [[maybe_unused]] const bool traceWork  = gr::trace::kEnabled && gr::trace::categoryEnabled(gr::trace::Category::work);
+        if (traceWork) {
+            // `workBegin` is appended *after* its entry instant is read, and `workEnd` measures from that
+            // instant, so a ring built by the append would be charged to the invocation as execution time.
+            gr::trace::prepareThread();
+        }
         [[maybe_unused]] const auto entityFor  = [&](std::size_t i) { return i < states.size() ? states[i].entityId : gr::trace::kNoEntity; };
         [[maybe_unused]] const auto traceEnter = [&](std::size_t i, std::size_t requested, gr::trace::LoopKind loopKind, std::uint8_t extraFlags) -> std::uint64_t {
             if (!traceWork) {
@@ -1805,7 +1811,6 @@ protected:
         gr::scheduler::detail::applyStaticOrder<TPolicy>(localBlockList, localStates); // no-op for RoundRobinPolicy: its key is the position itself
         if constexpr (needsReleaseTracking(TPolicy::kPriorityClass)) {
             buildReleaseStorage(localBlockList, localStates, localJobArena, localSuccessorArena, localReadyHeap, localTopology);
-            std::ignore = restoreOutstandingJobs(localBlockList, localStates, localCarry); // records the baseline; there is nothing to carry yet
         }
 
         if (localBlockList.empty()) {
@@ -1833,6 +1838,10 @@ protected:
             // on-core before the wall clock starts counting. On a millisecond run that hides inside
             // the natural gap between the two; on a short one it makes the on-core time exceed the
             // lifetime, which no single thread can do.
+            // The ring first, when anything is live: built after the clocks below, its millisecond would
+            // sit inside the measured lifetime as unaccounted time -- the recorder's setup reported as
+            // the loop's.
+            gr::trace::prepareThread();
             const std::uint64_t startedAtNs = gr::trace::now();
             traceCpuAtStart                 = gr::trace::threadCpuNow();
             gr::trace::emit(gr::trace::Event{.startNs = startedAtNs, .payload0 = static_cast<std::uint32_t>(localBlockList.size()), .payload1 = static_cast<std::uint32_t>(gr::trace::currentCpu()), .kind = gr::trace::Kind::workerStart, .workerId = gr::trace::workerIdOf(runnerID)});
@@ -1955,7 +1964,7 @@ protected:
                         [[maybe_unused]] gr::trace::Scope syncScope{gr::trace::Event{.payload0 = gr::trace::saturate(localBlockList.size()), .kind = gr::trace::Kind::stateSync, .workerId = gr::trace::workerIdOf(runnerID), .flags = listChanged}};
 
                         if constexpr (needsReleaseTracking(TPolicy::kPriorityClass)) {
-                            saveOutstandingJobs(localBlockList, localStates, localCarry);
+                            saveOutstandingJobs(localBlockList, localStates, localTopology, localCarry);
                         }
 
                         syncSchedStates(localBlockList, localStates, gr::trace::workerIdOf(runnerID));

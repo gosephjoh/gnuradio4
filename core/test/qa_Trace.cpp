@@ -1054,6 +1054,84 @@ const boost::ut::suite<"Trace"> traceTests = [] {
         reset();
     };
 
+    if constexpr (kEnabled) {
+        // Building a thread's ring costs about a millisecond -- two megabytes, written and faulted in
+        // at once -- and it happens at that thread's first record. A span already open at that moment
+        // absorbs it and reports the recorder's own setup as the program's time. Checked as an ordering
+        // rather than a duration: both sides are clock reads on one thread, so the comparison is exact.
+        // Every scenario runs on a fresh thread, because only a thread that has never recorded builds.
+        "the first scope a thread opens builds its ring before the span starts"_test = [] {
+            reset();
+            setCategories(categoryMask(Category::schedulerLoop));
+
+            bool          ringWhileOpen = false;
+            std::uint64_t createdNs     = std::numeric_limits<std::uint64_t>::max();
+            std::uint64_t outerStartNs  = 0UL;
+            std::thread   fresh([&] {
+                Scope outer{Event{.kind = Kind::messagePhase}};
+                ringWhileOpen = gr::trace::detail::threadRingCreatedNs().has_value();
+                createdNs     = gr::trace::detail::threadRingCreatedNs().value_or(createdNs);
+                outerStartNs  = outer.event().startNs;
+                Scope inner{Event{.kind = Kind::stateSync}}; // closes first: before the fix, the ring was built here, inside `outer`
+            });
+            fresh.join();
+
+            expect(ringWhileOpen) << "the ring must exist once the first scope has opened, not only when a record is appended";
+            expect(le(createdNs, outerStartNs)) << "the ring must be complete before the outermost span starts, or that span absorbs its construction";
+
+            setCategories(0U);
+            reset();
+        };
+
+        "a scope whose category is off builds no ring"_test = [] {
+            // T0's guarantee: a tracing-enabled binary whose mask excludes everything it reaches allocates
+            // nothing. Building the ring early must not turn into building it unconditionally.
+            reset();
+            setCategories(categoryMask(Category::work));
+            const std::size_t ringsBefore = ringStats().rings;
+
+            bool        ringBuilt = true;
+            std::thread fresh([&] {
+                Scope off{Event{.kind = Kind::messagePhase}};
+                ringBuilt = gr::trace::detail::threadRingCreatedNs().has_value();
+            });
+            fresh.join();
+
+            expect(!ringBuilt) << "a scope that did not arm must not allocate";
+            expect(eq(ringStats().rings, ringsBefore)) << "and no ring may have been registered";
+
+            setCategories(0U);
+            reset();
+        };
+
+        "preparing a thread builds its ring only while something is being traced"_test = [] {
+            reset();
+            setCategories(0U);
+            const std::size_t ringsBefore = ringStats().rings;
+
+            bool        builtWhileOff = true;
+            std::thread idle([&] {
+                prepareThread();
+                builtWhileOff = gr::trace::detail::threadRingCreatedNs().has_value();
+            });
+            idle.join();
+            expect(!builtWhileOff) << "a zero mask must allocate nothing, or every enabled binary pays two megabytes per thread";
+            expect(eq(ringStats().rings, ringsBefore));
+
+            setCategories(categoryMask(Category::lifecycle));
+            bool        builtWhileLive = false;
+            std::thread live([&] {
+                prepareThread();
+                builtWhileLive = gr::trace::detail::threadRingCreatedNs().has_value();
+            });
+            live.join();
+            expect(builtWhileLive) << "with any category live, preparing must build the ring, or it moves nothing";
+
+            setCategories(0U);
+            reset();
+        };
+    }
+
     "the build flag reaches the header"_test = [] {
 #ifdef GR_ENABLE_TRACING
         expect(kEnabled) << "GR_ENABLE_TRACING is defined but gr::trace::kEnabled is false";

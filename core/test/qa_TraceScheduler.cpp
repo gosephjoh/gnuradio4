@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <optional>
 #include <set>
 #include <string>
 #include <thread>
@@ -295,6 +296,48 @@ const boost::ut::suite<"TraceScheduler"> traceSchedulerTests = [] {
         expect(eq(collisions, 0UZ)) << "a new graph reused an identity from a destroyed one";
 
         std::ignore = scheduler.changeStateTo(gr::lifecycle::State::STOPPED);
+    };
+
+    "a thread's first invocation does not absorb the construction of its ring"_test = [] {
+        // `workBegin` is stamped with the invocation's entry instant and *then* appended, and `workEnd`
+        // measures from that same instant. If `workBegin` is the thread's first record, the ring --
+        // about a millisecond to build -- was built inside the span `workEnd` reports, so the thread's
+        // first invocation reported the recorder's setup as execution time, straight into the report's
+        // worst case. Only the `work` category is live, which is what makes it the thread's first
+        // record; a fresh thread, because only a thread that has never recorded builds a ring.
+        reset();
+        setCategories(categoryMask(Category::work));
+
+        // Results are carried out of the thread and asserted here: a fatal assertion throws, and an
+        // exception escaping a `std::thread` terminates the whole suite rather than failing one test.
+        std::optional<std::uint64_t> createdNs;
+        bool                         started = false;
+        std::thread                  fresh([&createdNs, &started] {
+            gr::Graph graph;
+            auto&     source = graph.emplaceBlock<gr::testing::ConstantSource<float>>({{"name", std::string("src")}, {"n_samples_max", gr::Size_t{2048U}}});
+            auto&     sink   = graph.emplaceBlock<gr::testing::NullSink<float>>({{"name", std::string("snk")}});
+            std::ignore      = graph.connect<"out", "in">(source, sink);
+
+            TestScheduler scheduler;
+            started = scheduler.exchange(std::move(graph)).has_value() && scheduler.changeStateTo(gr::lifecycle::State::INITIALISED).has_value() && scheduler.changeStateTo(gr::lifecycle::State::RUNNING).has_value();
+            for (std::size_t pass = 0UZ; started && pass < 4UZ; ++pass) {
+                std::ignore = scheduler.step();
+            }
+            createdNs   = gr::trace::detail::threadRingCreatedNs();
+            std::ignore = scheduler.changeStateTo(gr::lifecycle::State::STOPPED);
+        });
+        fresh.join();
+
+        const std::vector<Event> recorded = collect();
+        expect(started >> fatal) << "the scheduler must start on the fresh thread";
+        expect(createdNs.has_value() >> fatal) << "the thread must have recorded, or this scenario tests nothing";
+        expect(gt(std::ranges::count(recorded, Kind::workBegin, &Event::kind), 0) >> fatal);
+        for (const Event& event : recorded) {
+            expect(le(*createdNs, event.startNs)) << "a record on this thread started before its ring existed, so its span contains the construction (kind " << static_cast<int>(std::to_underlying(event.kind)) << ")";
+        }
+
+        setCategories(0U);
+        reset();
     };
 
     "a work() pair is emitted per productive invocation, and only for productive ones"_test = [] {
