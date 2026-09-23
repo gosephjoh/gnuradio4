@@ -218,6 +218,12 @@ Ring* createThreadRing() noexcept {
     // Nothrow `new` rather than `make_unique`, wrapped immediately: this is library code on a
     // `noexcept` path (CLAUDE.md section 5), and a 2 MB allocation is the realistic failure. Losing
     // a thread's records is the right response to a full heap; aborting the graph is not.
+    //
+    // Every element is initialised, which writes -- and so faults in -- the whole slab here, about a
+    // millisecond for the default size. That is deliberate. Left uninitialised, the same page faults
+    // would land one every 128 records inside arbitrary spans over the thread's first 65 536 records,
+    // skewing minima and jitter instead of costing once, at a moment `prepareThread()` keeps outside
+    // every span.
     std::unique_ptr<Event[]> slab{new (std::nothrow) Event[capacity]};
     if (slab == nullptr) {
         return nullptr;
@@ -227,8 +233,9 @@ Ring* createThreadRing() noexcept {
     if (owned == nullptr) {
         return nullptr;
     }
-    owned->ring.slots = slab.get();
-    owned->ring.mask  = static_cast<std::uint64_t>(capacity) - 1UL;
+    owned->ring.slots     = slab.get();
+    owned->ring.mask      = static_cast<std::uint64_t>(capacity) - 1UL;
+    owned->ring.createdNs = now(); // stamped before registration; the caller reads its own clock only after this returns
     owned->slab       = std::move(slab);
 
     Ring* ring = std::addressof(owned->ring);

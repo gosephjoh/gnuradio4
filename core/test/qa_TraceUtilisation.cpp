@@ -377,13 +377,12 @@ const boost::ut::suite<"TraceUtilisationLive"> traceUtilisationLiveTests = [] {
     }
 
     "a real worker loop yields a decomposition that holds together"_test = [] {
-        // Warmed up first, because the *first* run in a process is not the steady state this
-        // assertion is about. A cold process pays ring allocation, first-touch page faults and arena
-        // construction inside the worker's lifetime and outside every recorded scope, which lands --
-        // correctly -- in `unaccounted`: measured cold, the worker is alive 4.6 ms, accounts for
-        // 1.75 ms of it, and is on a core for 99.7 % of the difference. Nothing is missing; the
-        // process is simply starting up. Warmed, the same run accounts for 99.5 % of its life.
-        std::ignore                                 = runLive(categoryMask(Category::work), gr::Size_t{1000U});
+        // Deliberately *not* warmed up. This used to run a throwaway graph first, because a cold worker
+        // accounted for only 38-40 % of its life: about 2.6 ms of it went to building the thread's
+        // trace ring, inside the lifetime and outside every scope. The worker loop now builds the ring
+        // before it starts its clocks, and cold it accounts for 99.4-99.6 % -- what the warm-up used to
+        // buy. So this is also the test that the ring stays out of the lifetime: move it back inside
+        // and B3 below fails.
         const std::vector<Event>             events = runLive(categoryMask(Category::work, Category::schedulerLoop, Category::lifecycle), gr::Size_t{200000U});
         const std::vector<WorkerUtilisation> all    = workerUtilisation(events, 0UL);
         expect(eq(all.size(), 1UZ) >> fatal) << "singleThreaded runs exactly one worker";

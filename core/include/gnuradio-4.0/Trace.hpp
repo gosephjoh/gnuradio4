@@ -364,7 +364,8 @@ namespace detail {
 struct Ring {
     Event*        slots    = nullptr;
     std::uint64_t mask     = 0UL; /// capacity - 1; capacity is a power of two, so the modulo is an AND
-    std::uint64_t sequence = 0UL; /// total pushes ever, not an index — the excess over capacity is the loss count
+    std::uint64_t sequence  = 0UL; /// total pushes ever, not an index — the excess over capacity is the loss count
+    std::uint64_t createdNs = 0UL; /// when construction finished: no span on this thread may start before it
 };
 
 extern std::uint32_t      gCategoryMask;
@@ -375,6 +376,11 @@ extern thread_local Ring* tRing;
 Ring* createThreadRing() noexcept;
 
 [[nodiscard]] inline Ring* threadRing() noexcept { return tRing != nullptr ? tRing : createThreadRing(); }
+
+/// When this thread's ring finished construction, if it has one. Building a ring costs about a
+/// millisecond, and a span open at that moment would absorb it; comparing this against the thread's
+/// earliest `startNs` checks that none did, without timing anything.
+[[nodiscard]] inline std::optional<std::uint64_t> threadRingCreatedNs() noexcept { return tRing != nullptr ? std::optional{tRing->createdNs} : std::nullopt; }
 
 /// The push itself, with **no category check**. Callers that have already decided to record use this;
 /// everything else goes through `emit()`.
@@ -395,6 +401,18 @@ inline void append(const Event& event) noexcept {
         return false;
     } else {
         return (gr::atomic_ref(detail::gCategoryMask).load_relaxed() & std::to_underlying(category)) != 0U;
+    }
+}
+
+/// Builds this thread's ring now, if any category is live. Construction takes about a millisecond,
+/// and whatever span is open when it happens absorbs it, so a caller about to read a span's start
+/// calls this first. Under a zero mask it allocates nothing, which is what keeps a tracing-enabled
+/// binary free until a capture is asked for.
+inline void prepareThread() noexcept {
+    if constexpr (kEnabled) {
+        if (gr::atomic_ref(detail::gCategoryMask).load_relaxed() != 0U) {
+            static_cast<void>(detail::threadRing());
+        }
     }
 }
 
@@ -440,6 +458,11 @@ public:
         if constexpr (kEnabled) {
             if (categoryEnabled(categoryOf(_event.kind))) {
                 if (_event.startNs == 0UL) {
+                    // Before the start is read: the first scope a thread opens is the outermost one, so
+                    // a ring built here lands before every span on the thread rather than inside one. A
+                    // caller that supplied the start has read its clock already; building here would
+                    // buy it nothing, so it is left to call `prepareThread()` first.
+                    static_cast<void>(detail::threadRing());
                     _event.startNs = now();
                 }
                 _armed = true;
