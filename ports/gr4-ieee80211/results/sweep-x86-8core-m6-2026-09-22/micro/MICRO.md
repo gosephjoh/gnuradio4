@@ -102,3 +102,99 @@ run used is recorded as `sched_ratio` in its `latency_summary.json` and `trace_m
 | rr | 4096 | 93394 | 9.8 | 23 | 44.21 | 0.1 |
 | edf | 4096 | 199944 | 4.0 | 49 | 20.47 | 0.5 |
 | rm | 4096 | 80936 | 11.4 | 20 | 50.96 | 0.1 |
+
+## Comparison: this run against the re-sync-cache rerun of the same day
+
+*Hand-written after the generated part; a regeneration of this file drops it. Tables produced by a
+throwaway script over the two `micro.json` files; the rerun is in `../../sweep-x86-8core-m6-2026-09-22b/micro/`.*
+
+**What changed between the two runs.** The scheduler commits `9126f2a`, `7af5453` and `17100e8` (merged as
+`d3c74e1`), on the same KVM guest, the same binary configuration and the same `--max-pass-duration 51`.
+`syncSchedStates()` and `buildReleaseStorage()` still run on every message phase; what they do when nothing
+changed is different: the flattened graph and its adjacency list are now cached per worker and rebuilt only when
+`_topologyGeneration` has moved (bumped whenever work quiescence is released), and the admitted jobs, last-release
+times and overrun counts are carried across a re-sync whose block list is pointer-identical and whose generation is
+unchanged. Two consequences for reading the tables: the `stateSync` marker now covers the state rebuild alone
+(before, it ran to the end of the phase, so the "before" `stateSync` rows are nearly the whole phase and are **not**
+comparable), and three new kinds — `schedulerMessages`, `removalCleanup`, `blockMessages` — account for the rest of
+the phase. `messagePhase` spans the whole phase in both runs and is the like-for-like quantity. RR and RM never
+tracked releases, so the change cannot touch their work; they serve as the control for run-to-run movement.
+One repeat of each run, as M6 is defined.
+
+### Batch response time per receiver, mean µs (before → after) and late share (before → after):
+
+| policy | ratio | rx 0 | rx 1 | rx 2 | rx 3 (5 Msps) |
+|---|---|---|---|---|---|
+| rr | 16 | 112 → 138 (0.1 → 0.0 %) | 145 → 162 (0.1 → 0.0 %) | 146 → 153 (0.2 → 0.2 %) | 156 → 170 (15.2 → 21.9 %) |
+| edf | 16 | 301 → 197 (0.1 → 0.0 %) | 337 → 190 (0.2 → 0.0 %) | 270 → 168 (3.6 → 0.0 %) | 206 → 148 (45.4 → 6.5 %) |
+| rm | 16 | 159 → 175 (0.0 → 0.0 %) | 237 → 197 (0.0 → 0.0 %) | 133 → 151 (0.0 → 0.0 %) | 115 → 116 (1.3 → 1.3 %) |
+| rr | 4096 | 133 → 147 (0.0 → 0.4 %) | 125 → 164 (0.0 → 0.4 %) | 154 → 188 (0.0 → 1.2 %) | 151 → 185 (11.1 → 24.4 %) |
+| edf | 4096 | 164 → 224 (0.0 → 0.9 %) | 165 → 241 (0.0 → 0.7 %) | 127 → 189 (0.0 → 1.3 %) | 127 → 170 (3.6 → 15.7 %) |
+| rm | 4096 | 176 → 199 (0.0 → 0.7 %) | 179 → 195 (0.0 → 0.6 %) | 129 → 162 (0.0 → 0.7 %) | 115 → 126 (0.6 → 2.6 %) |
+
+### Message phase per worker (the whole phase, same marker scope in both runs):
+
+| policy | ratio | per s before → after | mean µs before → after | p99 µs before → after | busy % before → after |
+|---|---|---|---|---|---|
+| rr | 16 | 5567 → 5365 | 7.4 → 7.6 (+2 %) | 17.8 → 19.8 | 4.1 → 4.1 |
+| edf | 16 | 6223 → 9292 | 47.2 → 15.4 (-67 %) | 74.3 → 28.5 | 29.4 → 14.3 |
+| rm | 16 | 4856 → 4816 | 7.3 → 7.4 (+1 %) | 17.4 → 17.5 | 3.6 → 3.6 |
+| rr | 4096 | 23 → 21 | 35.7 → 48.6 (+36 %) | 58.0 → 75.0 | 0.1 → 0.1 |
+| edf | 4096 | 49 → 40 | 94.7 → 68.4 (-28 %) | 227.7 → 120.2 | 0.5 → 0.3 |
+| rm | 4096 | 20 → 18 | 34.0 → 52.8 (+55 %) | 47.1 → 69.6 | 0.1 → 0.1 |
+
+### Passes per worker
+
+| policy | ratio | passes per s before → after | mean pass µs before → after | sweep busy % before → after | releaseScan busy % before → after |
+|---|---|---|---|---|---|
+| rr | 16 | 89071 → 85844 (-4 %) | 10.0 → 10.4 | 89.3 → 89.5 | - |
+| edf | 16 | 99563 → 148672 (+49 %) | 6.0 → 4.8 | 60.1 → 70.7 | 14.3 → 20.6 |
+| rm | 16 | 77689 → 77056 (-1 %) | 11.7 → 11.8 | 90.6 → 90.7 | - |
+| rr | 4096 | 93394 → 87654 (-6 %) | 9.8 → 10.5 | 91.6 → 91.9 | - |
+| edf | 4096 | 199944 → 162593 (-19 %) | 4.0 → 5.1 | 80.0 → 82.4 | 27.6 → 25.3 |
+| rm | 4096 | 80936 → 73020 (-10 %) | 11.4 → 12.6 | 92.4 → 92.0 | - |
+
+### Where the new run's message phase goes (after only; the before run had no such markers):
+
+| policy | ratio | stateSync mean µs (busy %) | schedulerMessages | removalCleanup | blockMessages | zombieReap | adopt | houseKeeping |
+|---|---|---|---|---|---|---|---|---|
+| rr | 16 | 4.64 (2.49) | 0.09 (0.01) | 0.70 (0.38) | 0.24 (0.13) | 0.05 (0.03) | 0.08 (0.04) | 1.44 (0.77) |
+| edf | 16 | 12.51 (11.63) | 0.07 (0.02) | 0.96 (0.89) | 0.21 (0.19) | 0.04 (0.04) | 0.07 (0.06) | 1.22 (1.14) |
+| rm | 16 | 4.63 (2.23) | 0.06 (0.01) | 0.70 (0.34) | 0.24 (0.11) | 0.04 (0.02) | 0.09 (0.04) | 1.30 (0.63) |
+| rr | 4096 | 32.51 (0.07) | 1.75 (0.00) | 1.00 (0.00) | 3.11 (0.01) | 0.13 (0.00) | 1.31 (0.00) | 9.42 (0.02) |
+| edf | 4096 | 54.29 (0.22) | 0.94 (0.00) | 1.16 (0.00) | 2.28 (0.01) | 0.19 (0.00) | 1.00 (0.00) | 8.54 (0.03) |
+| rm | 4096 | 35.13 (0.06) | 1.55 (0.00) | 1.13 (0.00) | 3.75 (0.01) | 0.07 (0.00) | 1.21 (0.00) | 10.45 (0.02) |
+
+### stateSync as each run's marker measured it (NOT comparable: the before marker ran to the end of the phase):
+
+| policy | ratio | before mean µs (busy %) | after mean µs (busy %) | jobs discarded per sync before → after (mean, max) |
+|---|---|---|---|---|
+| rr | 16 | 6.5 (3.6) | 4.64 (2.49) | 0.00, 0 → 0.00, 0 |
+| edf | 16 | 45.9 (28.6) | 12.51 (11.63) | 0.00, 7 → 0.00, 0 |
+| rm | 16 | 6.4 (3.1) | 4.63 (2.23) | 0.00, 0 → 0.00, 0 |
+| rr | 4096 | 33.6 (0.1) | 32.51 (0.07) | 0.00, 0 → 0.00, 0 |
+| edf | 4096 | 92.8 (0.5) | 54.29 (0.22) | 0.00, 0 → 0.00, 0 |
+| rm | 4096 | 32.0 (0.1) | 35.13 (0.06) | 0.00, 0 → 0.00, 0 |
+
+### Reading
+
+- **At ratio 16 the change does what it was written to do.** EDF's message phase fell from 47.2 to 15.4 µs
+  mean (−67 %), 74.3 to 28.5 µs at p99, and from 29.4 % to 14.3 % of a worker's time; the pass rate rose 49 %
+  (99 563 → 148 672 per s). Every EDF receiver's batch response time dropped — 301 → 197, 337 → 190, 270 → 168,
+  206 → 148 µs — and the 5 Msps receiver's late share fell from 45.4 % to 6.5 %. The controls did not move:
+  RR's and RM's phase means changed by +2 % and +1 %, their pass rates by −4 % and −1 %.
+- **EDF's re-sync is still the largest part of its phase.** With the marker narrowed, `stateSync` under EDF at
+  ratio 16 is 12.5 µs and 11.6 % of the worker against 4.6 µs and 2.5 % under RR — the storage rebuild that
+  remains after the graph cache. House-keeping (1.2–1.4 µs) and removal cleanup (0.7–1.0 µs) are the next
+  items; scheduler messages, block messages, zombie reaping and adoption are each under 0.25 µs.
+- **The re-sync now discards nothing.** The maximum jobs discarded per re-sync under EDF at ratio 16 went from
+  7 to 0; at 4096 both runs read 0.
+- **At ratio 4096 nothing can be concluded from this pair.** Every policy's batch response time rose, RR and RM
+  included (RR rx 3: 151 → 185 µs, late 11.1 → 24.4 %; RM rx 3: 115 → 126 µs), and RR's and RM's phase means
+  rose 36 % and 55 % on 18–23 phases per second over a 1.8–2.0 s window (36–46 phases per worker). Since the change cannot touch RR or RM,
+  that is the run-to-run movement of a single-repeat measurement on a virtual machine, and EDF's rise at 4096
+  (127 → 170 µs on rx 3) is of the same size as the controls'. The phase itself did get cheaper under EDF at
+  4096 (94.7 → 68.4 µs mean, 227.7 → 120.2 at p99), but at 40–49 phases per second that is 0.5 → 0.3 % of the worker. Repeats are needed before any claim about ratio 4096.
+- **What this means for the ratio.** The default of 16 is now survivable for EDF on this workload (6.5 % late on
+  the 5 Msps receiver, from 45.4 %) but still costs it 14 % of each worker in message phases against 4 % for RR
+  and RM, so the reason to raise the ratio for a static graph stands; it is a smaller reason than it was.

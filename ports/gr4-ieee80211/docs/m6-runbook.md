@@ -87,8 +87,11 @@ each of the six `m6_*/latency_summary.json`:
 - `"max_pass_duration_us": 51` and `"sched_ratio"` 16 or 4096 as expected.
   If the budget reads 0, the run took the scheduler's auto rule and §7 says
   why that is wrong here.
-- `decoded_total` equals `frames`, and `wrong_payload_total` is 0: every
-  frame was decoded and checked byte for byte.
+- in every `per_chain` entry `decoded` equals `frames`, and at the top level
+  `missing_total` and `wrong_payload_total` are 0: every frame replayed was
+  decoded and checked byte for byte. (The top-level `frames` is the whole
+  60 s cell, 102 934; a 20 s replay decodes 34 308 of them, so
+  `decoded_total` is expected to be well below it.)
 - `elapsed_s` close to 20: a run that took appreciably longer did not keep up.
 
 Then in each `batch_rt.json`, no receiver should be marked `saturated`. The
