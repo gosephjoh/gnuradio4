@@ -1125,6 +1125,11 @@ protected:
         // `step()` passes an empty span -- so identity falls back to `kNoEntity`, which is a valid
         // worker-scoped record rather than an out-of-range read.
         [[maybe_unused]] const bool traceWork  = gr::trace::kEnabled && gr::trace::categoryEnabled(gr::trace::Category::work);
+        if (traceWork) {
+            // `workBegin` is appended *after* its entry instant is read, and `workEnd` measures from that
+            // instant, so a ring built by the append would be charged to the invocation as execution time.
+            gr::trace::prepareThread();
+        }
         [[maybe_unused]] const auto entityFor  = [&](std::size_t i) { return i < states.size() ? states[i].entityId : gr::trace::kNoEntity; };
         [[maybe_unused]] const auto traceEnter = [&](std::size_t i, std::size_t requested, gr::trace::LoopKind loopKind, std::uint8_t extraFlags) -> std::uint64_t {
             if (!traceWork) {
@@ -1833,6 +1838,10 @@ protected:
             // on-core before the wall clock starts counting. On a millisecond run that hides inside
             // the natural gap between the two; on a short one it makes the on-core time exceed the
             // lifetime, which no single thread can do.
+            // The ring first, when anything is live: built after the clocks below, its millisecond would
+            // sit inside the measured lifetime as unaccounted time -- the recorder's setup reported as
+            // the loop's.
+            gr::trace::prepareThread();
             const std::uint64_t startedAtNs = gr::trace::now();
             traceCpuAtStart                 = gr::trace::threadCpuNow();
             gr::trace::emit(gr::trace::Event{.startNs = startedAtNs, .payload0 = static_cast<std::uint32_t>(localBlockList.size()), .payload1 = static_cast<std::uint32_t>(gr::trace::currentCpu()), .kind = gr::trace::Kind::workerStart, .workerId = gr::trace::workerIdOf(runnerID)});
