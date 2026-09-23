@@ -178,7 +178,7 @@ commits since have done to each item:
 | `tie_break` | did not exist | default (`registrationOrder`) | `77fe5c5` added it; the default reproduces the old behaviour |
 | `--trace-categories all --trace-buffer R --trace-limit-mb 1024` | yes | mask and ring **revised**, §7 | the capture is analysed and discarded, as before, but the ring should hold the whole analysis window |
 | `--timeout-s` | 6 × run_s + 60 | 240 | |
-| `--cpus`, `--rt-prio` | did not exist | **`--cpus 4-7 --rt-prio 10`** on every run | added 2026-09-23 (§13): worker *k* pinned to CPU 4+*k*, one per CPU, under `SCHED_FIFO` 10; needs the isolation of §13 to mean anything |
+| `--cpus`, `--rt-prio` | did not exist | **`--cpus 4-7`** on every run; no `--rt-prio` | added 2026-09-23 (§13): worker *k* pinned to CPU 4+*k*, one per CPU, under `SCHED_OTHER`; needs the isolation of §13 to mean anything. `SCHED_FIFO` was measured and set aside (§13 step 3b) |
 
 Nothing that was set before has become unnecessary; one new setting
 (`--max-pass-duration`) has become necessary. The default values of every
@@ -193,7 +193,7 @@ build/rx_latency4 --run-dir data/rt_300_300_102934_QPSK_1_2_s1 --out-dir <run> \
     --policy {rr|rm|edf} --fixed-batch 1024 \
     --threads 3 --chains 4 --rates 1250000,1250000,2500000,5000000 --run-s 30 \
     --rotate 1 --sched-ratio 4096 --max-pass-duration 51 --timeout-s 240 \
-    --cpus 4-7 --rt-prio 10 \
+    --cpus 4-7 \
     --trace-categories <mask> --trace-buffer <R> --trace-limit-mb <M> --trace-out <run>/trace.gr4trace
 ```
 
@@ -564,7 +564,8 @@ Settled 2026-09-23, third round:
 - **Workers**: 1 / 2 for `simple1` / `simple2`; 3 for the three mixes, the
   ceiling of `knee`'s total demand, close to full utilisation (§2).
 - **Worker isolation**: CPUs 4–7 isolated in the guest, workers pinned one
-  per CPU under `SCHED_FIFO` 10, everything else on 0–3 (§13).
+  per CPU, everything else on 0–3; **pin only, no real-time priority**
+  (decided 2026-09-23 on the measurements of §13 step 3b).
 
 Open: nothing beyond the held item above.
 
@@ -607,13 +608,41 @@ grep ^CPUAffinity /etc/systemd/system.conf
 `isolcpus` does not stop a process that pins itself onto 4–7; this keeps every
 service and login session, and so every child, off them by inheritance.
 
-### Step 3 — allow real-time priority for the user
+### Step 3 — real-time priority: available, not used
+
+Both of the following are applied on this guest and are what `--rt-prio`
+needs; the sweep does not use it (decision below), so they can be undone
+without changing a result.
 
 ```
-printf 'gr3 - rtprio 80\ngr3 - memlock unlimited\n' | sudo tee /etc/security/limits.d/90-gr3-rt.conf
+printf 'gr3 - rtprio 80\ngr3 - memlock unlimited\n' | sudo tee /etc/security/limits.d/90-gr3-rt.conf   # effective at next login
+sudo sysctl -w kernel.sched_rt_runtime_us=-1
+echo 'kernel.sched_rt_runtime_us = -1' | sudo tee /etc/sysctl.d/90-rt-no-throttle.conf
 ```
 
-Takes effect at the next login.
+### Step 3b — why the workers stay `SCHED_OTHER`
+
+By default (`sched_rt_runtime_us` = 950000 of a 1 000 000 µs period) the
+kernel lets real-time tasks use at most 95 % of a CPU and forces them off for
+the rest; a busy-polling worker under `SCHED_FIFO` never yields, so it lost
+its CPU for tens of milliseconds in every second. Measured on this guest,
+10 s light mix, three workers pinned to 4–6, `--rt-prio 10`: with the
+throttle on, p99 3–10 ms and maxima of 11–14 ms per receiver; with it off,
+p99 0.9–1.5 ms and maxima 1.6–2.8 ms; pinned under `SCHED_OTHER` the same
+run gave p99 0.8–1.4 ms and maxima 1.1–1.6 ms (one run each — the
+difference between the last two is within a single run's noise). Disabling
+the throttle is safe here because the FIFO threads are confined to CPUs the
+rest of the system does not use; on a shared CPU it would let a runaway
+FIFO thread lock the CPU.
+
+**Decision (2026-09-23): pin only.** On an isolated CPU nothing competes with
+the worker, so the real-time class has nothing to pre-empt and measured no
+better than `SCHED_OTHER`; it starves the CPU's own `SCHED_OTHER` kernel
+threads (`ktimers/N`, `ksoftirqd/N`), which is the likely reason the tick
+stayed on for one FIFO worker (step 6); and it adds two settings a reader
+must reproduce. If a later run shows something landing on 4–6 despite
+`isolcpus` and `CPUAffinity`, `--rt-prio` is there and the two settings
+above make it work.
 
 ### Step 4 — reboot and verify
 
@@ -628,18 +657,22 @@ ulimit -r                                    # 80
 ```
 
 If `isolated` is empty the boot line did not apply: `grep isolcpus
-/boot/grub/grub.cfg`.
+/boot/grub/grub.cfg`. Applied and verified on this guest on 2026-09-23
+(boot at 08:28): `isolated` and `nohz_full` read `4-7`, the IRQ default mask
+`0f`, CPUs 4–7 hold only their per-CPU kernel threads. The four
+`virtio3-request` queue interrupts are pinned one per CPU 4–7 by the
+managed-IRQ code (they serve I/O submitted from that CPU) and fired zero
+times during a run: the file source reads from the page cache.
 
 ### Step 5 — pin the workers (in the app, done 2026-09-23)
 
-`rx_latency4 --cpus LIST --rt-prio N` (needs `--threads`): worker *k* is
+`rx_latency4 --cpus LIST [--rt-prio N]` (needs `--threads`): worker *k* is
 pinned to the *k*-th CPU of LIST, one worker per CPU (the app refuses fewer
-CPUs than workers), and the workers run under `SCHED_FIFO` at N. The sweep
-uses `--cpus 4-7 --rt-prio 10`: the mixes' three workers land on 4, 5, 6;
-`simple1`/`simple2` on 4 and 4–5. Priority 10 is above every `SCHED_OTHER`
-task and below the kernel's `irq/*` and `rcuc/*` threads at 50, so a worker
-cannot block its CPU's own kernel work. `worker_cpus` and `rt_prio` are
-recorded in every run's `latency_summary.json` and `trace_meta.json`.
+CPUs than workers); `--rt-prio N` would put the workers under `SCHED_FIFO`
+at N, which the sweep does not use (step 3b). The sweep uses `--cpus 4-7`:
+the mixes' three workers land on 4, 5, 6; `simple1`/`simple2` on 4 and 4–5.
+`worker_cpus` and `rt_prio` (0) are recorded in every run's
+`latency_summary.json` and `trace_meta.json`.
 
 Found while adding this: GR4's `BasicThreadPool::updateThreadConstraints()`
 applied each worker's affinity mask to the *calling* thread (the helper was
@@ -655,11 +688,15 @@ I/O threads `TS` on 0–3.
 ### Step 6 — check before trusting a number
 
 During a run: `ps -eLo psr,rtprio,policy,comm | awk '$1>=4'` shows the
-workers alone on 4–6 at `FF 10`. After it: `awk '/^ *LOC:/{print $6,$7,$8,$9}'
+workers alone on 4–6, policy `TS`. After it: `awk '/^ *LOC:/{print $6,$7,$8,$9}'
 /proc/interrupts` twice, 30 s apart — the tick counts on 4–6 should advance
 by hundreds, not tens of thousands. In the run's own record: the stall
 filter's count on its frames (0.007 % last time, in 2–3 ms clusters) and the
-trace's per-worker lifetime accounting.
+trace's per-worker lifetime accounting. Observed 2026-09-23 over a 10 s run:
+under `SCHED_OTHER` the tick advanced by 2–6 on each of 4–7; under
+`SCHED_FIFO` 10 it advanced by 7 163 on CPU 4 and 0 on 5–7 — the tick stayed
+on for one FIFO worker, cause not identified (one observation; to be watched
+in the calibration runs).
 
 ### What the guest cannot do
 
