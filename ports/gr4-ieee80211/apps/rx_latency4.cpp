@@ -42,6 +42,9 @@
 #include <nlohmann/json.hpp>
 
 #include <getopt.h>
+#include <sched.h>
+#include <sys/resource.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <chrono>
@@ -51,6 +54,7 @@
 #include <fstream>
 #include <memory>
 #include <print>
+#include <sstream>
 #include <thread>
 #include <vector>
 
@@ -93,7 +97,30 @@ struct Options {
     double      run_s = 0;               // replay run_s seconds per chain (max_samples = run_s x chain rate)
     unsigned    rotate = 0;              // rotate chain k's construction order by rotate x k slots
     bool        rm_tiny_periods = false; // RM: keep the tiny periods (default: true per-receiver periods N/rate)
+    std::vector<unsigned> cpus;          // pin worker k to cpus[k]; empty = no pinning
+    int         rt_prio = 0;             // SCHED_FIFO priority of the workers; 0 = SCHED_OTHER
 };
+
+// "4-7" or "4,5,6" -> {4,5,6,7}; empty on a malformed list
+std::vector<unsigned> parseCpuList(const char* a) {
+    std::vector<unsigned> v;
+    std::string s(a), tok;
+    std::stringstream ss(s);
+    while (std::getline(ss, tok, ',')) {
+        const std::size_t dash = tok.find('-');
+        char* end = nullptr;
+        const unsigned lo = static_cast<unsigned>(std::strtoul(tok.c_str(), &end, 10));
+        if (end == tok.c_str()) { return {}; }
+        unsigned hi = lo;
+        if (dash != std::string::npos) {
+            const char* p = tok.c_str() + dash + 1;
+            hi = static_cast<unsigned>(std::strtoul(p, &end, 10));
+            if (end == p || hi < lo) { return {}; }
+        }
+        for (unsigned c = lo; c <= hi; c++) { v.push_back(c); }
+    }
+    return v;
+}
 
 std::vector<float> parseFloats(const char* a) {
     std::vector<float> v;
@@ -162,7 +189,12 @@ void usage() {
         "  --rotate K          rotate receiver k's block construction order by K x k slots (spreads the heavy blocks\n"
         "                      over GR4's striped workers); 0 = graph order as built\n"
         "  --rm-tiny-periods   RM: keep the tiny periods (default under --policy rm: each receiver's blocks carry\n"
-        "                      their true period N/rate, so RM ranks receivers by rate)");
+        "                      their true period N/rate, so RM ranks receivers by rate)\n"
+        "worker placement (needs --threads):\n"
+        "  --cpus LIST         pin worker k to the k-th CPU of LIST (\"4-7\" or \"4,5,6\"); LIST must hold at least\n"
+        "                      --threads CPUs; one worker per CPU, never two\n"
+        "  --rt-prio N         run the workers under SCHED_FIFO at priority N (needs an rtprio limit >= N or root);\n"
+        "                      keep N below the kernel's irq/* and rcuc/* threads (50) unless you mean to outrank them");
 }
 
 double percentile(const std::vector<double>& sorted, double q) {
@@ -178,7 +210,7 @@ double percentile(const std::vector<double>& sorted, double q) {
 
 int main(int argc, char** argv) {
     Options opt;
-    static const struct option kOpts[] = {{"run-dir", required_argument, nullptr, 1}, {"input", required_argument, nullptr, 2}, {"out-dir", required_argument, nullptr, 3}, {"rate", required_argument, nullptr, 4}, {"chunk", required_argument, nullptr, 5}, {"chains", required_argument, nullptr, 6}, {"deadline-ms", required_argument, nullptr, 7}, {"timeout-s", required_argument, nullptr, 8}, {"record", no_argument, nullptr, 9}, {"no-check", no_argument, nullptr, 10}, {"buffer", required_argument, nullptr, 11}, {"catch-up", no_argument, nullptr, 12}, {"single", no_argument, nullptr, 13}, {"threads", required_argument, nullptr, 14}, {"batch", required_argument, nullptr, 15}, {"policy", required_argument, nullptr, 16}, {"fixed-batch", required_argument, nullptr, 17}, {"tiny-period", required_argument, nullptr, 18}, {"trace-categories", required_argument, nullptr, 19}, {"trace-buffer", required_argument, nullptr, 20}, {"trace-limit-mb", required_argument, nullptr, 21}, {"trace-out", required_argument, nullptr, 22}, {"sched-ratio", required_argument, nullptr, 23}, {"selection", required_argument, nullptr, 24}, {"max-outstanding-jobs", required_argument, nullptr, 25}, {"max-samples", required_argument, nullptr, 26}, {"deadline-classes", required_argument, nullptr, 27}, {"frame-deadline", required_argument, nullptr, 28}, {"max-selections", required_argument, nullptr, 29}, {"rates", required_argument, nullptr, 30}, {"run-s", required_argument, nullptr, 31}, {"rotate", required_argument, nullptr, 32}, {"rm-tiny-periods", no_argument, nullptr, 33}, {"max-pass-duration", required_argument, nullptr, 34}, {"help", no_argument, nullptr, 'h'}, {nullptr, 0, nullptr, 0}};
+    static const struct option kOpts[] = {{"run-dir", required_argument, nullptr, 1}, {"input", required_argument, nullptr, 2}, {"out-dir", required_argument, nullptr, 3}, {"rate", required_argument, nullptr, 4}, {"chunk", required_argument, nullptr, 5}, {"chains", required_argument, nullptr, 6}, {"deadline-ms", required_argument, nullptr, 7}, {"timeout-s", required_argument, nullptr, 8}, {"record", no_argument, nullptr, 9}, {"no-check", no_argument, nullptr, 10}, {"buffer", required_argument, nullptr, 11}, {"catch-up", no_argument, nullptr, 12}, {"single", no_argument, nullptr, 13}, {"threads", required_argument, nullptr, 14}, {"batch", required_argument, nullptr, 15}, {"policy", required_argument, nullptr, 16}, {"fixed-batch", required_argument, nullptr, 17}, {"tiny-period", required_argument, nullptr, 18}, {"trace-categories", required_argument, nullptr, 19}, {"trace-buffer", required_argument, nullptr, 20}, {"trace-limit-mb", required_argument, nullptr, 21}, {"trace-out", required_argument, nullptr, 22}, {"sched-ratio", required_argument, nullptr, 23}, {"selection", required_argument, nullptr, 24}, {"max-outstanding-jobs", required_argument, nullptr, 25}, {"max-samples", required_argument, nullptr, 26}, {"deadline-classes", required_argument, nullptr, 27}, {"frame-deadline", required_argument, nullptr, 28}, {"max-selections", required_argument, nullptr, 29}, {"rates", required_argument, nullptr, 30}, {"run-s", required_argument, nullptr, 31}, {"rotate", required_argument, nullptr, 32}, {"rm-tiny-periods", no_argument, nullptr, 33}, {"max-pass-duration", required_argument, nullptr, 34}, {"cpus", required_argument, nullptr, 35}, {"rt-prio", required_argument, nullptr, 36}, {"help", no_argument, nullptr, 'h'}, {nullptr, 0, nullptr, 0}};
     int c;
     while ((c = getopt_long(argc, argv, "h", kOpts, nullptr)) != -1) {
         switch (c) {
@@ -216,6 +248,8 @@ int main(int argc, char** argv) {
         case 32: opt.rotate = static_cast<unsigned>(std::strtoul(optarg, nullptr, 10)); break;
         case 33: opt.rm_tiny_periods = true; break;
         case 34: opt.max_pass_duration = static_cast<unsigned>(std::strtoul(optarg, nullptr, 10)); break;
+        case 35: opt.cpus = parseCpuList(optarg); if (opt.cpus.empty()) { std::println(stderr, "rx_latency4: --cpus: bad list {}", optarg); return 2; } break;
+        case 36: opt.rt_prio = std::atoi(optarg); break;
         default: usage(); return 2;
         }
     }
@@ -234,6 +268,29 @@ int main(int argc, char** argv) {
     if (opt.single && opt.policy != "rr") {
         std::println(stderr, "rx_latency4: --single is round robin only; use --threads 1 for one worker under edf/rm");
         return 2;
+    }
+    if (!opt.cpus.empty() || opt.rt_prio != 0) {
+        if (opt.threads == 0 || opt.single) {
+            std::println(stderr, "rx_latency4: --cpus and --rt-prio apply to the worker pool: give --threads N, not --single");
+            return 2;
+        }
+        const unsigned ncpu = std::thread::hardware_concurrency();
+        if (!opt.cpus.empty() && opt.cpus.size() < opt.threads) {
+            std::println(stderr, "rx_latency4: --cpus lists {} CPU(s) for {} workers; one CPU per worker is required", opt.cpus.size(), opt.threads);
+            return 2;
+        }
+        for (unsigned c : opt.cpus) {
+            if (c >= ncpu) { std::println(stderr, "rx_latency4: --cpus: CPU {} is not one of the {} CPUs", c, ncpu); return 2; }
+        }
+        if (opt.rt_prio != 0) {
+            const int lo = sched_get_priority_min(SCHED_FIFO), hi = sched_get_priority_max(SCHED_FIFO);
+            if (opt.rt_prio < lo || opt.rt_prio > hi) { std::println(stderr, "rx_latency4: --rt-prio must be in [{}, {}]", lo, hi); return 2; }
+            struct rlimit rl {};
+            if (geteuid() != 0 && (getrlimit(RLIMIT_RTPRIO, &rl) != 0 || (rl.rlim_cur != RLIM_INFINITY && static_cast<int>(rl.rlim_cur) < opt.rt_prio))) {
+                std::println(stderr, "rx_latency4: --rt-prio {}: the rtprio limit is {} (ulimit -r); raise it in /etc/security/limits.d or run as root", opt.rt_prio, rl.rlim_cur == RLIM_INFINITY ? std::string("unlimited") : std::to_string(rl.rlim_cur));
+                return 2;
+            }
+        }
     }
     if (opt.fixed_batch > 0) {
         if (opt.rate <= 0) {
@@ -400,12 +457,24 @@ int main(int argc, char** argv) {
     const unsigned hw_threads = std::thread::hardware_concurrency();
     if (opt.threads > 0) {
         using namespace gr::thread_pool;
-        auto cpu = std::make_shared<ThreadPoolWrapper>(std::make_unique<BasicThreadPool>(std::string(kDefaultCpuPoolId), TaskType::CPU_BOUND, opt.threads, opt.threads), "CPU");
+        auto pool = std::make_unique<BasicThreadPool>(std::string(kDefaultCpuPoolId), TaskType::CPU_BOUND, opt.threads, opt.threads);
+        // the pool spreads its threads over the set CPUs of the mask, thread k on the k-th: a mask of
+        // exactly --threads CPUs pins one worker per CPU (thread_pool.hpp distributeThreadAffinityAcrossCores)
+        if (!opt.cpus.empty()) {
+            std::vector<bool> mask(std::thread::hardware_concurrency(), false);
+            for (unsigned k = 0; k < opt.threads; k++) { mask[opt.cpus[k]] = true; }
+            pool->setAffinityMask(mask);
+        }
+        if (opt.rt_prio != 0) { pool->setThreadSchedulingPolicy(thread::Policy::FIFO, opt.rt_prio); }
+        auto cpu = std::make_shared<ThreadPoolWrapper>(std::move(pool), "CPU");
         gr::thread_pool::Manager::instance().replacePool(std::string(kDefaultCpuPoolId), std::move(cpu));
     }
     const unsigned pool_threads = opt.threads > 0 ? opt.threads : hw_threads;
 
     std::println(stderr, "rx_latency4: replaying {} ({} frames) at {}, {} chain(s) x {} blocks, deadline {} ms, policy {}, {} worker(s) of {} hw threads{}{}", opt.input, frames, opt.rate > 0 ? std::format("{} Msample/s chunk {}", opt.rate / 1e6, opt.chunk) : std::string("unthrottled"), opt.chains, chains[0].block_count, opt.deadline_ms, opt.policy, opt.single ? 1U : pool_threads, hw_threads, opt.fixed_batch ? std::format(", fixed batch {}", opt.fixed_batch) : std::string(), opt.trace_mask ? std::format(", trace mask 0x{:x}", opt.trace_mask) : std::string());
+    if (!opt.cpus.empty() || opt.rt_prio != 0) {
+        std::println(stderr, "rx_latency4: workers on CPUs [{}]{}", opt.cpus.empty() ? std::string("any") : [&] { std::string t; for (unsigned k = 0; k < opt.threads; k++) { t += (k ? "," : "") + std::to_string(opt.cpus[k]); } return t; }(), opt.rt_prio ? std::format(", SCHED_FIFO {}", opt.rt_prio) : std::string(", SCHED_OTHER"));
+    }
     if (opt.trace_limit_mb > 0) {
         gr::trace::setRingCapacityLimitBytes(opt.trace_limit_mb * 1024UZ * 1024UZ);
     }
@@ -572,7 +641,8 @@ int main(int argc, char** argv) {
     }
     std::fclose(csv);
 
-    json summary = {{"app", "rx_latency4"}, {"runtime", "gnuradio4"}, {"scheduler", sched_name}, {"policy", opt.policy}, {"policy_name", policy_name}, {"fixed_batch", opt.fixed_batch}, {"tiny_period_s", opt.fixed_batch > 0 ? opt.tiny_period : 0.f}, {"selection_strategy", opt.selection}, {"sched_ratio", opt.sched_ratio}, {"max_outstanding_jobs", opt.max_outstanding_jobs}, {"max_selections_per_pass", opt.max_selections}, {"max_pass_duration_us", opt.max_pass_duration}, {"trace", trace_info}, {"max_samples", opt.max_samples}, {"run_s", opt.run_s}, {"rates", opt.rates}, {"rotate", opt.rotate}, {"frames_dropped", frames_dropped}, {"deadline_classes", opt.deadline_classes}, {"frame_deadline", opt.frame_deadline}, {"buffer", opt.buffer}, {"catch_up", opt.catch_up}, {"threads", opt.single ? 1U : pool_threads}, {"batch", opt.batch}, {"hw_threads", hw_threads}, {"chains", opt.chains}, {"order_mode", order_mode}, {"blocks_per_chain", chains[0].block_count}, {"frames", frames}, {"decoded_total", decoded_total}, {"missing_total", missing_total}, {"wrong_payload_total", opt.check ? json(wrong_total) : json(nullptr)}, {"deadline_misses_total", misses_total}, {"elapsed_s", elapsed_s}, {"latency", {{"rate", opt.rate}, {"chunk", opt.chunk}, {"deadline_ms", opt.deadline_ms}, {"stamp_bias_max_us", opt.rate > 0 ? opt.chunk / opt.rate * 1e6 : 0.0}, {"input", opt.input}}}, {"result", ok ? "ok" : (timed_out.load() ? "timeout" : "error")}, {"per_chain", per_chain}};
+    const std::vector<unsigned> worker_cpus(opt.cpus.begin(), opt.cpus.begin() + static_cast<std::ptrdiff_t>(std::min<std::size_t>(opt.cpus.size(), opt.threads)));
+    json summary = {{"app", "rx_latency4"}, {"runtime", "gnuradio4"}, {"scheduler", sched_name}, {"policy", opt.policy}, {"policy_name", policy_name}, {"fixed_batch", opt.fixed_batch}, {"tiny_period_s", opt.fixed_batch > 0 ? opt.tiny_period : 0.f}, {"selection_strategy", opt.selection}, {"sched_ratio", opt.sched_ratio}, {"max_outstanding_jobs", opt.max_outstanding_jobs}, {"max_selections_per_pass", opt.max_selections}, {"max_pass_duration_us", opt.max_pass_duration}, {"trace", trace_info}, {"max_samples", opt.max_samples}, {"run_s", opt.run_s}, {"rates", opt.rates}, {"rotate", opt.rotate}, {"frames_dropped", frames_dropped}, {"deadline_classes", opt.deadline_classes}, {"frame_deadline", opt.frame_deadline}, {"buffer", opt.buffer}, {"catch_up", opt.catch_up}, {"threads", opt.single ? 1U : pool_threads}, {"worker_cpus", worker_cpus}, {"rt_prio", opt.rt_prio}, {"batch", opt.batch}, {"hw_threads", hw_threads}, {"chains", opt.chains}, {"order_mode", order_mode}, {"blocks_per_chain", chains[0].block_count}, {"frames", frames}, {"decoded_total", decoded_total}, {"missing_total", missing_total}, {"wrong_payload_total", opt.check ? json(wrong_total) : json(nullptr)}, {"deadline_misses_total", misses_total}, {"elapsed_s", elapsed_s}, {"latency", {{"rate", opt.rate}, {"chunk", opt.chunk}, {"deadline_ms", opt.deadline_ms}, {"stamp_bias_max_us", opt.rate > 0 ? opt.chunk / opt.rate * 1e6 : 0.0}, {"input", opt.input}}}, {"result", ok ? "ok" : (timed_out.load() ? "timeout" : "error")}, {"per_chain", per_chain}};
     {
         std::ofstream f(opt.out_dir + "/latency_summary.json");
         f << summary.dump(2) << "\n";
@@ -588,7 +658,7 @@ int main(int argc, char** argv) {
             for (const auto& [uname, role] : chains[k].roles) { blocks.push_back({{"unique_name", uname}, {"role", role}}); }
             jchains.push_back({{"chain", k}, {"rate", chain_rate[k]}, {"max_samples", chain_max[k]}, {"frames", chain_frames[k]}, {"throttle_start_ns", cc.thr_start_ns}, {"throttle_chunks", cc.thr_chunks}, {"throttle_max_chunks_per_call", cc.thr_max_chunks_per_call}, {"throttle_max_backlog_samples", cc.thr_max_backlog}, {"blocks", blocks}});
         }
-        json meta = {{"app", "rx_latency4"}, {"run_dir", opt.run_dir}, {"input", opt.input}, {"out_dir", opt.out_dir}, {"policy", opt.policy}, {"policy_name", policy_name}, {"scheduler", sched_name}, {"threads", opt.single ? 1U : pool_threads}, {"hw_threads", hw_threads}, {"rate", opt.rate}, {"chunk", opt.chunk}, {"fixed_batch", opt.fixed_batch}, {"batch", opt.batch}, {"buffer", opt.buffer}, {"tiny_period_s", opt.fixed_batch > 0 ? opt.tiny_period : 0.f}, {"selection_strategy", opt.selection}, {"sched_ratio", opt.sched_ratio}, {"max_outstanding_jobs", opt.max_outstanding_jobs}, {"max_pass_duration_us", opt.max_pass_duration}, {"frames", frames}, {"max_samples", opt.max_samples}, {"run_s", opt.run_s}, {"rates", opt.rates}, {"rotate", opt.rotate}, {"rm_true_periods", opt.policy == "rm" && !opt.rm_tiny_periods}, {"deadline_classes", opt.deadline_classes}, {"frame_deadline", opt.frame_deadline}, {"elapsed_s", elapsed_s}, {"result", ok ? "ok" : (timed_out.load() ? "timeout" : "error")}, {"trace", trace_info}, {"chains", jchains}, {"analysis", analysis}, {"diagnostics", diagnostics}};
+        json meta = {{"app", "rx_latency4"}, {"run_dir", opt.run_dir}, {"input", opt.input}, {"out_dir", opt.out_dir}, {"policy", opt.policy}, {"policy_name", policy_name}, {"scheduler", sched_name}, {"threads", opt.single ? 1U : pool_threads}, {"worker_cpus", worker_cpus}, {"rt_prio", opt.rt_prio}, {"hw_threads", hw_threads}, {"rate", opt.rate}, {"chunk", opt.chunk}, {"fixed_batch", opt.fixed_batch}, {"batch", opt.batch}, {"buffer", opt.buffer}, {"tiny_period_s", opt.fixed_batch > 0 ? opt.tiny_period : 0.f}, {"selection_strategy", opt.selection}, {"sched_ratio", opt.sched_ratio}, {"max_outstanding_jobs", opt.max_outstanding_jobs}, {"max_pass_duration_us", opt.max_pass_duration}, {"frames", frames}, {"max_samples", opt.max_samples}, {"run_s", opt.run_s}, {"rates", opt.rates}, {"rotate", opt.rotate}, {"rm_true_periods", opt.policy == "rm" && !opt.rm_tiny_periods}, {"deadline_classes", opt.deadline_classes}, {"frame_deadline", opt.frame_deadline}, {"elapsed_s", elapsed_s}, {"result", ok ? "ok" : (timed_out.load() ? "timeout" : "error")}, {"trace", trace_info}, {"chains", jchains}, {"analysis", analysis}, {"diagnostics", diagnostics}};
         std::ofstream f(opt.out_dir + "/trace_meta.json");
         f << meta.dump(2) << "\n";
     }
