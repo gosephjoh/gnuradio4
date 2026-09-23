@@ -135,7 +135,7 @@ def m5(cell, out, log):
     return res
 
 
-M6_KINDS = ("sweep", "stateSync", "messagePhase", "houseKeeping", "releaseScan", "select", "selectEmpty", "workProbe", "zombieReap", "adopt")
+M6_KINDS = ("sweep", "stateSync", "messagePhase", "houseKeeping", "releaseScan", "select", "selectEmpty", "workProbe", "zombieReap", "adopt", "schedulerMessages", "removalCleanup", "blockMessages")
 M6_RATES = "1250000,1250000,2500000,5000000"
 M6_BATCH = 1024
 # A quarter of the fastest receiver's batch period, which is what the scheduler's own auto rule
@@ -230,7 +230,7 @@ def write_md(res, out):
             L.append(f"| {r['policy']} | {r['sched_ratio']} | " + " | ".join(cells) + f" | {sum(x['misses'] for x in e) if e else '-'} |\n")
         L.append("\nScheduler events per worker inside the window (rate, mean and p99 duration, share of the worker's time):\n\n| policy | ratio | event | per s | mean µs | p99 µs | busy % |\n|---|---|---|---|---|---|---|\n")
         for key, r in res["M6"].items():
-            for k in ("sweep", "stateSync", "messagePhase", "releaseScan", "workProbe"):
+            for k in ("sweep", "messagePhase", "stateSync", "schedulerMessages", "removalCleanup", "blockMessages", "releaseScan", "workProbe"):
                 v = r["kinds"].get(k)
                 if v:
                     L.append(f"| {r['policy']} | {r['sched_ratio']} | {k} | {v['per_s_per_worker']:.0f} | {v['mean_us']:.1f} | {v['p99_us']:.1f} | {100 * v['busy_share']:.1f} |\n")
@@ -263,12 +263,18 @@ below gives both for this run). A power of two is slightly cheaper (the counter 
 a modulo).
 
 The re-sync is what makes the ratio matter to EDF. `syncSchedStates()` assigns whole scheduling states, and
-under a policy that tracks releases the worker then rebuilds its release storage and discards every
-outstanding job — on every message phase, whether or not the graph changed (the source records this as a
-known defect). Under RR and RM the re-sync is a few microseconds; under EDF it is the storage rebuild. At the
-default ratio of 16 that rebuild recurs every 16 passes, which is the `stateSync` row above: its busy share is
-the share of the worker's life spent rebuilding state that did not change. At 4096 the same work recurs 256×
-less often and its busy share falls below one percent, which is why the sweeps compare policies at 4096.
+under a policy that tracks releases the worker then rebuilds its release storage — on every message phase.
+Until 2026-09-22 (`9126f2a`, `7af5453`) that rebuild flattened the whole graph and recomputed its adjacency
+each time, and discarded every outstanding job and last-release time, whether or not the graph had changed.
+Now the flattened graph and adjacency are cached per worker and rebuilt only when the scheduler's topology
+generation has moved (it is bumped whenever work quiescence is released, which every structural change
+takes), and the admitted jobs, last-release times and overrun counts are carried across a re-sync whose
+block list is pointer-identical and whose generation is unchanged. The re-sync still runs on every message
+phase; it is cheaper when nothing changed. Under RR and RM the re-sync is a few microseconds; under EDF it
+is the storage rebuild. At the default ratio of 16 that recurs every 16 passes, which is the `stateSync` row
+above (since `9126f2a` the marker covers the state rebuild alone; before, it ran to the end of the phase
+and read as nearly all of it). At 4096 the same work recurs 256× less often and its busy share falls below
+one percent, which is why the sweeps compare policies at 4096.
 
 ### Choosing and setting a value
 
