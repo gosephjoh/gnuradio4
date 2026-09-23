@@ -1545,6 +1545,14 @@ public:
     /// is left and terminate. A block with no connected input never reports ended -- it has no input
     /// stream to end.
     [[nodiscard]] bool inputStreamEnded() {
+        // End of stream is only ever a tag, so an input with nothing unread cannot have ended. Checked
+        // first because a release scan asks this of every idle block on every pass, and the full answer
+        // below builds several tag spans per port to find it.
+        bool anyUnreadTag = false;
+        for_each_port([&anyUnreadTag](PortLike auto& port) { anyUnreadTag = anyUnreadTag || (port.isConnected() && port.tagReader().available() > 0UZ); }, inputPorts<PortType::STREAM>(&self()));
+        if (!anyUnreadTag) {
+            return false;
+        }
         const auto position = getNextTagAndEosPosition();
         return position.asyncEoS || position.nextEosTag != std::numeric_limits<std::size_t>::max();
     }

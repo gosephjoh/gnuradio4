@@ -15,6 +15,7 @@
 #include <gnuradio-4.0/SchedulingAnalysis.hpp>
 #include <gnuradio-4.0/SchedulingPolicy.hpp>
 #include <gnuradio-4.0/testing/NullSources.hpp>
+#include <gnuradio-4.0/testing/TagMonitors.hpp>
 #include <gnuradio-4.0/thread/thread_pool.hpp>
 
 using namespace boost::ut;
@@ -1057,6 +1058,65 @@ std::size_t recordedRunsInOneStep(gr::Size_t bound, std::size_t chains, gr::sche
 }
 
 } // namespace
+
+const boost::ut::suite<"end-of-stream detection"> eosDetectionTests = [] {
+    // `inputStreamEnded()` first asks whether any input has an unread tag at all, because the release
+    // scan reaches it for every idle block on every pass and the full answer builds tag spans per port.
+    // End of stream is only ever a tag, so the shortcut must never change the answer -- these pin it.
+    "an end-of-stream tag pending behind no samples is detected"_test = [] {
+        // The case the check exists for: nothing left to read, so only the tag says the block must drain.
+        EndedChain chain{8U};
+        for (std::size_t i = 0UZ; i < 8UZ && chain.mid->availableInputSamples(true)[0UZ] > 0UZ; ++i) {
+            std::ignore = chain.mid->work(64UZ);
+        }
+        expect(eq(chain.mid->availableInputSamples(true)[0UZ], 0UZ) >> fatal) << "every sample consumed";
+        expect((chain.mid->state() == gr::lifecycle::State::RUNNING) >> fatal) << "and the end-of-stream tag not yet acted on";
+        expect(chain.mid->inputStreamEnded()) << "a pending end-of-stream tag with no samples before it must still read as ended";
+    };
+
+    "a pending tag that is not end-of-stream does not end the stream"_test = [] {
+        gr::Graph graph;
+        auto&     source = graph.emplaceBlock<gr::testing::TagSource<float, gr::testing::ProcessFunction::USE_PROCESS_BULK>>({{"n_samples_max", gr::Size_t{0U}}, {"verbose_console", false}});
+        source._tags     = {{2, gr::property_map({{"key", "value"}})}};
+        auto& copy       = graph.emplaceBlock<gr::testing::Copy<float>>();
+        auto& sink       = graph.emplaceBlock<gr::testing::NullSink<float>>();
+        expect(graph.connect<"out", "in">(source, copy).has_value());
+        expect(graph.connect<"out", "in">(copy, sink).has_value());
+        expect(graph.connectPendingEdges());
+
+        gr::BlockModel& srcModel = *graph.blocks()[0];
+        gr::BlockModel& midModel = *graph.blocks()[1];
+        activate(srcModel);
+        activate(midModel);
+        // `TagSource` stops each call at its next tag and publishes the tag on the call after, so one call
+        // is not enough -- and a test whose tag never arrived would pass whatever the check did.
+        for (std::size_t i = 0UZ; i < 4UZ; ++i) {
+            std::ignore = srcModel.work(8UZ);
+        }
+
+        expect(gt(copy.in.tagReader().available(), 0UZ) >> fatal) << "the tag must actually be waiting on the consumer's input";
+        expect(!midModel.inputStreamEnded()) << "an unread tag is a reason to look closer, not proof the stream ended";
+    };
+
+    "a stream that is still flowing has not ended"_test = [] {
+        gr::Graph graph;
+        auto&     source = graph.emplaceBlock<gr::testing::ConstantSource<float>>({{"n_samples_max", gr::Size_t{1024U}}});
+        auto&     copy   = graph.emplaceBlock<gr::testing::Copy<float>>();
+        auto&     sink   = graph.emplaceBlock<gr::testing::NullSink<float>>();
+        expect(graph.connect<"out", "in">(source, copy).has_value());
+        expect(graph.connect<"out", "in">(copy, sink).has_value());
+        expect(graph.connectPendingEdges());
+
+        gr::BlockModel& srcModel = *graph.blocks()[0];
+        gr::BlockModel& midModel = *graph.blocks()[1];
+        activate(srcModel);
+        activate(midModel);
+        std::ignore = srcModel.work(8UZ);
+
+        expect((srcModel.state() == gr::lifecycle::State::RUNNING) >> fatal) << "the source has more to give";
+        expect(!midModel.inputStreamEnded());
+    };
+};
 
 const boost::ut::suite<"dynamic selector error and bound"> selectorEdgeTests = [] {
     "a block reporting ERROR aborts the pass"_test = [] {

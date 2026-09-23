@@ -395,8 +395,9 @@ inline void releaseIfEligible(BlockModel& block, SchedState& state, std::chrono:
 
     // End of stream makes the batch floor unsatisfiable: no more data is coming, so waiting for it
     // is waiting for ever, and the block would never run, never report DONE and never let its worker
-    // conclude the graph had finished. Only checked when the gate is about to shut, so it costs
-    // nothing while data is flowing.
+    // conclude the graph had finished. Only checked when the gate is about to shut -- which for an idle
+    // block is every scan, so `inputStreamEnded()` answers from its tag readers' cursors alone unless a
+    // tag is actually waiting.
     //
     // Only with an empty ring: a shut gate can equally mean the samples are committed to outstanding
     // jobs rather than absent, and waiving then would commit them twice.
