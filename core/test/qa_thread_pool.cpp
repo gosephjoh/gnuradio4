@@ -1,7 +1,16 @@
 #include <boost/ut.hpp>
 
 #include <gnuradio-4.0/meta/UnitTestHelper.hpp>
+#include <gnuradio-4.0/meta/formatter.hpp>
 #include <gnuradio-4.0/thread/thread_pool.hpp>
+
+#include <algorithm>
+#include <chrono>
+#include <format>
+#include <latch>
+#include <mutex>
+#include <thread>
+#include <vector>
 
 const boost::ut::suite<"gr::thread_pool GR4 default"> defaultThreadPool = [] {
     using namespace boost::ut;
@@ -128,6 +137,42 @@ const boost::ut::suite<"gr::thread_pool GR4 default"> defaultThreadPool = [] {
         pool.setAffinityMask({true, false, false});
 
         expect(throws<gr::exception>([&] { pool.execute<"bad_affinity", 0, 1>([] { std::println("should not run"); }); }));
+    };
+
+    "ThreadPool: CPU affinity pins the pool's threads, not the caller"_test = [] {
+        using namespace gr::thread_pool;
+        if (std::thread::hardware_concurrency() < 2U) {
+            return;
+        }
+        const std::vector<bool> callerBefore = thread::getThreadAffinity();
+
+        BasicThreadPool pool("AffinityPins", TaskType::CPU_BOUND, 2U, 2U);
+        pool.waitUntilInitialised();
+        pool.setAffinityMask({true, true});
+
+        constexpr int                  kTasks = 8;
+        std::latch                     done(kTasks);
+        std::mutex                     seenMutex;
+        std::vector<std::vector<bool>> seen;
+        for (int i = 0; i < kTasks; i++) {
+            pool.execute([&] {
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                {
+                    std::scoped_lock lock(seenMutex);
+                    seen.push_back(thread::getThreadAffinity());
+                }
+                done.count_down();
+            });
+        }
+        done.wait();
+
+        expect(!seen.empty());
+        for (const std::vector<bool>& mask : seen) {
+            const auto enabled = std::ranges::count(mask, true);
+            expect(eq(enabled, 1L)) << std::format("a CPU_BOUND worker is pinned to exactly one CPU, got {{{}}}", gr::join(mask, ", "));
+            expect(mask.size() >= 2 && (mask[0] || mask[1])) << "the pinned CPU is one of the mask's";
+        }
+        expect(thread::getThreadAffinity() == callerBefore) << "setAffinityMask must not touch the calling thread";
     };
 
     "ThreadPool: exception propagation"_test = [] {

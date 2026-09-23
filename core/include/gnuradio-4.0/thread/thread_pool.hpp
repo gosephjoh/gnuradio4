@@ -513,11 +513,11 @@ private:
         thread::setThreadSchedulingParameter(_schedulingPolicy, _schedulingPriority, thread);
         if (!_affinityMask.empty()) {
             if (_taskType == TaskType::IO_BOUND) {
-                thread::setThreadAffinity(_affinityMask);
+                thread::setThreadAffinity(_affinityMask, thread);
                 return;
             }
             const std::vector<bool> affinityMask = distributeThreadAffinityAcrossCores(_affinityMask, threadID);
-            thread::setThreadAffinity(affinityMask);
+            thread::setThreadAffinity(affinityMask, thread);
         }
     }
 
