@@ -226,6 +226,75 @@ comparison EDF's fastest workers went from 17 % to about 20 % of their time in
 message phases while their passes halved in length. Read a change in
 `messagePhase` busy share next to the change in pass rate, never on its own.
 
+The isolated run of 2026-09-23 shows it plainly. At ratio 16 a message phase
+cost about the same under every policy: 6.5 µs for round robin, 6.9 µs for
+rate monotonic and 6.6 µs for EDF. The re-sync (`stateSync`) was about three
+quarters of it under all three, and release tracking added only about 0.5 µs
+to EDF's. Yet the phase took 13 % of an EDF worker against 4 % of a round-robin
+one, because EDF's 3.2 µs passes reach the sixteenth pass three times as often
+as round robin's 9.9 µs ones. Spread over the passes, every policy paid about
+0.4 µs each. So compare **the phase's mean duration** across policies, not its
+share.
+
+At ratio 4096 each phase cost 2–4 times as much (14–26 µs), probably because
+the caches were cold after 4096 passes of other work. Spread over the passes
+that cost is negligible. Each figure rests on only a few dozen to a few
+hundred phases per worker within the trace window, so treat it as rough.
+
+### Why passes end, and what that does to the ratio
+
+Each policy ends a pass in its own way:
+
+- **Round robin** calls `work()` once on every block on the worker, then
+  stops. It has no bound.
+- **Rate monotonic** walks the blocks in priority order and restarts from the
+  top after every call that did work. It stops at the end of the list, or
+  after `max_selections_per_pass` productive calls (four times the block
+  count when left at 0). The time budget of §7 does not apply to it.
+- **EDF** runs released jobs until none are left, or until the count bound or
+  the time budget is hit.
+
+On this workload almost no pass is cut short. Fewer than one call in 30 does
+any work under round robin or rate monotonic: a pass averaged 0.4–0.5
+productive calls, against a count bound of 72. At least 99.97 % of EDF's
+passes ended with no job left to run, so at most 0.03 % can have been stopped
+by the time budget. **The message phase's frequency is set by how long an idle
+pass takes, not by the bounds:** an idle pass under round robin is 18
+unproductive calls, under rate monotonic about 21 (the restart adds the rest),
+and under EDF a release scan and an empty selection. Changing the budget or
+the count bound will not change how often the message phase runs; counting
+passes in time, or counting only productive ones, would.
+
+To tell the pass-exit reasons apart:
+
+- `selectEmpty` marks a pass that ran out of jobs. EDF alone emits it.
+- `selectionBoundHit` marks a pass stopped by a bound. The flag
+  `kBoundWasTime` distinguishes the time budget from the count bound, and
+  then `payload0` holds microseconds rather than selections.
+- The driver does not count `selectionBoundHit` (it is not in `M6_KINDS` in
+  `scripts/rt-microbench4`). Until it does, bound the EDF figure as passes
+  minus `selectEmpty` records. Round robin and rate monotonic emit neither
+  `select` nor `selectEmpty`, so their split needs `selectionBoundHit`
+  counted.
+- The per-block `calls`, `probe_calls` and `zero_work_calls` in each
+  `batch_rt.json` give the content of a pass. Under round robin they must add
+  up to the block count per pass, which is a useful check.
+
+### Most of EDF's selections are the throttle's
+
+The throttles declare a 1 µs period so that they are always the most urgent
+job (§7). A throttle therefore holds a released job on almost every pass, is
+selected, and returns `INSUFFICIENT_*` until its own clock lets it publish. In
+the isolated run, 0.60 of EDF's 0.74 selections per pass were such probes, all
+of them throttles. The chain 0 throttle, for example, ran productively 1 220
+times a second and was selected about 214 000 times.
+
+These probes are cheap, and they are what the design intends. But they mean
+EDF's `select` rate overstates the work it did by about five times. They also
+mean the four workers are not alike: the two that hold throttles select
+about once per pass or more, and the other two far less often. A per-worker mean hides
+that difference.
+
 ### Markers see only what they bracket
 
 Every row in `MICRO.md` comes from a trace marker, and a cost outside every
