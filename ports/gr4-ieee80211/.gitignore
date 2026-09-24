@@ -10,4 +10,5 @@ rtrun4.log
 trace_*.csv
 trace_header.json
 batch_rt.csv
+pacer.csv
 __pycache__/
