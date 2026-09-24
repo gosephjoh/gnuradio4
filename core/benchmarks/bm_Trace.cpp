@@ -172,10 +172,9 @@ int main() {
     setCategories(0U);
     const double disabled = nanosPerOp([](std::uint32_t i) { emit(Event{.payload0 = i, .kind = Kind::workEnd}); });
 
-    // The cost *when inlined*, which the constructor now forces at every call site. This row documents
-    // the target; it cannot guard it, because inlining is decided per call site and this small loop
-    // would be inlined either way. The scheduler comparison below, compiled in against compiled out,
-    // is the guard.
+    // The cost *when inlined*, which the constructor forces at every call site. This row documents the
+    // target; it cannot guard it, because inlining is decided per call site and this small loop would
+    // be inlined either way. The `qa_TraceScopeInlined` check guards it, on the test binary's symbols.
     const double scopeDisabled = nanosPerOp([](std::uint32_t i) {
         Scope scope{Event{.payload0 = i, .kind = Kind::workEnd}};
         (void)scope;
