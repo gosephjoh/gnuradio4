@@ -6,6 +6,8 @@
  *
  *   file_source(input) -> [throttle(rate, chunk)] -> wifi rx chain -> latency_sink
  *                                   \-> arrival_stamper
+ *   with feed = pacer (Pacer.hpp writes from outside the graph):
+ *   entry(Copy) -> wifi rx chain -> latency_sink
  *   with --record: decode_mac -> pdu_recorder, frame_equalizer.symbols -> symbols_recorder
  *
  * The rx chain is GR3's wifi_phy_rx block for block (src/phy/wifi_phy_rx.cc
@@ -22,6 +24,7 @@
 
 #include "harness_blocks.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -86,6 +89,18 @@ struct ChainConfig {
     // blocks their true period N/rate so RM ranks receivers by rate; EDF keeps
     // the tiny period (its gate would otherwise forbid catching up).
     bool        rm_true_periods = false;
+    // Where the stimulus comes from.  throttle: the file source and throttle
+    // above, with the arrival stamper.  pacer: an entry block whose input the
+    // pacer writes from outside the graph (Pacer.hpp); no source, throttle or
+    // stamper in the graph, and the entry block takes the pre-gate blocks'
+    // period and deadline.
+    enum class Feed { throttle, pacer };
+    Feed        feed = Feed::throttle;
+    // Declare every `period` as exactly 0 (no temporal gate) instead of
+    // `tiny_period`: EDF in pacer mode, where every block also carries an
+    // explicit deadline.  An explicit 0 is kept, not derived from the rates
+    // (qa_SchedulingAnalysis pins that).
+    bool        zero_period = false;
 };
 
 struct ChainCounters {
@@ -106,7 +121,8 @@ struct ChainCounters {
 };
 
 struct ChainBlocks {
-    ArrivalStamper*  stamper = nullptr;
+    ArrivalStamper*  stamper = nullptr; // throttle mode only
+    gr::PortIn<cf>*  feed_in = nullptr; // pacer mode only: the entry block's input, for the pacer
     LatencySink*     sink    = nullptr;
     PduRecorder*     pdu     = nullptr; // record only
     SymbolsRecorder* sym     = nullptr; // record only
@@ -118,5 +134,10 @@ struct ChainBlocks {
 };
 
 ChainBlocks buildChain(gr::Graph& graph, const ChainConfig& cfg);
+
+// Zeros appended after the replayed samples in fixed-batch mode, before rounding up to a multiple of N:
+// the fixed-N calls need whole batches to push the last frame through (FileSourceRaw.hpp explains).
+// The file source and the pacer both pad by it, so the two replays stay sample for sample alike.
+[[nodiscard]] constexpr uint64_t fixedBatchFlushTail(unsigned fixedBatch) noexcept { return std::max<uint64_t>(3ULL * fixedBatch, 2560ULL); }
 
 } // namespace gr4wifi

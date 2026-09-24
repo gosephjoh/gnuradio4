@@ -28,6 +28,16 @@
  *                           beside it maps GR4's block names to our roles
  *   --sched-ratio N, --selection scan|heap, --max-outstanding-jobs N
  *                           the scheduler settings 0036 names
+ *
+ * --feed pacer replaces the file source, throttle and arrival stamper with a
+ * thread outside the scheduler (Pacer.hpp) that writes each chunk into the
+ * receiver's entry block at its nominal instant and logs when it did:
+ *
+ *   pacer thread --> entry(Copy) -> wifi rx chain -> latency_sink
+ *
+ * latency.csv's arrival stamps are then the pacer's write instants, pacer.csv
+ * holds every chunk's nominal and actual write time, and the sink stamps a
+ * decoded packet at the end of the call that delivered it.
  */
 #include <gnuradio-4.0/Graph.hpp>
 #include <gnuradio-4.0/Scheduler.hpp>
@@ -37,6 +47,7 @@
 #include <gnuradio-4.0/TraceFile.hpp>
 #include <gnuradio-4.0/thread/thread_pool.hpp>
 
+#include "gr4ieee80211/Pacer.hpp"
 #include "gr4ieee80211/chain.hpp"
 
 #include <nlohmann/json.hpp>
@@ -99,6 +110,11 @@ struct Options {
     bool        rm_tiny_periods = false; // RM: keep the tiny periods (default: true per-receiver periods N/rate)
     std::vector<unsigned> cpus;          // pin worker k to cpus[k]; empty = no pinning
     int         rt_prio = 0;             // SCHED_FIFO priority of the workers; 0 = SCHED_OTHER
+    std::string feed = "throttle";       // throttle | pacer
+    int         pacer_cpu = -1;          // pin the pacer thread; -1 = anywhere
+    int         pacer_prio = 0;          // SCHED_FIFO priority of the pacer; 0 = SCHED_OTHER
+    unsigned    pacer_spin_us = 60;      // sleep until this long before a chunk is due, then spin
+    unsigned    pacer_delay_ms = 500;    // from the scheduler running to the first chunk's clock
 };
 
 // "4-7" or "4,5,6" -> {4,5,6,7}; empty on a malformed list
@@ -194,7 +210,15 @@ void usage() {
         "  --cpus LIST         pin worker k to the k-th CPU of LIST (\"4-7\" or \"4,5,6\"); LIST must hold at least\n"
         "                      --threads CPUs; one worker per CPU, never two\n"
         "  --rt-prio N         run the workers under SCHED_FIFO at priority N (needs an rtprio limit >= N or root);\n"
-        "                      keep N below the kernel's irq/* and rcuc/* threads (50) unless you mean to outrank them");
+        "                      keep N below the kernel's irq/* and rcuc/* threads (50) unless you mean to outrank them\n"
+        "input:\n"
+        "  --feed F            throttle (default): file source -> throttle in the graph, arrival stamper beside it;\n"
+        "                      pacer: a thread outside the scheduler writes each chunk into an entry block at its\n"
+        "                      nominal instant (Pacer.hpp); pacer.csv logs every write; under EDF every period is 0\n"
+        "  --pacer-cpu C       pin the pacer thread to CPU C (a housekeeping CPU, not one of --cpus)\n"
+        "  --pacer-prio N      run the pacer under SCHED_FIFO at priority N (default SCHED_OTHER)\n"
+        "  --pacer-spin-us U   sleep until U us before a chunk is due, then spin (default 60)\n"
+        "  --pacer-delay-ms M  wait M ms after the scheduler starts before the first chunk's clock (default 500)");
 }
 
 double percentile(const std::vector<double>& sorted, double q) {
@@ -210,7 +234,7 @@ double percentile(const std::vector<double>& sorted, double q) {
 
 int main(int argc, char** argv) {
     Options opt;
-    static const struct option kOpts[] = {{"run-dir", required_argument, nullptr, 1}, {"input", required_argument, nullptr, 2}, {"out-dir", required_argument, nullptr, 3}, {"rate", required_argument, nullptr, 4}, {"chunk", required_argument, nullptr, 5}, {"chains", required_argument, nullptr, 6}, {"deadline-ms", required_argument, nullptr, 7}, {"timeout-s", required_argument, nullptr, 8}, {"record", no_argument, nullptr, 9}, {"no-check", no_argument, nullptr, 10}, {"buffer", required_argument, nullptr, 11}, {"catch-up", no_argument, nullptr, 12}, {"single", no_argument, nullptr, 13}, {"threads", required_argument, nullptr, 14}, {"batch", required_argument, nullptr, 15}, {"policy", required_argument, nullptr, 16}, {"fixed-batch", required_argument, nullptr, 17}, {"tiny-period", required_argument, nullptr, 18}, {"trace-categories", required_argument, nullptr, 19}, {"trace-buffer", required_argument, nullptr, 20}, {"trace-limit-mb", required_argument, nullptr, 21}, {"trace-out", required_argument, nullptr, 22}, {"sched-ratio", required_argument, nullptr, 23}, {"selection", required_argument, nullptr, 24}, {"max-outstanding-jobs", required_argument, nullptr, 25}, {"max-samples", required_argument, nullptr, 26}, {"deadline-classes", required_argument, nullptr, 27}, {"frame-deadline", required_argument, nullptr, 28}, {"max-selections", required_argument, nullptr, 29}, {"rates", required_argument, nullptr, 30}, {"run-s", required_argument, nullptr, 31}, {"rotate", required_argument, nullptr, 32}, {"rm-tiny-periods", no_argument, nullptr, 33}, {"max-pass-duration", required_argument, nullptr, 34}, {"cpus", required_argument, nullptr, 35}, {"rt-prio", required_argument, nullptr, 36}, {"help", no_argument, nullptr, 'h'}, {nullptr, 0, nullptr, 0}};
+    static const struct option kOpts[] = {{"run-dir", required_argument, nullptr, 1}, {"input", required_argument, nullptr, 2}, {"out-dir", required_argument, nullptr, 3}, {"rate", required_argument, nullptr, 4}, {"chunk", required_argument, nullptr, 5}, {"chains", required_argument, nullptr, 6}, {"deadline-ms", required_argument, nullptr, 7}, {"timeout-s", required_argument, nullptr, 8}, {"record", no_argument, nullptr, 9}, {"no-check", no_argument, nullptr, 10}, {"buffer", required_argument, nullptr, 11}, {"catch-up", no_argument, nullptr, 12}, {"single", no_argument, nullptr, 13}, {"threads", required_argument, nullptr, 14}, {"batch", required_argument, nullptr, 15}, {"policy", required_argument, nullptr, 16}, {"fixed-batch", required_argument, nullptr, 17}, {"tiny-period", required_argument, nullptr, 18}, {"trace-categories", required_argument, nullptr, 19}, {"trace-buffer", required_argument, nullptr, 20}, {"trace-limit-mb", required_argument, nullptr, 21}, {"trace-out", required_argument, nullptr, 22}, {"sched-ratio", required_argument, nullptr, 23}, {"selection", required_argument, nullptr, 24}, {"max-outstanding-jobs", required_argument, nullptr, 25}, {"max-samples", required_argument, nullptr, 26}, {"deadline-classes", required_argument, nullptr, 27}, {"frame-deadline", required_argument, nullptr, 28}, {"max-selections", required_argument, nullptr, 29}, {"rates", required_argument, nullptr, 30}, {"run-s", required_argument, nullptr, 31}, {"rotate", required_argument, nullptr, 32}, {"rm-tiny-periods", no_argument, nullptr, 33}, {"max-pass-duration", required_argument, nullptr, 34}, {"cpus", required_argument, nullptr, 35}, {"rt-prio", required_argument, nullptr, 36}, {"feed", required_argument, nullptr, 37}, {"pacer-cpu", required_argument, nullptr, 38}, {"pacer-prio", required_argument, nullptr, 39}, {"pacer-spin-us", required_argument, nullptr, 40}, {"pacer-delay-ms", required_argument, nullptr, 41}, {"help", no_argument, nullptr, 'h'}, {nullptr, 0, nullptr, 0}};
     int c;
     while ((c = getopt_long(argc, argv, "h", kOpts, nullptr)) != -1) {
         switch (c) {
@@ -250,6 +274,11 @@ int main(int argc, char** argv) {
         case 34: opt.max_pass_duration = static_cast<unsigned>(std::strtoul(optarg, nullptr, 10)); break;
         case 35: opt.cpus = parseCpuList(optarg); if (opt.cpus.empty()) { std::println(stderr, "rx_latency4: --cpus: bad list {}", optarg); return 2; } break;
         case 36: opt.rt_prio = std::atoi(optarg); break;
+        case 37: opt.feed = optarg; break;
+        case 38: opt.pacer_cpu = std::atoi(optarg); break;
+        case 39: opt.pacer_prio = std::atoi(optarg); break;
+        case 40: opt.pacer_spin_us = static_cast<unsigned>(std::strtoul(optarg, nullptr, 10)); break;
+        case 41: opt.pacer_delay_ms = static_cast<unsigned>(std::strtoul(optarg, nullptr, 10)); break;
         default: usage(); return 2;
         }
     }
@@ -260,6 +289,34 @@ int main(int argc, char** argv) {
     if (opt.policy != "rr" && opt.policy != "edf" && opt.policy != "rm") {
         std::println(stderr, "rx_latency4: --policy must be rr, edf or rm");
         return 2;
+    }
+    if (opt.feed != "throttle" && opt.feed != "pacer") {
+        std::println(stderr, "rx_latency4: --feed must be throttle or pacer");
+        return 2;
+    }
+    const bool pacing = opt.feed == "pacer";
+    if (pacing && opt.rate <= 0) {
+        std::println(stderr, "rx_latency4: --feed pacer needs a rate (--rate > 0): the pacer is the clock");
+        return 2;
+    }
+    if (pacing && opt.pacer_cpu >= 0 && std::ranges::find(opt.cpus, static_cast<unsigned>(opt.pacer_cpu)) != opt.cpus.end()) {
+        std::println(stderr, "rx_latency4: --pacer-cpu {} is one of the workers' --cpus; give the pacer a CPU of its own", opt.pacer_cpu);
+        return 2;
+    }
+    if (pacing && opt.pacer_cpu >= static_cast<int>(std::thread::hardware_concurrency())) {
+        std::println(stderr, "rx_latency4: --pacer-cpu {} is not one of the {} CPUs", opt.pacer_cpu, std::thread::hardware_concurrency());
+        return 2;
+    }
+    if (pacing && opt.pacer_prio != 0) {
+        if (opt.pacer_prio < sched_get_priority_min(SCHED_FIFO) || opt.pacer_prio > sched_get_priority_max(SCHED_FIFO)) {
+            std::println(stderr, "rx_latency4: --pacer-prio must be in [{}, {}]", sched_get_priority_min(SCHED_FIFO), sched_get_priority_max(SCHED_FIFO));
+            return 2;
+        }
+        struct rlimit rl {};
+        if (geteuid() != 0 && (getrlimit(RLIMIT_RTPRIO, &rl) != 0 || (rl.rlim_cur != RLIM_INFINITY && static_cast<int>(rl.rlim_cur) < opt.pacer_prio))) {
+            std::println(stderr, "rx_latency4: --pacer-prio {}: the rtprio limit is too low (ulimit -r); raise it or run as root", opt.pacer_prio);
+            return 2;
+        }
     }
     if (opt.selection != "heap" && opt.selection != "scan") {
         std::println(stderr, "rx_latency4: --selection must be heap or scan");
@@ -417,6 +474,23 @@ int main(int argc, char** argv) {
             chain_frames[k] = std::min(n, frames);
         }
     }
+    // Declared before the scheduler, so it is destroyed after it: its ports own the entry buffers'
+    // writer side, and the pacer thread must be joined before anything it writes into goes away.
+    std::unique_ptr<Pacer> pacer;
+    if (pacing) {
+        pacer = std::make_unique<Pacer>(PacerSettings{.chunk         = opt.chunk,
+                                                      .padToMultiple = opt.fixed_batch,
+                                                      .padMinTail    = opt.fixed_batch > 0 ? fixedBatchFlushTail(opt.fixed_batch) : 0ULL,
+                                                      .buffer        = opt.buffer > 0 ? opt.buffer : 65536UZ,
+                                                      .cpu           = opt.pacer_cpu,
+                                                      .fifoPriority  = opt.pacer_prio,
+                                                      .spinNs        = static_cast<uint64_t>(opt.pacer_spin_us) * 1000ULL,
+                                                      .startDelayNs  = static_cast<uint64_t>(opt.pacer_delay_ms) * 1'000'000ULL});
+        if (auto opened = pacer->open(opt.input); !opened) {
+            std::println(stderr, "rx_latency4: pacer: {}", opened.error());
+            return 2;
+        }
+    }
     gr::Graph                 graph;
     std::vector<ChainBlocks> chains;
     for (int k = 0; k < opt.chains; k++) {
@@ -441,10 +515,21 @@ int main(int argc, char** argv) {
         cfg.rotate          = opt.rotate;
         cfg.chain_index     = static_cast<unsigned>(k);
         cfg.rm_true_periods = opt.policy == "rm" && !opt.rm_tiny_periods;
+        cfg.feed            = pacing ? ChainConfig::Feed::pacer : ChainConfig::Feed::throttle;
+        cfg.zero_period     = pacing && opt.policy == "edf"; // every pacer-mode block carries an explicit deadline
         ChainBlocks cb  = buildChain(graph, cfg);
         const std::size_t fk = chain_frames[static_cast<std::size_t>(k)];
-        cb.stamper->setFrames(std::vector<uint64_t>(first.begin(), first.begin() + static_cast<std::ptrdiff_t>(fk)), std::vector<uint64_t>(last.begin(), last.begin() + static_cast<std::ptrdiff_t>(fk)));
+        if (pacing) {
+            PacerStream& stream = pacer->addStream(chain_rate[static_cast<std::size_t>(k)], chain_max[static_cast<std::size_t>(k)]);
+            if (auto connected = stream.out.connect(*cb.feed_in); !connected) {
+                std::println(stderr, "rx_latency4: pacer: cannot connect receiver {}'s entry block: {}", k, connected.error().message);
+                return 2;
+            }
+        } else {
+            cb.stamper->setFrames(std::vector<uint64_t>(first.begin(), first.begin() + static_cast<std::ptrdiff_t>(fk)), std::vector<uint64_t>(last.begin(), last.begin() + static_cast<std::ptrdiff_t>(fk)));
+        }
         cb.sink->setFrames(fk);
+        cb.sink->_stamp_at_call_end = pacing;
         cb.sink->_order_mode = order_mode;
         if (opt.check) {
             for (std::size_t i = 0; i < fk; i++) {
@@ -477,6 +562,10 @@ int main(int argc, char** argv) {
     }
     if (opt.trace_limit_mb > 0) {
         gr::trace::setRingCapacityLimitBytes(opt.trace_limit_mb * 1024UZ * 1024UZ);
+    }
+    if (pacer) {
+        pacer->prefault();
+        std::println(stderr, "rx_latency4: pacer on CPU {}{}, spin {} us, first chunk {} ms after the scheduler starts", opt.pacer_cpu >= 0 ? std::to_string(opt.pacer_cpu) : std::string("any"), opt.pacer_prio ? std::format(", SCHED_FIFO {}", opt.pacer_prio) : std::string(", SCHED_OTHER"), opt.pacer_spin_us, opt.pacer_delay_ms);
     }
 
     std::atomic<bool> timed_out{false}, finished{false};
@@ -522,11 +611,19 @@ int main(int argc, char** argv) {
                 sched.requestStop();
             }
         });
+        if (pacer) {
+            pacer->start([&sched] { return sched.state() == gr::lifecycle::State::RUNNING; });
+        }
         const auto t0 = std::chrono::steady_clock::now();
         ok            = sched.runAndWait().has_value() && !timed_out.load();
         elapsed_s     = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         finished      = true;
         watchdog.join();
+        if (pacer) {
+            pacer->stop(); // already done unless the run ended early
+            if (!pacer->error().empty()) { std::println(stderr, "rx_latency4: pacer: {}", pacer->error()); }
+            ok = ok && pacer->finished();
+        }
         // what GR4 derived per block (RT reference 6.6): period, deadline,
         // priority, batch floor/ceiling and where each came from.  Derived in
         // init(), which runAndWait() enters, so it is read after the run.
@@ -588,7 +685,9 @@ int main(int argc, char** argv) {
         std::println(stderr, "rx_latency4: cannot open {}", csv_path);
         return 1;
     }
-    std::fprintf(csv, "chain,seq,length,t_first_ns,t_last_ns,t_decode_ns,lat_first_us,lat_last_us,decoded,correct\n");
+    // pacer mode: a frame's arrival is the write of the chunk holding its sample, and the nominal
+    // columns measure from the instant that chunk was due -- their difference is the pacer's own error
+    std::fprintf(csv, "chain,seq,length,t_first_ns,t_last_ns,t_decode_ns,lat_first_us,lat_last_us,decoded,correct,t_last_nominal_ns,lat_last_nominal_us\n");
     json per_chain = json::array();
     uint64_t decoded_total = 0, missing_total = 0, misses_total = 0, wrong_total = 0;
     const double deadline_us = opt.deadline_ms * 1000.0;
@@ -599,8 +698,12 @@ int main(int argc, char** argv) {
         json                missing = json::array(), wrong = json::array();
         uint64_t            missing_n = 0, misses = 0, unstamped = 0;
         double              first_us = std::nan("");
+        const PacerStream*  stream   = pacer ? &pacer->streams()[k] : nullptr;
         for (std::size_t i = 0; i < frames_k; i++) {
-            const uint64_t tf = cb.stamper->_t_first[i], tl = cb.stamper->_t_last[i], td = cb.sink->_t_decode[i];
+            const uint64_t tf = stream ? stream->log[stream->chunkOf(first[i])].writtenNs : cb.stamper->_t_first[i];
+            const uint64_t tl = stream ? stream->log[stream->chunkOf(last[i])].writtenNs : cb.stamper->_t_last[i];
+            const uint64_t tn = stream ? stream->nominalNs(stream->chunkOf(last[i])) : 0;
+            const uint64_t td = cb.sink->_t_decode[i];
             if (tf == 0 || tl == 0) {
                 ++unstamped;
             }
@@ -609,7 +712,7 @@ int main(int argc, char** argv) {
                 if (missing.size() < 50) {
                     missing.push_back(i);
                 }
-                std::fprintf(csv, "%zu,%zu,%u,%llu,%llu,,,,0,\n", k, i, lengths[i], static_cast<unsigned long long>(tf), static_cast<unsigned long long>(tl));
+                std::fprintf(csv, "%zu,%zu,%u,%llu,%llu,,,,0,,%s,\n", k, i, lengths[i], static_cast<unsigned long long>(tf), static_cast<unsigned long long>(tl), tn ? std::to_string(tn).c_str() : "");
                 continue;
             }
             const double lf = (static_cast<double>(td) - static_cast<double>(tf)) / 1e3;
@@ -625,13 +728,34 @@ int main(int argc, char** argv) {
             if (opt.check && !correct && wrong.size() < 50) {
                 wrong.push_back(i);
             }
-            std::fprintf(csv, "%zu,%zu,%u,%llu,%llu,%llu,%.3f,%.3f,1,%s\n", k, i, lengths[i], static_cast<unsigned long long>(tf), static_cast<unsigned long long>(tl), static_cast<unsigned long long>(td), lf, ll, correct < 0 ? "" : (correct ? "1" : "0"));
+            const std::string nominal = tn ? std::format("{},{:.3f}", tn, (static_cast<double>(td) - static_cast<double>(tn)) / 1e3) : std::string(",");
+            std::fprintf(csv, "%zu,%zu,%u,%llu,%llu,%llu,%.3f,%.3f,1,%s,%s\n", k, i, lengths[i], static_cast<unsigned long long>(tf), static_cast<unsigned long long>(tl), static_cast<unsigned long long>(td), lf, ll, correct < 0 ? "" : (correct ? "1" : "0"), nominal.c_str());
         }
         std::sort(lat.begin(), lat.end());
         const double p50 = percentile(lat, 0.50), p95 = percentile(lat, 0.95), p99 = percentile(lat, 0.99);
         const double mx = lat.empty() ? std::nan("") : lat.back(), mn = lat.empty() ? std::nan("") : lat.front();
         const ChainCounters cc = cb.counters();
-        json s = {{"chain", k}, {"frames", frames_k}, {"rate", chain_rate[k]}, {"max_samples", chain_max[k]}, {"decoded", cb.sink->_count}, {"missing", missing_n}, {"missing_seqs", missing}, {"duplicates", cb.sink->_duplicates}, {"unpairable", cb.sink->_unpairable}, {"wrong_payload", opt.check ? json(cb.sink->_wrong_payload) : json(nullptr)}, {"wrong_seqs", wrong}, {"unstamped", unstamped}, {"samples_seen", cb.stamper->_items}, {"first_us", first_us}, {"min_us", mn}, {"p50_us", p50}, {"p95_us", p95}, {"p99_us", p99}, {"max_us", mx}, {"deadline_misses", misses}, {"counts", {{"sync_short_detections", cc.sync_short_detections}, {"sync_long_frames", cc.sync_long_frames}, {"signal_ok", cc.signal_ok}, {"signal_bad", cc.signal_bad}, {"frames_started", cc.frames_started}, {"frames_decoded", cc.frames_decoded}, {"crc_failed", cc.crc_failed}, {"too_large", cc.too_large}, {"sl_neg_tags", cc.sl_neg_tags}, {"sl_far_tags", cc.sl_far_tags}, {"sl_tags_seen", cc.sl_tags_seen}, {"sl_max_copy_run", cc.sl_max_copy_run}, {"sl_short_calls", cc.sl_short_calls}, {"fft_tags_in", cc.fft_tags_in}, {"fft_tags_out", cc.fft_tags_out}, {"eq_tags_in", cc.eq_tags_in}, {"src_calls", cc.src_calls}, {"src_max_read_us", cc.src_max_read_ns / 1e3}, {"src_mean_read_us", cc.src_calls ? cc.src_sum_read_ns / 1e3 / cc.src_calls : 0.0}, {"src_max_read_items", cc.src_max_read_items}, {"thr_calls", cc.thr_calls}, {"thr_max_gap_us", cc.thr_max_gap_ns / 1e3}, {"thr_mean_gap_us", cc.thr_calls ? cc.thr_sum_gap_ns / 1e3 / cc.thr_calls : 0.0}, {"thr_max_backlog_samples", cc.thr_max_backlog}, {"stamper_reentry", cc.stamper_reentry}}}};
+        json pacer_k = nullptr;
+        uint64_t samples_seen = cb.stamper ? cb.stamper->_items : 0;
+        if (stream) {
+            // write lag: how late each chunk was written after it was due; above ten batch periods at p95
+            // the pipeline did not keep up (the saturation criterion the throttle's lag used to carry)
+            std::vector<double> lag;
+            uint64_t            retries = 0, written = 0;
+            for (const PacerStream::Chunk& chunk : stream->log) {
+                retries += chunk.retries;
+                if (chunk.writtenNs == 0) { continue; }
+                ++written;
+                lag.push_back((static_cast<double>(chunk.writtenNs) - static_cast<double>(stream->t0Ns + chunk.dueNs)) / 1e3);
+            }
+            std::sort(lag.begin(), lag.end());
+            samples_seen                 = std::min<uint64_t>(stream->total, written * stream->chunk);
+            const double period_us       = static_cast<double>(stream->chunk) / stream->rate * 1e6;
+            pacer_k = {{"chunks", stream->log.size()}, {"written", written}, {"samples_from_file", stream->fromFile}, {"samples_total", stream->total}, {"retries", retries}, {"period_us", period_us},
+                {"write_lag_us", {{"p50", percentile(lag, 0.50)}, {"p95", percentile(lag, 0.95)}, {"p99", percentile(lag, 0.99)}, {"p999", percentile(lag, 0.999)}, {"max", lag.empty() ? std::nan("") : lag.back()}}},
+                {"saturated", !lag.empty() && percentile(lag, 0.95) > 10.0 * period_us}};
+        }
+        json s = {{"chain", k}, {"frames", frames_k}, {"rate", chain_rate[k]}, {"max_samples", chain_max[k]}, {"decoded", cb.sink->_count}, {"missing", missing_n}, {"missing_seqs", missing}, {"duplicates", cb.sink->_duplicates}, {"unpairable", cb.sink->_unpairable}, {"wrong_payload", opt.check ? json(cb.sink->_wrong_payload) : json(nullptr)}, {"wrong_seqs", wrong}, {"unstamped", unstamped}, {"samples_seen", samples_seen}, {"pacer", pacer_k}, {"first_us", first_us}, {"min_us", mn}, {"p50_us", p50}, {"p95_us", p95}, {"p99_us", p99}, {"max_us", mx}, {"deadline_misses", misses}, {"counts", {{"sync_short_detections", cc.sync_short_detections}, {"sync_long_frames", cc.sync_long_frames}, {"signal_ok", cc.signal_ok}, {"signal_bad", cc.signal_bad}, {"frames_started", cc.frames_started}, {"frames_decoded", cc.frames_decoded}, {"crc_failed", cc.crc_failed}, {"too_large", cc.too_large}, {"sl_neg_tags", cc.sl_neg_tags}, {"sl_far_tags", cc.sl_far_tags}, {"sl_tags_seen", cc.sl_tags_seen}, {"sl_max_copy_run", cc.sl_max_copy_run}, {"sl_short_calls", cc.sl_short_calls}, {"fft_tags_in", cc.fft_tags_in}, {"fft_tags_out", cc.fft_tags_out}, {"eq_tags_in", cc.eq_tags_in}, {"src_calls", cc.src_calls}, {"src_max_read_us", cc.src_max_read_ns / 1e3}, {"src_mean_read_us", cc.src_calls ? cc.src_sum_read_ns / 1e3 / cc.src_calls : 0.0}, {"src_max_read_items", cc.src_max_read_items}, {"thr_calls", cc.thr_calls}, {"thr_max_gap_us", cc.thr_max_gap_ns / 1e3}, {"thr_mean_gap_us", cc.thr_calls ? cc.thr_sum_gap_ns / 1e3 / cc.thr_calls : 0.0}, {"thr_max_backlog_samples", cc.thr_max_backlog}, {"stamper_reentry", cc.stamper_reentry}}}};
         per_chain.push_back(s);
         decoded_total += cb.sink->_count;
         missing_total += missing_n;
@@ -640,9 +764,25 @@ int main(int argc, char** argv) {
         std::println(stderr, "rx_latency4: chain {} -- {}/{} decoded, {} missing, {} dup, {} unpairable, {} wrong payload; last->decode us: first {:.1f} p50 {:.1f} p95 {:.1f} p99 {:.1f} max {:.1f}; {} over {} ms; sync_short {} sync_long {} signal ok/bad {}/{} crc failed {}", k, cb.sink->_count, frames, missing_n, cb.sink->_duplicates, cb.sink->_unpairable, cb.sink->_wrong_payload, first_us, p50, p95, p99, mx, misses, opt.deadline_ms, cc.sync_short_detections, cc.sync_long_frames, cc.signal_ok, cc.signal_bad, cc.crc_failed);
     }
     std::fclose(csv);
+    if (pacer) {
+        const std::string pacer_path = opt.out_dir + "/pacer.csv";
+        if (std::FILE* pf = std::fopen(pacer_path.c_str(), "w")) {
+            std::fprintf(pf, "chain,chunk,first_sample,samples,nominal_ns,written_ns,retries\n");
+            for (std::size_t k = 0; k < pacer->streams().size(); ++k) {
+                const PacerStream& st = pacer->streams()[k];
+                for (std::size_t j = 0; j < st.log.size(); ++j) {
+                    const uint64_t first_sample = static_cast<uint64_t>(j) * st.chunk;
+                    std::fprintf(pf, "%zu,%zu,%llu,%llu,%llu,%llu,%u\n", k, j, static_cast<unsigned long long>(first_sample), static_cast<unsigned long long>(std::min<uint64_t>(st.chunk, st.total - first_sample)), static_cast<unsigned long long>(st.nominalNs(j)), static_cast<unsigned long long>(st.log[j].writtenNs), st.log[j].retries);
+                }
+            }
+            std::fclose(pf);
+        } else {
+            std::println(stderr, "rx_latency4: cannot open {}", pacer_path);
+        }
+    }
 
     const std::vector<unsigned> worker_cpus(opt.cpus.begin(), opt.cpus.begin() + static_cast<std::ptrdiff_t>(std::min<std::size_t>(opt.cpus.size(), opt.threads)));
-    json summary = {{"app", "rx_latency4"}, {"runtime", "gnuradio4"}, {"scheduler", sched_name}, {"policy", opt.policy}, {"policy_name", policy_name}, {"fixed_batch", opt.fixed_batch}, {"tiny_period_s", opt.fixed_batch > 0 ? opt.tiny_period : 0.f}, {"selection_strategy", opt.selection}, {"sched_ratio", opt.sched_ratio}, {"max_outstanding_jobs", opt.max_outstanding_jobs}, {"max_selections_per_pass", opt.max_selections}, {"max_pass_duration_us", opt.max_pass_duration}, {"trace", trace_info}, {"max_samples", opt.max_samples}, {"run_s", opt.run_s}, {"rates", opt.rates}, {"rotate", opt.rotate}, {"frames_dropped", frames_dropped}, {"deadline_classes", opt.deadline_classes}, {"frame_deadline", opt.frame_deadline}, {"buffer", opt.buffer}, {"catch_up", opt.catch_up}, {"threads", opt.single ? 1U : pool_threads}, {"worker_cpus", worker_cpus}, {"rt_prio", opt.rt_prio}, {"batch", opt.batch}, {"hw_threads", hw_threads}, {"chains", opt.chains}, {"order_mode", order_mode}, {"blocks_per_chain", chains[0].block_count}, {"frames", frames}, {"decoded_total", decoded_total}, {"missing_total", missing_total}, {"wrong_payload_total", opt.check ? json(wrong_total) : json(nullptr)}, {"deadline_misses_total", misses_total}, {"elapsed_s", elapsed_s}, {"latency", {{"rate", opt.rate}, {"chunk", opt.chunk}, {"deadline_ms", opt.deadline_ms}, {"stamp_bias_max_us", opt.rate > 0 ? opt.chunk / opt.rate * 1e6 : 0.0}, {"input", opt.input}}}, {"result", ok ? "ok" : (timed_out.load() ? "timeout" : "error")}, {"per_chain", per_chain}};
+    json summary = {{"app", "rx_latency4"}, {"runtime", "gnuradio4"}, {"scheduler", sched_name}, {"policy", opt.policy}, {"policy_name", policy_name}, {"fixed_batch", opt.fixed_batch}, {"tiny_period_s", opt.fixed_batch > 0 ? opt.tiny_period : 0.f}, {"selection_strategy", opt.selection}, {"sched_ratio", opt.sched_ratio}, {"max_outstanding_jobs", opt.max_outstanding_jobs}, {"max_selections_per_pass", opt.max_selections}, {"max_pass_duration_us", opt.max_pass_duration}, {"trace", trace_info}, {"max_samples", opt.max_samples}, {"run_s", opt.run_s}, {"rates", opt.rates}, {"rotate", opt.rotate}, {"frames_dropped", frames_dropped}, {"deadline_classes", opt.deadline_classes}, {"frame_deadline", opt.frame_deadline}, {"buffer", opt.buffer}, {"catch_up", opt.catch_up}, {"threads", opt.single ? 1U : pool_threads}, {"worker_cpus", worker_cpus}, {"rt_prio", opt.rt_prio}, {"batch", opt.batch}, {"hw_threads", hw_threads}, {"chains", opt.chains}, {"order_mode", order_mode}, {"blocks_per_chain", chains[0].block_count}, {"frames", frames}, {"decoded_total", decoded_total}, {"missing_total", missing_total}, {"wrong_payload_total", opt.check ? json(wrong_total) : json(nullptr)}, {"deadline_misses_total", misses_total}, {"elapsed_s", elapsed_s}, {"feed", opt.feed}, {"pacer", pacer ? json{{"cpu", opt.pacer_cpu}, {"fifo_priority", opt.pacer_prio}, {"spin_us", opt.pacer_spin_us}, {"delay_ms", opt.pacer_delay_ms}, {"t0_ns", pacer->t0Ns()}, {"finished", pacer->finished()}, {"error", pacer->error()}} : json(nullptr)}, {"sink_stamp", pacer ? "call_end" : "per_packet"}, {"latency", {{"rate", opt.rate}, {"chunk", opt.chunk}, {"deadline_ms", opt.deadline_ms}, {"stamp_bias_max_us", pacer ? 0.0 : (opt.rate > 0 ? opt.chunk / opt.rate * 1e6 : 0.0)}, {"input", opt.input}}}, {"result", ok ? "ok" : (timed_out.load() ? "timeout" : "error")}, {"per_chain", per_chain}};
     {
         std::ofstream f(opt.out_dir + "/latency_summary.json");
         f << summary.dump(2) << "\n";
@@ -656,9 +796,12 @@ int main(int argc, char** argv) {
             const ChainCounters cc = chains[k].counters();
             json blocks = json::array();
             for (const auto& [uname, role] : chains[k].roles) { blocks.push_back({{"unique_name", uname}, {"role", role}}); }
-            jchains.push_back({{"chain", k}, {"rate", chain_rate[k]}, {"max_samples", chain_max[k]}, {"frames", chain_frames[k]}, {"throttle_start_ns", cc.thr_start_ns}, {"throttle_chunks", cc.thr_chunks}, {"throttle_max_chunks_per_call", cc.thr_max_chunks_per_call}, {"throttle_max_backlog_samples", cc.thr_max_backlog}, {"blocks", blocks}});
+            // pacer mode: every receiver's clock is the pacer's t0; it stands in as the throttle's anchor too,
+            // so readers of the nominal-arrival grid need not know which feed produced it
+            const uint64_t anchor = pacer ? pacer->t0Ns() : cc.thr_start_ns;
+            jchains.push_back({{"chain", k}, {"rate", chain_rate[k]}, {"max_samples", chain_max[k]}, {"frames", chain_frames[k]}, {"pacer_t0_ns", pacer ? json(pacer->t0Ns()) : json(nullptr)}, {"throttle_start_ns", anchor}, {"throttle_chunks", cc.thr_chunks}, {"throttle_max_chunks_per_call", cc.thr_max_chunks_per_call}, {"throttle_max_backlog_samples", cc.thr_max_backlog}, {"blocks", blocks}});
         }
-        json meta = {{"app", "rx_latency4"}, {"run_dir", opt.run_dir}, {"input", opt.input}, {"out_dir", opt.out_dir}, {"policy", opt.policy}, {"policy_name", policy_name}, {"scheduler", sched_name}, {"threads", opt.single ? 1U : pool_threads}, {"worker_cpus", worker_cpus}, {"rt_prio", opt.rt_prio}, {"hw_threads", hw_threads}, {"rate", opt.rate}, {"chunk", opt.chunk}, {"fixed_batch", opt.fixed_batch}, {"batch", opt.batch}, {"buffer", opt.buffer}, {"tiny_period_s", opt.fixed_batch > 0 ? opt.tiny_period : 0.f}, {"selection_strategy", opt.selection}, {"sched_ratio", opt.sched_ratio}, {"max_outstanding_jobs", opt.max_outstanding_jobs}, {"max_pass_duration_us", opt.max_pass_duration}, {"frames", frames}, {"max_samples", opt.max_samples}, {"run_s", opt.run_s}, {"rates", opt.rates}, {"rotate", opt.rotate}, {"rm_true_periods", opt.policy == "rm" && !opt.rm_tiny_periods}, {"deadline_classes", opt.deadline_classes}, {"frame_deadline", opt.frame_deadline}, {"elapsed_s", elapsed_s}, {"result", ok ? "ok" : (timed_out.load() ? "timeout" : "error")}, {"trace", trace_info}, {"chains", jchains}, {"analysis", analysis}, {"diagnostics", diagnostics}};
+        json meta = {{"app", "rx_latency4"}, {"run_dir", opt.run_dir}, {"input", opt.input}, {"out_dir", opt.out_dir}, {"feed", opt.feed}, {"policy", opt.policy}, {"policy_name", policy_name}, {"scheduler", sched_name}, {"threads", opt.single ? 1U : pool_threads}, {"worker_cpus", worker_cpus}, {"rt_prio", opt.rt_prio}, {"hw_threads", hw_threads}, {"rate", opt.rate}, {"chunk", opt.chunk}, {"fixed_batch", opt.fixed_batch}, {"batch", opt.batch}, {"buffer", opt.buffer}, {"tiny_period_s", opt.fixed_batch > 0 ? opt.tiny_period : 0.f}, {"selection_strategy", opt.selection}, {"sched_ratio", opt.sched_ratio}, {"max_outstanding_jobs", opt.max_outstanding_jobs}, {"max_pass_duration_us", opt.max_pass_duration}, {"frames", frames}, {"max_samples", opt.max_samples}, {"run_s", opt.run_s}, {"rates", opt.rates}, {"rotate", opt.rotate}, {"rm_true_periods", opt.policy == "rm" && !opt.rm_tiny_periods}, {"deadline_classes", opt.deadline_classes}, {"frame_deadline", opt.frame_deadline}, {"elapsed_s", elapsed_s}, {"result", ok ? "ok" : (timed_out.load() ? "timeout" : "error")}, {"trace", trace_info}, {"chains", jchains}, {"analysis", analysis}, {"diagnostics", diagnostics}};
         std::ofstream f(opt.out_dir + "/trace_meta.json");
         f << meta.dump(2) << "\n";
     }

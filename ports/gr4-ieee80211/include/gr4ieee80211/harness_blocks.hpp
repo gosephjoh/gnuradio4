@@ -91,6 +91,11 @@ struct LatencySink : gr::Block<LatencySink> {
     // number (payloads under 4 bytes, the fixture's `edge` cell) the i-th
     // decoded packet is paired with the i-th frame.
     bool     _order_mode = false;
+    // Stamp every packet of a call with one instant taken at the end of the call -- the completion of
+    // the sink job, which is what the pacer-mode end-to-end latency measures to -- rather than each
+    // packet as it is reached.  Off by default so throttle-mode runs keep their meaning.
+    bool                  _stamp_at_call_end = false;
+    std::vector<uint32_t> _stamped_this_call; // reused, so steady state does not allocate
 
     void setFrames(std::size_t n) {
         _t_decode.assign(n, 0);
@@ -98,9 +103,11 @@ struct LatencySink : gr::Block<LatencySink> {
         _correct.assign(n, 0);
         _expected.assign(n, nullptr);
         _expected_len.assign(n, 0);
+        _stamped_this_call.reserve(64);
     }
 
     gr::work::Status processBulk(gr::InputSpanLike auto& sIn) {
+        _stamped_this_call.clear();
         for (const gr::Packet<uint8_t>& p : sIn) {
             const uint64_t t = monotonic_ns();
             const auto&    b = p.signal_values;
@@ -119,6 +126,7 @@ struct LatencySink : gr::Block<LatencySink> {
                 _duplicates++;
             } else {
                 _t_decode[seq] = t;
+                if (_stamp_at_call_end) { _stamped_this_call.push_back(seq); }
                 _len[seq]      = static_cast<uint32_t>(b.size() - 24);
                 _count++;
                 if (_expected[seq]) {
@@ -128,6 +136,12 @@ struct LatencySink : gr::Block<LatencySink> {
                         _wrong_payload++;
                     }
                 }
+            }
+        }
+        if (_stamp_at_call_end && !_stamped_this_call.empty()) {
+            const uint64_t end = monotonic_ns();
+            for (const uint32_t seq : _stamped_this_call) {
+                _t_decode[seq] = end;
             }
         }
         return gr::work::Status::OK;

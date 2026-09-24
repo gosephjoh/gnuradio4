@@ -1,6 +1,7 @@
 #include "gr4ieee80211/chain.hpp"
 
 #include <gnuradio-4.0/basic/ConverterBlocks.hpp>
+#include <gnuradio-4.0/testing/NullSources.hpp>
 
 #include "gr4ieee80211/DecodeMac.hpp"
 #include "gr4ieee80211/Fft64.hpp"
@@ -74,9 +75,15 @@ ChainBlocks buildChain(gr::Graph& g, const ChainConfig& cfg) {
     // stamper > the rest (equal periods tie).  docs/batch-rt-experiments.md 6.
     const float tp = cfg.tiny_period;
     const float batch_period_s = (N > 0 && cfg.rate > 0) ? static_cast<float>(N) / static_cast<float>(cfg.rate) : 0.f;
+    // With `zero_period` every period is declared as exactly 0, so the release gate is off by
+    // declaration rather than by a period too short to bind -- and the implicit deadline, which is
+    // the period, would then be none at all: every block must bring its own.
     auto T = [&](gr::property_map m, float period, float deadline) {
         if (N > 0 && tp > 0.f) {
-            m.insert_or_assign("period", period);
+            if (cfg.zero_period && !(deadline > 0.f)) {
+                throw std::runtime_error("buildChain: a zero period needs an explicit deadline on every block");
+            }
+            m.insert_or_assign("period", cfg.zero_period ? 0.f : period);
             if (deadline > 0.f) { m.insert_or_assign("relative_deadline", deadline); }
         }
         return m;
@@ -93,7 +100,7 @@ ChainBlocks buildChain(gr::Graph& g, const ChainConfig& cfg) {
     // order, and the graph order decides both round robin's sweep and which
     // worker each block is dealt to.  The dataflow wiring below is the same
     // whatever the order.
-    FileSourceRaw<cf>* src = nullptr; Throttle<cf>* thrp = nullptr; ArrivalStamper* stamper = nullptr;
+    FileSourceRaw<cf>* src = nullptr; Throttle<cf>* thrp = nullptr; ArrivalStamper* stamper = nullptr; gr::testing::Copy<cf>* entry = nullptr;
     MagSquared* mag2 = nullptr; MovingAverage<float>* avgpow = nullptr; SampleDelay<cf>* dly16 = nullptr; Conjugate* conj = nullptr;
     Multiply2<cf>* mult = nullptr; MovingAverage<cf>* avgcor = nullptr; blocks::type::converter::Abs<cf>* mag = nullptr; Divide2<float>* div = nullptr;
     SyncShort* ss = nullptr; SampleDelay<cf>* dly320 = nullptr; SyncLong* sl = nullptr; Fft64* fft = nullptr; FrameEqualizer* eq = nullptr;
@@ -102,29 +109,37 @@ ChainBlocks buildChain(gr::Graph& g, const ChainConfig& cfg) {
     const float pipe_period = cfg.rm_true_periods && batch_period_s > 0.f ? batch_period_s : tp;
     auto TPr  = [&](gr::property_map m) { return T(std::move(m), pipe_period, pre_deadline_s); };
     auto TPOr = [&](gr::property_map m) { return T(std::move(m), pipe_period, post_deadline_s); };
+    const bool pacer = cfg.feed == ChainConfig::Feed::pacer;
     std::vector<std::function<void()>> make;
-    make.push_back([&] {
-        // GR4's BasicFileSource delivered no samples on this tree under either
-        // scheduler (apps/probe.cpp modes "fsrc"); FileSourceRaw is GR3's
-        // file_source semantics in a dozen lines.
-        gr::property_map srcm{{"name", nm("fsrc")}, {"file_name", cfg.input}};
-        if (cfg.declare_rate && cfg.rate > 0) { srcm.insert_or_assign("sample_rate", static_cast<float>(cfg.rate)); }
-        if (cfg.max_samples > 0) { srcm.insert_or_assign("max_items", cfg.max_samples); }
-        if (N > 0) {
-            srcm.insert_or_assign("pad_to_multiple", Size_t(N));
-            srcm.insert_or_assign("pad_min_tail", Size_t(std::max(3U * N, 2560U))); // the fixed-batch flush tail (FileSourceRaw.hpp)
-        }
-        src = &g.emplaceBlock<FileSourceRaw<cf>>(S(T(srcm, 0.25f * tp, 0.f), N == 0));
-        R(*src, "fsrc");
-    });
-    if (cfg.rate > 0) {
+    if (pacer) {
+        // The pacer's entry block: a copy, timed like the pre-gate blocks it feeds (the throttle's tiny
+        // deadline existed because the throttle was the clock; the pacer is, outside the graph), and
+        // left without a batch ceiling in fixed-batch mode so it catches up after a hiccup.
+        make.push_back([&] { entry = &g.emplaceBlock<gr::testing::Copy<cf>>(S(TPr({{"name", nm("feed")}}), N == 0)); R(*entry, "feed"); });
+    } else {
         make.push_back([&] {
-            gr::property_map thrm{{"name", nm("throttle")}, {"sample_rate", static_cast<float>(cfg.rate)}, {"chunk_size", Size_t(cfg.chunk)}, {"catch_up", cfg.catch_up}, {"whole_chunks", N > 0}};
-            thrp = &g.emplaceBlock<Throttle<cf>>(S(T(thrm, 0.5f * tp, 0.f), N == 0));
-            R(*thrp, "throttle");
+            // GR4's BasicFileSource delivered no samples on this tree under either
+            // scheduler (apps/probe.cpp modes "fsrc"); FileSourceRaw is GR3's
+            // file_source semantics in a dozen lines.
+            gr::property_map srcm{{"name", nm("fsrc")}, {"file_name", cfg.input}};
+            if (cfg.declare_rate && cfg.rate > 0) { srcm.insert_or_assign("sample_rate", static_cast<float>(cfg.rate)); }
+            if (cfg.max_samples > 0) { srcm.insert_or_assign("max_items", cfg.max_samples); }
+            if (N > 0) {
+                srcm.insert_or_assign("pad_to_multiple", Size_t(N));
+                srcm.insert_or_assign("pad_min_tail", Size_t(fixedBatchFlushTail(N)));
+            }
+            src = &g.emplaceBlock<FileSourceRaw<cf>>(S(T(srcm, 0.25f * tp, 0.f), N == 0));
+            R(*src, "fsrc");
         });
+        if (cfg.rate > 0) {
+            make.push_back([&] {
+                gr::property_map thrm{{"name", nm("throttle")}, {"sample_rate", static_cast<float>(cfg.rate)}, {"chunk_size", Size_t(cfg.chunk)}, {"catch_up", cfg.catch_up}, {"whole_chunks", N > 0}};
+                thrp = &g.emplaceBlock<Throttle<cf>>(S(T(thrm, 0.5f * tp, 0.f), N == 0));
+                R(*thrp, "throttle");
+            });
+        }
+        make.push_back([&] { stamper = &g.emplaceBlock<ArrivalStamper>(S(T({{"name", nm("stamp")}}, 0.75f * tp, pre_deadline_s))); R(*stamper, "stamp"); });
     }
-    make.push_back([&] { stamper = &g.emplaceBlock<ArrivalStamper>(S(T({{"name", nm("stamp")}}, 0.75f * tp, pre_deadline_s))); R(*stamper, "stamp"); });
     // the stock GR3 front end, block for block
     make.push_back([&] { mag2   = &g.emplaceBlock<MagSquared>(S(TPr({{"name", nm("mag2")}}))); R(*mag2, "mag2"); F(mag2->in); });
     make.push_back([&] { avgpow = &g.emplaceBlock<MovingAverage<float>>(S(TPr({{"name", nm("avgpow")}, {"length", Size_t(64)}, {"max_iter", max_iter}}))); R(*avgpow, "avgpow"); F(avgpow->in); });
@@ -160,8 +175,12 @@ ChainBlocks buildChain(gr::Graph& g, const ChainConfig& cfg) {
     gr::EdgeParameters ep{};
     if (cfg.buffer > 0) { ep.minBufferSize = cfg.buffer; }
 
-    // feed = throttle output, or the file source when unthrottled
-    if (thrp) {
+    // feed = the pacer's entry block, the throttle output, or the file source when unthrottled
+    if (entry) {
+        must(g.connect<"out", "in">(*entry, *mag2, ep), "feed->mag2");
+        must(g.connect<"out", "in">(*entry, *dly16, ep), "feed->dly16");
+        must(g.connect<"out", "in0">(*entry, *mult, ep), "feed->mul.in0");
+    } else if (thrp) {
         must(g.connect<"out", "in">(*src, *thrp, ep), "src->throttle");
         must(g.connect<"out", "in">(*thrp, *mag2, ep), "throttle->mag2");
         must(g.connect<"out", "in">(*thrp, *dly16, ep), "throttle->dly16");
@@ -206,6 +225,16 @@ ChainBlocks buildChain(gr::Graph& g, const ChainConfig& cfg) {
         cb.sym = &sym;
     }
 
+    if (entry) {
+        // Pacer.hpp: an entry block must take no in-graph input, or the release scan may skip it
+        // while the pacer's data waits
+        for (const gr::Edge& edge : g.edges()) {
+            if (edge.destinationBlock()->uniqueName() == entry->unique_name) {
+                throw std::runtime_error("buildChain: the pacer's entry block must take no input from inside the graph");
+            }
+        }
+        cb.feed_in = &entry->in;
+    }
     cb.stamper  = stamper;
     cb.sink     = sink;
     cb.counters = [ss, sl, eq, dec, avgpow, dly16, avgcor, dly320, fft, src, thrp, stamper]() {
@@ -220,8 +249,8 @@ ChainBlocks buildChain(gr::Graph& g, const ChainConfig& cfg) {
         c.too_large             = dec->_too_large;
         c.items_avgpow = avgpow->_items; c.items_dly16 = dly16->_items; c.items_avgcor = avgcor->_items; c.items_ss = ss->_items; c.items_dly320 = dly320->_items;
         c.items_sl = sl->_items; c.items_fft = fft->_items; c.items_eq = eq->_items; c.items_dec = dec->_items; c.calls_ss = ss->_calls; c.calls_sl = sl->_calls; c.max_cor = ss->_max_cor;
-        c.stamper_reentry = stamper->_reentry;
-        c.src_calls = src->_calls; c.src_max_read_ns = src->_max_read_ns; c.src_sum_read_ns = src->_sum_read_ns; c.src_max_read_items = src->_max_read_items;
+        if (stamper) { c.stamper_reentry = stamper->_reentry; }
+        if (src) { c.src_calls = src->_calls; c.src_max_read_ns = src->_max_read_ns; c.src_sum_read_ns = src->_sum_read_ns; c.src_max_read_items = src->_max_read_items; }
         if (thrp) { c.thr_calls = thrp->_calls; c.thr_max_gap_ns = thrp->_max_gap_ns; c.thr_sum_gap_ns = thrp->_sum_gap_ns; c.thr_max_backlog = thrp->_max_backlog; c.thr_start_ns = thrp->_start_ns; c.thr_chunks = thrp->_chunks_published; c.thr_max_chunks_per_call = thrp->_max_chunks_per_call; }
         c.fft_tags_in = fft->_tags_in; c.fft_tags_out = fft->_tags_out; c.eq_tags_in = eq->_tags_in;
         c.sl_neg_tags = sl->_neg_tags; c.sl_far_tags = sl->_far_tags; c.sl_tags_seen = sl->_tags_seen; c.sl_max_copy_run = sl->_max_copy_run; c.sl_short_calls = sl->_short_calls;
