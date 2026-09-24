@@ -328,7 +328,8 @@ inline constexpr double kRatioTolerance = 1e-9; /// the counts are integers, so 
 
 [[nodiscard]] inline RatioEstimate ratioOf(std::span<const Event> events, EntityId entity) {
     const std::vector<Event> records = exactRecordsFor(events, entity);
-    RatioEstimate            estimate{.invocations = records.size()};
+    RatioEstimate            estimate;
+    estimate.invocations = records.size();
     if (records.empty()) {
         estimate.reason = "no productive block-side records";
         return estimate;
@@ -848,7 +849,8 @@ inline constexpr std::uint64_t kThreadCpuScaleNs = 1000UL;
     std::vector<WorkerUtilisation> out;
     out.reserve(workers.size());
     for (const std::uint8_t worker : workers) {
-        WorkerUtilisation w{.workerId = worker};
+        WorkerUtilisation w;
+        w.workerId = worker;
 
         // Before anything is summed. With a wrapped ring the terms cover a truncated window while the
         // lifetime spans the whole run, so every ratio understates by an unknowable amount -- and the
