@@ -15,6 +15,8 @@ Definitions (0036 items 1-3):
   batch j          samples [j*N, (j+1)*N) of the chain's input, N = fixed_batch
   release_j        nominal arrival: throttle_start + (j+1)*N/rate  (item 1)
   publish_j        when the throttle actually published chunk j (workExact end)
+                   -- or, with rx_latency4 --feed pacer, when the pacer wrote it
+                   (pacer.csv); the pacer's t0 stands in as throttle_start
   done_<block>_j   end of the first invocation of <block> whose input span
                    covers the batch's last sample (j+1)*N-1
   batch RT         done_syncshort_j - release_j   (item 2, headline)
@@ -23,6 +25,15 @@ Definitions (0036 items 1-3):
   frame RT         lat_last_us of latency.csv (0035; works without a trace)
 Under RM and RR a "job" is one invocation (item 3); the trace has no job
 index, so j is assigned here from stream positions.
+
+With --feed pacer, three more figures need no trace and cover the whole window:
+  source_lag       written - nominal per chunk (pacer.csv): how late arrival
+                   itself was; p95 above ten batch periods = saturated
+  frame_e2e        sink stamp - write of the chunk holding the frame's last
+                   sample (latency.csv lat_last_us): the end-to-end latency,
+                   waiting in the entry block's buffer included
+  frame_e2e_nominal  the same from the chunk's nominal instant
+frame_e2e.csv holds one row per decoded frame.
 
 Utilization (0036 item 12) is measured, not predicted, and split three ways:
 demand (work() calls that moved samples -- the load, scales with the rate),
@@ -90,6 +101,10 @@ def main():
     period_ns = N / rate * 1e9 if (N > 0 and rate > 0) else None
     out["batch_period_us"] = period_ns / 1e3 if period_ns else None
     out["elapsed_s"] = meta.get("elapsed_s")
+    pacing = meta.get("feed") == "pacer"
+    out["feed"] = meta.get("feed", "throttle")
+    source_role = "feed" if pacing else "throttle"
+    chunks = pd.read_csv(os.path.join(rd, "pacer.csv")) if pacing else None
 
     # ---- the frames of the cell: last-sample offsets
     man = json.load(open(os.path.join(meta["run_dir"], "manifest.json")))
@@ -105,7 +120,10 @@ def main():
         out["air_s"] = float(meta["run_s"])  # --run-s: every receiver replays that long at its own rate
     # slower than real time = the graph could not keep up = response times are unbounded (the
     # throttle publishes late because its output buffer stays full); the point is saturated
-    out["realtime_ratio"] = (meta.get("elapsed_s") / out["air_s"]) if (out["air_s"] and meta.get("elapsed_s")) else None
+    # the pacer waits delay_ms after the scheduler starts before its clock runs: that wait is not the
+    # graph falling behind, and on a 10 s run it alone would exceed the 1.05 margin
+    pacer_delay_s = ((summ.get("pacer") or {}).get("delay_ms") or 0) / 1e3
+    out["realtime_ratio"] = ((meta.get("elapsed_s") - pacer_delay_s) / out["air_s"]) if (out["air_s"] and meta.get("elapsed_s")) else None
     out["saturated"] = bool(out["realtime_ratio"] and out["realtime_ratio"] > 1.05)
     out["saturation_reason"] = "slower than 1.05x real time" if out["saturated"] else None
     if out["saturated"]:
@@ -133,7 +151,26 @@ def main():
         cf = float(classes[k]) if k < len(classes) else 1.0
         pc = {"chain": k, "rate": chain_rate[k], "batch_period_us": N / chain_rate[k] * 1e6 if (N and chain_rate[k]) else None, "deadline_factor": cf, "frame_deadline_factor": min(cf, frame_f), "frames": int(len(L)), "decoded": int(len(dec)), "decoded_in_window": int(len(inwin)),
               "frame_rt": stats(inwin.lat_last_us.to_numpy() * 1e3), "frame_rt_all": stats(dec.lat_last_us.to_numpy() * 1e3)}
+        if pacing:
+            # the pacer knows when every chunk was due and when it was written: arrival lag and the
+            # end-to-end latency follow without a trace, over the whole window rather than what the
+            # rings retained
+            C = chunks[(chunks.chain == k) & (chunks.written_ns > 0)]
+            Cw = C[(C.nominal_ns >= w0) & (C.nominal_ns < w1)]
+            chunk_period_ns = C.samples.max() / chain_rate[k] * 1e9 if len(C) else None
+            pc["source_lag"] = stats((Cw.written_ns - Cw.nominal_ns).to_numpy())
+            pc["throttle_lag"] = pc["source_lag"]  # the name earlier readers use for the arrival point's lag
+            pc["source_retries"] = int(C.retries.sum())
+            pc["saturated"] = bool(chunk_period_ns and pc["source_lag"].get("n") and pc["source_lag"]["p95_us"] * 1e3 > 10 * chunk_period_ns)
+            if pc["saturated"]:
+                out["saturated"] = True
+                out["saturation_reason"] = f"pacer write lag p95 {pc['source_lag']['p95_us']:.0f} us > 10 chunk periods (chain {k})"
+            pc["frame_e2e"] = stats(inwin.lat_last_us.to_numpy() * 1e3, chunk_period_ns)
+            pc["frame_e2e_nominal"] = stats(inwin.lat_last_nominal_us.to_numpy() * 1e3, chunk_period_ns)
         out["per_chain"].append(pc)
+    if pacing:
+        e2e = lat[lat.decoded == 1][["chain", "seq", "t_last_ns", "t_last_nominal_ns", "t_decode_ns", "lat_last_us", "lat_last_nominal_us"]]
+        e2e.rename(columns={"t_last_ns": "written_ns", "t_last_nominal_ns": "nominal_ns", "t_decode_ns": "sink_ns", "lat_last_us": "e2e_us", "lat_last_nominal_us": "e2e_nominal_us"}).to_csv(os.path.join(rd, "frame_e2e.csv"), index=False)
 
     # ---- the trace
     tr = meta.get("trace") or {}
@@ -161,7 +198,7 @@ def main():
         # *every* block of the batch path still has records for, or a batch published by the
         # throttle finds no consumer records (or the reverse).  Intersect the retained spans of
         # the throttle and the pre-gate blocks over all chains; slide/shrink the window into it.
-        path = inv[inv.role.isin(["throttle"] + PRE_GATE)]
+        path = inv[inv.role.isin([source_role] + PRE_GATE)]
         spans = path.groupby(["chain", "role"]).start_ns.agg(["min", "max"]) if len(path) else None
         out["window_shifted"] = False
         if spans is not None and len(spans):
@@ -186,31 +223,38 @@ def main():
             rate = chain_rate[k]                       # this receiver's rate ...
             period_ns = N / rate * 1e9                  # ... and batch period
             I = inv[inv.chain == k]
-            T = I[(I.role == "throttle") & (I["out"] > 0)].sort_values("start_ns")
-            if len(T) == 0:
-                pc["error"] = "no throttle invocations in the capture"
-                continue
-            tpos = unwrap32(T.pos.to_numpy())
-            tout = T["out"].to_numpy(dtype=np.int64)
-            tend = (T.start_ns.to_numpy(dtype=np.int64) + T.dur_ns.to_numpy(dtype=np.int64))
-            # every chunk j published, with its publish instant
-            j_first = tpos // N
-            j_count = tout // N
-            total = int(j_count.sum())
-            J = np.empty(total, dtype=np.int64)
-            PUB = np.empty(total, dtype=np.int64)
-            o = 0
-            for jf, jc, te in zip(j_first, j_count, tend):
-                J[o:o + jc] = np.arange(jf, jf + jc)
-                PUB[o:o + jc] = te
-                o += jc
-            REL = thr_start + ((J + 1) * N / rate * 1e9).astype(np.int64)
+            if pacing:
+                # fixed batches: the pacer's chunk is the batch, and it logged both instants
+                C = chunks[(chunks.chain == k) & (chunks.written_ns > 0)]
+                J = C.chunk.to_numpy(dtype=np.int64)
+                PUB = C.written_ns.to_numpy(dtype=np.int64)
+                REL = C.nominal_ns.to_numpy(dtype=np.int64)
+            else:
+                T = I[(I.role == "throttle") & (I["out"] > 0)].sort_values("start_ns")
+                if len(T) == 0:
+                    pc["error"] = "no throttle invocations in the capture"
+                    continue
+                tpos = unwrap32(T.pos.to_numpy())
+                tout = T["out"].to_numpy(dtype=np.int64)
+                tend = (T.start_ns.to_numpy(dtype=np.int64) + T.dur_ns.to_numpy(dtype=np.int64))
+                # every chunk j published, with its publish instant
+                j_first = tpos // N
+                j_count = tout // N
+                total = int(j_count.sum())
+                J = np.empty(total, dtype=np.int64)
+                PUB = np.empty(total, dtype=np.int64)
+                o = 0
+                for jf, jc, te in zip(j_first, j_count, tend):
+                    J[o:o + jc] = np.arange(jf, jf + jc)
+                    PUB[o:o + jc] = te
+                    o += jc
+                REL = thr_start + ((J + 1) * N / rate * 1e9).astype(np.int64)
             sel = (REL >= w0) & (REL < w1)
             J, PUB, REL = J[sel], PUB[sel], REL[sel]
             last_sample = (J + 1) * N - 1
             done = {}
             begin = {}
-            for role in PRE_GATE:
+            for role in (["feed"] if pacing else []) + PRE_GATE:
                 B = I[(I.role == role) & (I["in"] > 0)].sort_values("start_ns")
                 if len(B) == 0:
                     done[role] = np.full(J.size, np.nan)
@@ -243,14 +287,20 @@ def main():
                 pc["batch_rt"]["over_class_deadline_ratio"] = float((fin > dl).mean()) if fin.size else None
                 pc["class_deadline_us"] = dl / 1e3
             pc["batch_rt_from_publish"] = stats(rt_pub, period_ns)
-            pc["throttle_lag"] = stats(PUB - REL)  # publish - nominal: how late the arrival point itself was
-            # a run can finish within 1.05x its air time and still carry a backlog of hundreds of
-            # batches (a 0.4 s lag is 0.7 % of a 60 s run): the throttle publishing ten periods late
-            # at the 95th percentile is the saturation criterion that matches what the plot shows
-            pc["saturated"] = bool(period_ns and pc["throttle_lag"].get("n") and pc["throttle_lag"]["p95_us"] * 1e3 > 10 * period_ns)
-            if pc["saturated"]:
+            if not pacing:  # the pacer's lag and saturation were judged above, over the whole window
+                pc["throttle_lag"] = stats(PUB - REL)  # publish - nominal: how late the arrival point itself was
+                # a run can finish within 1.05x its air time and still carry a backlog of hundreds of
+                # batches (a 0.4 s lag is 0.7 % of a 60 s run): the throttle publishing ten periods late
+                # at the 95th percentile is the saturation criterion that matches what the plot shows
+                pc["saturated"] = bool(period_ns and pc["throttle_lag"].get("n") and pc["throttle_lag"]["p95_us"] * 1e3 > 10 * period_ns)
+            if pc.get("saturated") and not pacing:
                 out["saturated"] = True
                 out["saturation_reason"] = f"throttle lag p95 {pc['throttle_lag']['p95_us']:.0f} us > 10 batch periods (chain {k})"
+            if pacing:
+                # from the write to the start of the entry block's call that took the batch: how long
+                # arriving data waited for the scheduler to notice it and run its first block -- the same
+                # event under every policy, so directly comparable between them
+                pc["entry_wait"] = stats(begin["feed"] - PUB)
             pc["per_block_done"] = {role: stats(done[role] - REL) for role in PRE_GATE}
             pc["per_block_begin"] = {role: stats(begin[role] - REL) for role in PRE_GATE}
             # frame-anchored batch response time: decode instant minus the release of the batch holding the frame's last sample
@@ -340,7 +390,7 @@ def main():
                             "max_queue_depth": int(grp.queue_depth.max())})
             # the source and the throttle carry a 1 us period/deadline on purpose (0036 item 8: always
             # most urgent, paced by the throttle's own clock), so every one of their jobs "misses";
-            # the pipeline figure leaves them out
+            # the pipeline figure leaves them out.  A pacer's entry block has a real deadline and counts.
             pipe = ~Rn.role.isin(["fsrc", "throttle"])
             pipe_m = ~Mn.role.isin(["fsrc", "throttle"]) if len(Mn) > 0 else pipe[:0]
             n_rel_p, n_mis_p = int(pipe.sum()), int(pipe_m.sum()) if len(Mn) > 0 else 0
