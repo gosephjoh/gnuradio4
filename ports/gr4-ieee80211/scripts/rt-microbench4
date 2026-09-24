@@ -20,9 +20,15 @@
       and 4096, with every event category traced -> per worker, the rate, mean and p99 duration
       and the busy share of every scheduler event kind (sweep, stateSync, messagePhase,
       releaseScan, ...) inside the analysis window, next to the batch RT of every receiver.
-      The selection pass carries an explicit wall-clock budget (M6_PASS_US): the count bound is
+      The selection pass carries an explicit wall-clock budget (m6_pass_us): the count bound is
       left at its default, but the budget's own auto rule reads the declared period, which this
-      workload sets to 1 us to disarm the release gate -- see M6_PASS_US below
+      workload disarms on purpose -- see m6_pass_us below.
+      The input is the pacer (--m6-feed pacer, the default; rx_latency4 --feed pacer): a thread
+      outside the scheduler writes every chunk at its nominal instant.  --m6-calibrate first scales
+      all four rates together until the busiest worker's demand is 0.93-0.95 (RR at ratio 4096,
+      10 s steps) and runs the six at that scale; --m6-scale S runs at S; --m6-saturation-scan
+      then bisects each policy's largest scale that still keeps up, untraced
+      (docs/m6-runbook.md 5 and 9)
   M5  trace overhead at an unsaturated point: 1 receiver, 1 worker, 2.5 Msps, N = 1024, 30 s,
       every policy, every category live against no category -> frame response time
 Writes DIR/micro.json and DIR/MICRO.md (tables).  Takes about ten minutes; run it with the
@@ -140,60 +146,183 @@ def m5(cell, out, log):
 
 M6_KINDS = ("sweep", "stateSync", "messagePhase", "houseKeeping", "releaseScan", "select", "selectEmpty", "workProbe", "zombieReap", "adopt", "schedulerMessages", "removalCleanup", "blockMessages", "selectionBoundHit")
 K_BOUND_WAS_TIME = 1 << 2  # gr::trace::flag::kBoundWasTime: the pass budget, not the selection count, ended the pass
-M6_RATES = "1250000,1250000,2500000,5000000"
+M6_RATES = (1250000.0, 1250000.0, 2500000.0, 5000000.0)
 M6_BATCH = 1024
+M6_RUN = {"s": 20}  # --m6-run-s; 20 s for every published M6
 # A quarter of the fastest receiver's batch period, which is what the scheduler's own auto rule
-# would pick if it could see that period. It cannot: every block here declares a 1 us `period` so
-# that EDF's release gate never paces the pipeline (src/chain.cpp), and the deadlines carry the real
-# timing instead -- so the auto budget would come out at 250 ns and end every pass after a single
-# selection. Stated rather than derived, because the deadline is what this workload means by period.
-M6_PASS_US = round(0.25 * M6_BATCH / max(float(r) for r in M6_RATES.split(",")) * 1e6)
+# would pick if it could see that period. It cannot: in throttle mode every block declares a 1 us
+# `period`, and in pacer mode EDF's periods are 0, so that EDF's release gate never paces the
+# pipeline (src/chain.cpp) and the deadlines carry the real timing -- the auto budget would come out
+# at 250 ns, or be off. Stated rather than derived, because the deadline is what this workload means
+# by period; it follows the rate scale.
+def m6_pass_us(scale):
+    return max(1, round(0.25 * M6_BATCH / (max(M6_RATES) * scale) * 1e6))
+
+
+M6_PASS_US = m6_pass_us(1.0)
+# calibration (docs/m6-runbook.md 4a): the busiest worker's demand, the share of its time in work()
+# calls that moved samples, is brought into this band by scaling every receiver's rate together
+M6_CAL_TARGET, M6_CAL_BAND, M6_CAL_RUN_S, M6_CAL_STEPS = 0.94, (0.93, 0.95), 10, 5
+M6_REFERENCE = ("rr", 4096)  # no release tracking, fewest message phases: the last to saturate
 
 
 CPUS = []  # --cpus LIST, appended to every rx_latency4 command
+FEED = ["--feed", "pacer"]  # --m6-feed, plus the pacer's flags
 
 
 def pin():
     return ["--cpus", ",".join(map(str, CPUS))] if CPUS else []
 
 
-def m6(cell, out, log):
+def stimulus_scale_cap(cell, run_s):
+    """every receiver replays the cell from its start: the fastest must not run past its end"""
+    samples = os.path.getsize(os.path.join(cell, "rx_stimulus.cf32")) // 8
+    return samples / (max(M6_RATES) * run_s)
+
+
+def m6_run(cell, d, log, pol, ratio, scale, run_s, traced=True, warmup=3.0, window=12.0, events=True):
+    """one M6 run at `scale` x the base rates; returns the per-run record (and deletes the capture).
+    events=False skips the per-kind event statistics: a calibration step needs only the demand."""
+    os.makedirs(d, exist_ok=True)
+    rates = ",".join(str(round(r * scale)) for r in M6_RATES)
+    cmd = [RX, "--run-dir", cell, "--out-dir", d, "--chains", "4", "--threads", "4", "--policy", pol, "--fixed-batch", str(M6_BATCH), "--rates", rates, "--run-s", str(run_s), "--rotate", "1",
+           "--sched-ratio", str(ratio), "--max-pass-duration", str(m6_pass_us(scale)), "--timeout-s", str(10 * run_s + 60)] + FEED + pin()
+    if traced:
+        cmd += ["--trace-categories", "all", "--trace-buffer", "16777216", "--trace-limit-mb", "1024", "--trace-out", os.path.join(d, "trace.gr4trace")]
+    sh(cmd, log)
+    if traced:
+        sh([EXP, os.path.join(d, "trace.gr4trace"), "--out-dir", d, "--meta", os.path.join(d, "trace_meta.json")] + (["--all-events"] if events else []), log)
+    sh([sys.executable, ANALYSE, d, "--warmup", str(warmup), "--window", str(window), "--quiet"], log)
+    b = json.load(open(os.path.join(d, "batch_rt.json")))
+    ls = json.load(open(os.path.join(d, "latency_summary.json")))
+    rec = {"policy": pol, "sched_ratio": ratio, "scale": scale, "run_s": run_s, "rates": [round(r * scale) for r in M6_RATES], "max_pass_duration_us": m6_pass_us(scale), "feed": ls.get("feed", "throttle"),
+           "worker_cpus": ls.get("worker_cpus", []), "result": ls.get("result"), "saturated": bool(b.get("saturated")), "saturation_reason": b.get("saturation_reason"),
+           "per_chain": [{"chain": pc["chain"], "rate": pc.get("rate"), "period_us": pc.get("batch_period_us"), "batch_rt": pc.get("batch_rt"), "frame_rt": pc.get("frame_rt"), "frame_e2e": pc.get("frame_e2e"),
+                          "entry_wait": pc.get("entry_wait"), "source_lag": pc.get("source_lag"), "saturated": pc.get("saturated"), "edf": pc.get("edf")} for pc in b["per_chain"]]}
+    u = b.get("utilization") or {}
+    if u.get("per_worker"):
+        # the workload's own units, the same under every policy: time in productive work() calls,
+        # and those calls per second -- what a pass costs is then charged per call it made possible
+        calls = {}
+        for x in u.get("per_block", []):
+            calls[str(x["worker"])] = calls.get(str(x["worker"]), 0) + x["calls"]
+        rec["demand_per_worker"] = u["per_worker"]
+        rec["demand_max"] = max(u["per_worker"].values())
+        rec["productive_calls_per_s_per_worker"] = {w: n / u["window_s"] for w, n in calls.items()}
+        rec["occupancy"] = u.get("per_worker_occupancy")
+    if not traced or not events:
+        for f in glob.glob(os.path.join(d, "trace_*.csv")) + glob.glob(os.path.join(d, "trace.gr4trace")):
+            if not f.endswith(("trace_kinds.csv", "trace_entities.csv")):
+                os.remove(f)
+        return rec
+    w0, w1 = b["window_ns"]; span = (w1 - w0) / 1e9
+    E = pd.read_csv(os.path.join(d, "trace_events.csv")); E = E[(E.start_ns >= w0) & (E.start_ns < w1)]
+    workers = sorted(E.worker.unique()); T = max(len(workers), 1)
+    kinds = {}
+    for k in M6_KINDS:
+        x = E[E.kind == k]
+        if len(x):
+            kinds[k] = {"per_s_per_worker": len(x) / span / T, "mean_us": float(x.dur_ns.mean() / 1e3), "p99_us": float(x.dur_ns.quantile(0.99) / 1e3), "max_us": float(x.dur_ns.max() / 1e3), "busy_share": float(x.dur_ns.sum() / 1e9 / span / T)}
+    ss = E[E.kind == "stateSync"]
+    discarded = {"mean": float(ss.p1.mean()), "max": int(ss.p1.max()), "syncs_with_discards": float((ss.p1 > 0).mean())} if len(ss) else None
+    bh = E[E.kind == "selectionBoundHit"]
+    by_time = (bh["flags"] & K_BOUND_WAS_TIME) != 0
+    bound_hits = {"time_per_s_per_worker": int(by_time.sum()) / span / T, "count_per_s_per_worker": int((~by_time).sum()) / span / T}
+    sw = E[E.kind == "sweep"].sort_values(["worker", "start_ns"]); gaps = []
+    for _, g in sw.groupby("worker"):
+        st = g.start_ns.to_numpy(); en = st + g.dur_ns.to_numpy()
+        if len(st) > 1:
+            gaps.append(float(np.mean(st[1:] - en[:-1]) / 1e3))
+    rec.update({"window_s": span, "kinds": kinds, "gap_between_sweeps_us": gaps, "jobs_discarded_per_sync": discarded, "bound_hits": bound_hits})
+    for f in glob.glob(os.path.join(d, "trace_*.csv")) + [os.path.join(d, "trace.gr4trace")]:
+        if os.path.exists(f) and not f.endswith(("trace_header.json", "trace_kinds.csv", "trace_entities.csv")):
+            os.remove(f)
+    return rec
+
+
+def m6_calibrate(cell, out, log, start):
+    """scale every rate together until the busiest worker's demand lies in M6_CAL_BAND, twice running.
+
+    Keeps the largest scale that kept up and the smallest that saturated. The next scale is the one
+    demand predicts, unless that would cross a scale already seen to saturate; then it is the midpoint.
+    The reference policy can saturate before the band -- its own overhead does not fit in what is left
+    -- and then the bracket closes below the band: the calibration settles on the largest scale that
+    kept up and says the band was not reached."""
+    pol, ratio = M6_REFERENCE
+    cap = stimulus_scale_cap(cell, max(M6_RUN["s"], M6_CAL_RUN_S))
+    lo_band, hi_band = M6_CAL_BAND
+    steps, scale = [], min(start, cap)
+    kept_up, saturated_at, accepted = None, None, None  # (scale, demand) of the largest scale that kept up; smallest that did not
+    for k in range(2 * M6_CAL_STEPS):
+        r = m6_run(cell, os.path.join(out, f"m6_cal_{k}"), log, pol, ratio, scale, M6_CAL_RUN_S, warmup=2.0, window=6.0, events=False)
+        dmax = r.get("demand_max")
+        steps.append({"scale": scale, "demand_max": dmax, "demand_per_worker": r.get("demand_per_worker"), "saturated": r["saturated"], "result": r["result"]})
+        print(f"m6 calibration step {k}: scale {scale:.3f} -> busiest worker's demand {dmax}, saturated {r['saturated']}", flush=True)
+        if r["result"] != "ok" or dmax is None:
+            break
+        if r["saturated"]:
+            saturated_at = scale if saturated_at is None else min(saturated_at, scale)
+        else:
+            if kept_up is None or scale >= kept_up[0]:
+                kept_up = (scale, dmax)
+            if lo_band <= dmax <= hi_band:
+                previous = steps[-2] if len(steps) >= 2 else None
+                if previous and previous["scale"] == scale and not previous["saturated"] and previous["demand_max"] is not None and lo_band <= previous["demand_max"] <= hi_band:
+                    accepted = scale
+                    break
+                continue  # confirm at the same scale
+        if kept_up is None:
+            scale /= 2  # even the first scale saturated
+            continue
+        if saturated_at is not None and (saturated_at - kept_up[0]) / kept_up[0] < 0.03:
+            break  # the bracket has closed: the band lies beyond what the reference policy keeps up with
+        proposal = kept_up[0] * M6_CAL_TARGET / kept_up[1]
+        if saturated_at is not None and proposal >= saturated_at:
+            proposal = (kept_up[0] + saturated_at) / 2
+        scale = min(cap, proposal)
+    cal = {"reference": {"policy": pol, "sched_ratio": ratio}, "target": M6_CAL_TARGET, "band": list(M6_CAL_BAND), "run_s": M6_CAL_RUN_S, "stimulus_cap": cap, "steps": steps,
+           "converged": accepted is not None, "band_reached": accepted is not None, "saturated_at": saturated_at}
+    cal["scale"] = accepted if accepted is not None else (kept_up[0] if kept_up else None)
+    if accepted is None:
+        why = "the reference policy saturated before the band" if saturated_at is not None else "no step reached the band"
+        print(f"m6 calibration: band not reached ({why}); using the largest scale that kept up, {cal['scale']}", file=sys.stderr)
+    return cal
+
+
+def m6_saturation_scan(cell, out, log, scale, iterations=5):
+    """per policy and ratio, the largest scale that still keeps up (pacer write lag), untraced"""
+    cap = stimulus_scale_cap(cell, M6_CAL_RUN_S)
     res = {}
     for ratio in (16, 4096):
         for pol in ("rr", "edf", "rm"):
-            d = os.path.join(out, f"m6_{pol}_r{ratio}")
-            os.makedirs(d, exist_ok=True)
-            cmd = [RX, "--run-dir", cell, "--out-dir", d, "--chains", "4", "--threads", "4", "--policy", pol, "--fixed-batch", str(M6_BATCH), "--rates", M6_RATES, "--run-s", "20", "--rotate", "1",
-                   "--sched-ratio", str(ratio), "--max-pass-duration", str(M6_PASS_US), "--timeout-s", "200", "--trace-categories", "all", "--trace-buffer", "16777216", "--trace-limit-mb", "1024", "--trace-out", os.path.join(d, "trace.gr4trace")] + pin()
-            sh(cmd, log)
-            sh([EXP, os.path.join(d, "trace.gr4trace"), "--out-dir", d, "--meta", os.path.join(d, "trace_meta.json"), "--all-events"], log)
-            sh([sys.executable, ANALYSE, d, "--warmup", "3", "--window", "12", "--quiet"], log)
-            b = json.load(open(os.path.join(d, "batch_rt.json")))
-            ls = json.load(open(os.path.join(d, "latency_summary.json")))
-            w0, w1 = b["window_ns"]; span = (w1 - w0) / 1e9
-            E = pd.read_csv(os.path.join(d, "trace_events.csv")); E = E[(E.start_ns >= w0) & (E.start_ns < w1)]
-            workers = sorted(E.worker.unique()); T = max(len(workers), 1)
-            kinds = {}
-            for k in M6_KINDS:
-                x = E[E.kind == k]
-                if len(x):
-                    kinds[k] = {"per_s_per_worker": len(x) / span / T, "mean_us": float(x.dur_ns.mean() / 1e3), "p99_us": float(x.dur_ns.quantile(0.99) / 1e3), "max_us": float(x.dur_ns.max() / 1e3), "busy_share": float(x.dur_ns.sum() / 1e9 / span / T)}
-            ss = E[E.kind == "stateSync"]
-            discarded = {"mean": float(ss.p1.mean()), "max": int(ss.p1.max()), "syncs_with_discards": float((ss.p1 > 0).mean())} if len(ss) else None
-            bh = E[E.kind == "selectionBoundHit"]
-            by_time = (bh["flags"] & K_BOUND_WAS_TIME) != 0
-            bound_hits = {"time_per_s_per_worker": int(by_time.sum()) / span / T, "count_per_s_per_worker": int((~by_time).sum()) / span / T}
-            sw = E[E.kind == "sweep"].sort_values(["worker", "start_ns"]); gaps = []
-            for _, g in sw.groupby("worker"):
-                st = g.start_ns.to_numpy(); en = st + g.dur_ns.to_numpy()
-                if len(st) > 1:
-                    gaps.append(float(np.mean(st[1:] - en[:-1]) / 1e3))
-            res[f"{pol}_r{ratio}"] = {"policy": pol, "sched_ratio": ratio, "max_pass_duration_us": M6_PASS_US, "worker_cpus": ls.get("worker_cpus", []), "window_s": span, "kinds": kinds, "gap_between_sweeps_us": gaps, "jobs_discarded_per_sync": discarded, "bound_hits": bound_hits,
-                                      "per_chain": [{"chain": pc["chain"], "rate": pc.get("rate"), "period_us": pc.get("batch_period_us"), "batch_rt": pc.get("batch_rt"), "frame_rt": pc.get("frame_rt"), "saturated": pc.get("saturated"), "edf": pc.get("edf")} for pc in b["per_chain"]],
-                                      "occupancy": b.get("utilization", {}).get("per_worker_occupancy")}
-            for f in glob.glob(os.path.join(d, "trace_*.csv")) + [os.path.join(d, "trace.gr4trace")]:
-                if os.path.exists(f) and not f.endswith(("trace_header.json", "trace_kinds.csv", "trace_entities.csv")):
-                    os.remove(f)
+            lo, hi = None, min(cap, 2 * scale)
+            probe = lambda s, tag: m6_run(cell, os.path.join(out, f"m6_scan_{pol}_r{ratio}_{tag}"), log, pol, ratio, s, M6_CAL_RUN_S, traced=False, warmup=2.0, window=6.0)
+            base = probe(scale, "base")
+            # untraced, at the calibrated scale: the latency every policy delivers on the same input,
+            # free of the tracer's cost, which differs between policies
+            at_scale = {"saturated": base["saturated"], "frame_e2e": [pc.get("frame_e2e") for pc in base["per_chain"]]}
+            lo = scale if not base["saturated"] else None
+            if lo is None:
+                hi, lo = scale, 0.0
+            elif not probe(hi, "hi")["saturated"]:
+                res[f"{pol}_r{ratio}"] = {"keeps_up_at": hi, "saturates_at": None, "note": "kept up at the upper end of the scan", "at_calibrated_scale": at_scale}
+                continue
+            for i in range(iterations):
+                mid = (lo + hi) / 2
+                if probe(mid, f"i{i}")["saturated"]:
+                    hi = mid
+                else:
+                    lo = mid
+            res[f"{pol}_r{ratio}"] = {"keeps_up_at": lo, "saturates_at": hi, "at_calibrated_scale": at_scale}
+            print(f"m6 saturation scan {pol} r{ratio}: keeps up at {lo:.3f}, saturates at {hi:.3f}", flush=True)
+    return res
+
+
+def m6(cell, out, log, scale):
+    res = {}
+    for ratio in (16, 4096):
+        for pol in ("rr", "edf", "rm"):
+            res[f"{pol}_r{ratio}"] = m6_run(cell, os.path.join(out, f"m6_{pol}_r{ratio}"), log, pol, ratio, scale, M6_RUN["s"])
     return res
 
 
@@ -234,7 +363,30 @@ def write_md(res, out):
             if u and t:
                 L.append(f"| {pol} | {u['frame_rt']['mean_us']:.0f} | {t['frame_rt']['mean_us']:.0f} | {t['frame_rt']['mean_us'] - u['frame_rt']['mean_us']:+.0f} | {u['frame_rt']['std_us']:.0f} | {t['frame_rt']['std_us']:.0f} | {u['realtime_ratio']:.3f} | {t['realtime_ratio']:.3f} |\n")
     if "M6" in res:
-        L.append(f"\n## M6 — scheduler pass cost on four workers (light mix 1.25/1.25/2.5/5 Msps, N = {M6_BATCH}, rotation 1, 20 s, every category traced, selection pass bounded at {M6_PASS_US} µs)\n")
+        any_run = next(iter(res["M6"].values()))
+        m6_scale = any_run.get("scale", 1.0)
+        m6_feed = any_run.get("feed", "throttle")
+        L.append(f"\n## M6 — scheduler pass cost on four workers (light mix 1.25/1.25/2.5/5 Msps x {m6_scale:.3f}, N = {M6_BATCH}, rotation 1, {any_run.get('run_s', 20)} s, input: {m6_feed}, every category traced, selection pass bounded at {any_run.get('max_pass_duration_us', M6_PASS_US)} µs)\n")
+        cal = res.get("M6_calibration")
+        if cal:
+            L.append(f"\nCalibration ({cal['reference']['policy']} at ratio {cal['reference']['sched_ratio']}, {cal['run_s']} s steps, band {cal['band'][0]}-{cal['band'][1]} for the busiest worker's demand): " + "; ".join(f"x{x['scale']:.3f} -> {x['demand_max'] if x['demand_max'] is None else round(x['demand_max'], 3)}{' (saturated)' if x['saturated'] else ''}" for x in cal["steps"]) + f". Scale used: {cal['scale']}" + ("" if cal["converged"] else f" (band not reached: the largest scale that kept up; the reference saturated at {cal.get('saturated_at')})") + "\n")
+        L.append("\nIn the workload's units, the same under every policy (docs/m6-runbook.md 9): the busiest worker's demand, productive work() calls per second per worker, "
+                 "the end-to-end latency from the pacer's write to the sink (mean / p99 µs, fastest receiver), the entry block's wait from write to first run (mean / p99 µs, fastest receiver), and whether the run kept up:\n\n"
+                 "| policy | ratio | demand max | productive calls/s per worker | E2E rx3 mean / p99 | entry wait rx3 mean / p99 | saturated |\n|---|---|---|---|---|---|---|\n")
+        fmt = lambda d, k: f"{d.get(k, float('nan')):.1f}" if d and d.get("n") else "-"
+        for key, r in res["M6"].items():
+            pcs = r.get("per_chain") or []
+            last = pcs[-1] if pcs else {}
+            calls = r.get("productive_calls_per_s_per_worker") or {}
+            L.append(f"| {r['policy']} | {r['sched_ratio']} | {r.get('demand_max', float('nan')):.3f} | " + ", ".join(f"{v:.0f}" for _, v in sorted(calls.items())) +
+                     f" | {fmt(last.get('frame_e2e'), 'mean_us')} / {fmt(last.get('frame_e2e'), 'p99_us')} | {fmt(last.get('entry_wait'), 'mean_us')} / {fmt(last.get('entry_wait'), 'p99_us')} | {'yes' if r.get('saturated') else 'no'} |\n")
+        scan = res.get("M6_saturation_scan")
+        if scan:
+            L.append("\nSaturation scan (untraced 10 s runs, bisected on the pacer's write lag): the largest scale each policy kept up at, the smallest it did not, and its untraced end-to-end latency on the fastest receiver at the calibrated scale (mean / p99 µs).\n\n| policy | ratio | keeps up at | saturates at | E2E rx3 at the calibrated scale |\n|---|---|---|---|---|\n")
+            for key, x in scan.items():
+                pol, ratio = key.split("_r")
+                e = ((x.get("at_calibrated_scale") or {}).get("frame_e2e") or [None])[-1]
+                L.append(f"| {pol} | {ratio} | {x['keeps_up_at']:.3f} | {'-' if x['saturates_at'] is None else format(x['saturates_at'], '.3f')} | {fmt(e, 'mean_us')} / {fmt(e, 'p99_us')} |\n")
         L.append("\nBatch response time per receiver (mean µs, and the fraction of batches later than the receiver's own period):\n\n| policy | ratio | rx 0 | rx 1 | rx 2 | rx 3 (5 Msps) | EDF pipeline misses |\n|---|---|---|---|---|---|---|\n")
         for key, r in res["M6"].items():
             cells = []
@@ -321,11 +473,19 @@ def main():
     ap.add_argument("--cell", default=os.path.join(HERE, "data", "rt_300_300_102934_QPSK_1_2_s1"))
     ap.add_argument("--only", default="M1,M2,M3,M4,M5,M6")
     ap.add_argument("--cpus", help="pin each run's workers to the first --threads CPUs of this list, e.g. 4-7 (rx_latency4 --cpus)")
+    ap.add_argument("--m6-feed", choices=("pacer", "throttle"), default="pacer", help="M6's input: the pacer outside the scheduler (default) or the in-graph throttle of earlier runs")
+    ap.add_argument("--pacer-cpu", type=int, help="pin the pacer thread to this CPU (a housekeeping CPU, not one of --cpus)")
+    ap.add_argument("--m6-run-s", type=float, default=20.0, help="M6 run length in seconds (20 for every published M6; shorter only for a check)")
+    ap.add_argument("--m6-scale", type=float, default=1.0, help="multiply every M6 rate by this; with --m6-calibrate, the first step")
+    ap.add_argument("--m6-calibrate", action="store_true", help="find the scale at which the busiest worker's demand is 0.93-0.95 (RR at ratio 4096, 10 s steps), then run M6 at it")
+    ap.add_argument("--m6-saturation-scan", action="store_true", help="after M6, bisect each policy's largest scale that still keeps up (untraced 10 s runs; about 7 runs per policy and ratio)")
     a = ap.parse_args()
     if a.cpus:
         for tok in a.cpus.split(","):
             lo, _, hi = tok.partition("-")
             CPUS.extend(range(int(lo), int(hi or lo) + 1))
+    M6_RUN["s"] = a.m6_run_s
+    FEED[:] = ["--feed", a.m6_feed] + (["--pacer-cpu", str(a.pacer_cpu)] if a.pacer_cpu is not None and a.m6_feed == "pacer" else [])
     os.chdir(HERE)
     os.makedirs(a.out_dir, exist_ok=True)
     log = os.path.join(a.out_dir, "micro.log")
@@ -343,7 +503,18 @@ def main():
     if "M5" in want:
         res["M5"] = m5(a.cell, a.out_dir, log)
     if "M6" in want:
-        res["M6"] = m6(a.cell, a.out_dir, log)
+        scale = a.m6_scale
+        if a.m6_calibrate:
+            if a.m6_feed != "pacer":
+                sys.exit("rt-microbench4: --m6-calibrate needs the pacer: under the throttle arrival itself slips as the workers fill")
+            res["M6_calibration"] = m6_calibrate(a.cell, a.out_dir, log, a.m6_scale)
+            scale = res["M6_calibration"]["scale"]
+            if scale is None:
+                sys.exit("rt-microbench4: M6 calibration found no usable scale; see micro.log")
+        res["M6"] = m6(a.cell, a.out_dir, log, scale)
+        json.dump(res, open(path, "w"), indent=1)  # the scan takes long: keep what is measured if it fails
+        if a.m6_saturation_scan:
+            res["M6_saturation_scan"] = m6_saturation_scan(a.cell, a.out_dir, log, scale)
     json.dump(res, open(path, "w"), indent=1)
     write_md(res, a.out_dir)
     print("wrote", path, "and MICRO.md")

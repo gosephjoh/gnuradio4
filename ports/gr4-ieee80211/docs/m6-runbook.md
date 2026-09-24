@@ -14,12 +14,27 @@ here assumes a clean checkout of `benchmark-playground` and nothing else.
 
 Six runs of 20 s: three policies (RR, EDF, RM) × two values of the
 scheduler's `process_stream_to_message_ratio` (16, its default, and 4096).
-Each run is the same workload — four 802.11p receivers of different rates
-(1.25, 1.25, 2.5 and 5 Msps) on four workers, fixed batches of 1024 samples,
-the fastest receiver last in graph order, construction order rotated by one
-slot per receiver — with every trace category live.
+Each run is the same workload — four 802.11p receivers whose rates stand
+1 : 1 : 2 : 4 (1.25, 1.25, 2.5 and 5 Msps at scale 1) on four workers, fixed
+batches of 1024 samples, the fastest receiver last in graph order,
+construction order rotated by one slot per receiver — with every trace
+category live.
 
-Allow about five minutes of running and another few of export and analysis.
+Two things changed on 2026-09-24, and both make a run a new baseline (§8):
+
+- **The input comes from outside the scheduler.** A pacer thread writes each
+  1024-sample chunk into the receiver's entry block at its nominal instant and
+  logs when it did (`--feed pacer`, `include/gr4ieee80211/Pacer.hpp`). The file
+  source, the throttle and the arrival stamper are gone from the graph, so a
+  receiver has 16 blocks instead of 18, and no block of the graph holds the
+  clock. §9 says what that removed.
+- **The rates are calibrated, not fixed.** Before the six runs, short
+  calibration runs scale all four rates together until the busiest worker is
+  93–95 % loaded (§5). The six runs then measure the scheduler where its costs
+  matter: with almost no time to spare.
+
+Allow about five minutes of calibration, five of running, and another few of
+export and analysis. The optional saturation scan (§5) adds about 45 minutes.
 
 ## 2. Before you start
 
@@ -30,6 +45,7 @@ Allow about five minutes of running and another few of export and analysis.
 | ≈ 2.5 GB RAM for one translation unit | `src/chain.cpp`; build with `-j4` or lower on a small machine |
 | ≈ 6 GB free disk | 4.7 GB for the stimulus cell, about 1 GB of capture per run (deleted after each analysis) |
 | at least 8 hardware threads | four workers plus the tracing and the driver; fewer and the workers contend with the harness |
+| a fifth CPU for the pacer | it sleeps until 60 µs before each chunk is due, then spins; with four receivers a chunk falls due every ~50 µs on average at scale 1, so expect it to keep most of one CPU busy. On the isolated guest give it a housekeeping CPU (`--pacer-cpu 3`), never one of the workers' |
 | four CPUs the workers can have to themselves | on a guest set up as `docs/e2e-sweep-runbook.md` §13 describes (CPUs 4–7 isolated, everything else confined to 0–3) the workers get them only if pinned: pass `--cpus 4-7` (§5). On a machine without that isolation, omit it |
 | the machine otherwise idle | this is a timing measurement: no other build, no other benchmark, nothing interactive |
 
@@ -52,11 +68,25 @@ cmake --build build -j4 --target rx_latency4 gen4 trace_export microbench4
 
 Release, not Debug: the whole point is how long a real pass takes. Tracing is
 compiled in by default, so the same binary serves M6 and any untraced control.
-A marker whose category is off is meant to cost a predicted branch, but a
-profile of this workload found the block-side scope constructor compiled out of
-line inside `work()`: about 5 % of a round-robin worker with no category live.
-An untraced control is therefore not quite a tracing-free one until that is
-fixed on `lightweight-tracing`.
+A marker whose category is off is meant to cost a predicted branch. A profile
+of this workload once found the block-side scope constructor compiled out of
+line inside `work()`, about 5 % of a round-robin worker with no category live.
+That is fixed on this branch (`fe730a60`, merged in `9c5c1a5f`), with a test
+that fails if the constructor stops being inlined; its effect in this receiver
+has not been re-measured, so treat an untraced control as close to, not proven,
+tracing-free.
+
+The harness has its own tests: `qa_Pacer` (the pacer replays exactly what the
+file source does, dates each chunk by its last sample, and lets no receiver's
+full buffer hold up another) and `qa_Chain` (a pacer-mode receiver's blocks and
+the periods and deadlines GR4 derives for them). They fetch Boost.UT, so they
+are off by default; on a machine with network access, run them once after a
+change to the harness:
+
+```
+cmake -S . -B build -DGR4WIFI_TESTING=ON && cmake --build build -j4 --target qa_Pacer qa_Chain
+ctest --test-dir build --output-on-failure
+```
 
 The port builds against the GR4 core at `GNURADIO4_DIR`, which defaults to this
 checkout. Record the core's commit with the results: M6 measures the scheduler,
@@ -74,13 +104,60 @@ a few minutes and it is 4.7 GB, so generate it once and keep it:
 
 Use this cell even though a 20 s run reads only the first fifth of it. The
 published numbers came from it, and a shorter cell changes which frames each
-receiver sees.
+receiver sees. Every receiver replays the cell from its start, so the fastest
+receiver bounds the scale: at 5 Msps × scale for 20 s it must not run past
+the cell's 600 M samples, i.e. scale ≤ 6. The driver caps the calibration
+there.
 
 ## 5. Run
 
 ```
-./scripts/rt-microbench4 --out-dir results/sweep-<machine>/micro --only M6 --cpus 4-7
+./scripts/rt-microbench4 --out-dir results/sweep-<machine>/micro --only M6 --cpus 4-7 \
+    --pacer-cpu 3 --m6-calibrate
 ```
+
+**Calibration first** (`--m6-calibrate`). Round robin at ratio 4096 runs for
+10 s at scale 1, and the driver reads the busiest worker's **demand**: the
+share of its time inside `work()` calls that processed data
+(`trace-batch-rt.py`, `utilization.per_worker`). It then steps the scale as
+scale × 0.94 / demand and repeats, until two consecutive runs land in
+0.93–0.95, for at most five steps. Every step is recorded in `micro.json`
+(`M6_calibration`) and `MICRO.md`, and the six runs use the accepted scale.
+The pass budget follows the scale (§7).
+
+Why demand, and not the sweep's share or CPU utilisation: the workers never
+idle (§9), so CPU utilisation is always 100 % and a `sweep` spans every pass,
+idle ones included — at scale 1 sweeps already take 84–95 % of a worker.
+Demand is what grows with the input. Why the busiest worker: blocks are dealt
+round-robin, so workers carry different loads, and the busiest one saturates
+first. Why one scale for all three policies: demand does not depend on the
+policy (in the isolated run of 2026-09-23 the busiest worker's demand was 0.43
+under every policy and ratio), so all three see the same input, and a policy
+whose overhead does not fit in the time left saturates — which is a finding,
+not a reason to give it a different input. Why round robin at 4096: without
+release tracking and with the fewest message phases it is the policy least
+likely to saturate before the target, and a saturated run measures capacity,
+not load.
+
+The reference can saturate before the band all the same: its own overhead may
+not fit in the 5–7 % left. On the development machine, unpinned, round robin
+at ratio 4096 saturated at 2.28× with demand 0.92. The driver keeps the largest
+scale that kept up and the smallest that did not, bisects between them when
+demand would step past a saturated scale, and stops once they are within 3 %.
+It then uses the largest scale that kept up and records `band_reached: false`
+with the scale it saturated at. That is still the right operating point — the
+most load this machine carries under the least demanding policy — but say in
+the report that the band was not reached, and at what demand it stopped.
+
+`--m6-scale S` skips the calibration and runs at scale S (with
+`--m6-calibrate`, S is the first step). `--m6-saturation-scan` adds, after the
+six runs, a bisection per policy and ratio for the largest scale that still
+keeps up, on untraced 10 s runs; §9 says why that is the fairest comparison
+between policies. `--m6-feed throttle` reproduces the earlier runs' input, and
+cannot be calibrated.
+
+The pacer is pinned with `--pacer-cpu`: on the isolated guest a housekeeping
+CPU, never one of `--cpus`. `rx_latency4` refuses the two overlapping.
 
 `--cpus 4-7` pins each run's four workers to CPUs 4, 5, 6, 7, one each,
 under `SCHED_OTHER` (`rx_latency4 --cpus`; no real-time priority — see
@@ -115,10 +192,26 @@ each of the six `m6_*/latency_summary.json`:
 - `elapsed_s` close to 20: a run that took appreciably longer did not keep up.
 - `worker_cpus` reads `[4, 5, 6, 7]` when the run was meant to be pinned,
   and `rt_prio` 0.
+- `"feed": "pacer"`, `pacer.finished` true and `pacer.error` empty;
+  `blocks_per_chain` 16; and `max_pass_duration_us` the scaled budget (§7).
+- in every `per_chain` entry, `pacer.retries` is 0 and `pacer.write_lag_us`
+  small. On the development machine, unpinned, p99 was 6–12 µs; pinned on the
+  isolated guest it is expected to be lower, but that is still to be measured,
+  and the first run there should record it. A retry means the entry buffer was
+  full when a chunk fell due: the receiver did not keep up.
 
-Then in each `batch_rt.json`, no receiver should be marked `saturated`. The
-light mix at four workers has ample capacity, so a saturated receiver means
-something else was running on the machine.
+Then in each `batch_rt.json`, read `saturated` per receiver (the pacer's write
+lag p95 above ten batch periods; it needs no trace). At scale 1 nothing should
+saturate, and a saturated receiver means something else was running on the
+machine. At the calibrated scale a policy **may** saturate — that is what
+running near capacity is for. Report it, keep its run, and do not read its
+pass costs as those of a schedule: they measure a backlog.
+
+In `micro.json`, check whether the calibration reached the band
+(`M6_calibration.band_reached`; if not, §5 says what the scale then means),
+and that every run's `demand_max` lies within ±0.02 of the calibration's last
+step. Demand should not depend on the policy; a larger spread means it does
+here, and the like-for-like comparison of §9 needs that explained first.
 
 Note each run's `window_covered_s` and `window_shifted` from the same file.
 They say how much of the run the trace-based figures describe, and §9 says
@@ -126,18 +219,24 @@ why that is usually far less than the 12 s asked for.
 
 ## 7. Why the selection pass is bounded explicitly
 
-The driver passes `--max-pass-duration 51`, a quarter of the fastest
-receiver's batch period (1024 / 5 Msps = 204.8 µs). It is not a tuning knob
-and should not be varied to make a policy look better.
+The driver passes `--max-pass-duration`, a quarter of the fastest receiver's
+batch period: 51 µs at scale 1 (1024 / 5 Msps = 204.8 µs), and 51 µs divided
+by the scale after calibration. It is not a tuning knob and should not be
+varied to make a policy look better.
 
 Left at auto, the scheduler derives that budget from the shortest `period`
-declared on the worker. This workload declares 1 µs on every block on
-purpose, so that EDF's release gate never paces the pipeline and the real
-timing is carried by `relative_deadline` instead (`src/chain.cpp`). The auto
-rule would therefore read 250 ns, and every EDF pass would end after a single
-`work()` call and return to the backstop release scan — a regime that says
-nothing about what a pass costs. Stating the budget gives the rule the period
-this workload actually means.
+declared on the worker, and this workload deliberately declares none that
+means anything. GR4's release gate reads a period as a minimum separation
+between releases, with no catch-up, so a true period of N/rate would stop a
+block from ever draining a backlog. The real timing is carried by
+`relative_deadline` instead (`src/chain.cpp`). In throttle mode every block
+declares a 1 µs period, and the auto rule would read 250 ns, ending every EDF
+pass after a single `work()` call. In pacer mode EDF's periods are exactly 0
+(an explicit 0 means no temporal gate, and `qa_SchedulingAnalysis` pins that
+it is kept rather than derived), and the auto rule, which ignores zero
+periods, would switch the budget off. Either way, stating the budget gives the
+rule the period this workload actually means. Rate monotonic keeps its true
+periods, which it reads for ranking only.
 
 The budget reaches EDF alone: round robin sweeps unbounded and rate monotonic
 keeps the count bound. `max_selections_per_pass` is left at its default for
@@ -173,6 +272,13 @@ for four reasons:
    vCPUs with the driver, the throttle timer threads, the trace export and
    the guest's own housekeeping. A report on a pinned run says so beside
    the platform line.
+6. From 2026-09-24 the input and the load are different: the pacer replaces
+   the file source, throttle and stamper (16 blocks per receiver, so blocks
+   are dealt differently across the workers), EDF declares periods of 0
+   instead of 1 µs, and the rates are calibrated to near capacity instead of
+   fixed at the light mix. `MICRO.md` states the input and the scale in the
+   M6 heading. Compare a pacer run with a throttle run only through figures
+   that do not depend on either, and say so.
 
 What M6 was built to expose has since been largely fixed. The re-sync that
 rebuilt EDF's release storage on every message phase now reuses each worker's
@@ -254,14 +360,17 @@ Each policy ends a pass in its own way:
 - **EDF** runs released jobs until none are left, or until the count bound or
   the time budget is hit.
 
-On this workload almost no pass is cut short. Fewer than one call in 30 does
+In the isolated throttle-mode run of 2026-09-23 (18 blocks per worker, scale
+1), almost no pass was cut short. Fewer than one call in 30 did
 any work under round robin or rate monotonic: a pass averaged 0.4–0.5
 productive calls, against a count bound of 72. At least 99.97 % of EDF's
 passes ended with no job left to run, so at most 0.03 % can have been stopped
 by the time budget. **The message phase's frequency is set by how long an idle
 pass takes, not by the bounds:** an idle pass under round robin is 18
 unproductive calls, under rate monotonic about 21 (the restart adds the rest),
-and under EDF a release scan and an empty selection. Changing the budget or
+and under EDF a release scan and an empty selection. Near capacity, after
+calibration, passes carry more work and the bounds may start to bind: read
+`bound_hits` rather than assume these proportions. Changing the budget or
 the count bound will not change how often the message phase runs; counting
 passes in time, or counting only productive ones, would.
 
@@ -281,20 +390,90 @@ To tell the pass-exit reasons apart:
   `batch_rt.json` give the content of a pass. Under round robin they must add
   up to the block count per pass, which is a useful check.
 
-### Most of EDF's selections are the throttle's
+### Throttle runs: most of EDF's selections were the throttle's
 
-The throttles declare a 1 µs period so that they are always the most urgent
-job (§7). A throttle therefore holds a released job on almost every pass, is
+In throttle-mode runs (every run before 2026-09-24, and `--m6-feed throttle`),
+the throttles declare a tiny period so that they are always the most urgent
+job. A throttle therefore holds a released job on almost every pass, is
 selected, and returns `INSUFFICIENT_*` until its own clock lets it publish. In
-the isolated run, 0.60 of EDF's 0.74 selections per pass were such probes, all
-of them throttles. The chain 0 throttle, for example, ran productively 1 220
-times a second and was selected about 214 000 times.
+the isolated run of 2026-09-23, 0.60 of EDF's 0.74 selections per pass were
+such probes, all of them throttles; the chain 0 throttle ran productively
+1 220 times a second and was selected about 214 000 times. So in those runs
+EDF's `select` rate overstates its work about five times, and the two workers
+holding throttles are unlike the other two.
 
-These probes are cheap, and they are what the design intends. But they mean
-EDF's `select` rate overstates the work it did by about five times. They also
-mean the four workers are not alike: the two that hold throttles select
-about once per pass or more, and the other two far less often. A per-worker mean hides
-that difference.
+Pacer runs do not have this. The pacer's entry block has an input, so EDF
+releases it only when a chunk has arrived: a check on this workload found its
+selections equal to its productive calls. It has the pre-gate blocks' deadline
+(one batch period), not a tiny one, so EDF orders it honestly against other
+work and its jobs do not "miss" by construction; the EDF miss counts include
+it. One exception remains, and holds for any block: while a block's *output*
+is full, EDF keeps releasing it on its input alone and it keeps finding no
+room, so selections exceed productive calls during a backlog.
+
+### Comparing RR, RM and EDF like for like
+
+Most of what M6 reports is measured in each scheduler's own units, and those
+units differ between policies. They are the right figures for comparing two
+builds of one policy, and the wrong ones for comparing policies:
+
+| figure | why it does not compare across policies |
+|---|---|
+| passes per second, pass period | a round-robin pass is one call on every block; a rate-monotonic pass is a priority walk that restarts after every productive call; an EDF pass is a release scan plus job selections. A shorter pass is not less work per unit of input |
+| message phases per second, their busy share | the ratio counts passes, so a policy with shorter passes runs more message phases for the same input, at the same cost per phase (the ratio amplifier above) |
+| busy shares of `sweep`, `releaseScan`, `workProbe` | the workers spin, so every share fills whatever time is spare; at light load they measure idleness |
+| `select`, probe and zero-work counts | EDF selects released jobs; round robin and rate monotonic probe every block by design |
+| any traced figure | tracing costs policies unequally: EDF emits release and selection records RR never does, and all categories cost about 17 % of an EDF worker |
+
+To compare policies, hold everything but the policy fixed, and measure in the
+workload's units:
+
+**Hold fixed.** The same cell, run length and input scale (one calibration for
+all three: §5); the same machine, pinning and pacer CPU; the same batch
+contract (fixed batches of 1024, so every policy does the same work per call);
+the same block placement (`Simple` deals the blocks identically under every
+policy, in registration order with rotation 1; rate monotonic and EDF only
+reorder within a worker); and the same scheduler settings. For "each policy
+as shipped", that means GR4's defaults: ratio 16, the default selection count
+bound. Ratio 4096 is the control with message phases taken out.
+
+**Then compare, in this order:**
+
+1. **The largest input each policy keeps up with** (`--m6-saturation-scan`,
+   `M6_saturation_scan.<policy>_r<ratio>.keeps_up_at`). Same work, same
+   machine, same placement: the difference is what the scheduler's own time
+   and ordering cost, expressed as throughput. It is untraced and trace-free
+   (the verdict is the pacer's write lag), so the tracer's unequal cost is not
+   in it. Quote it as a ratio to round robin's. The bisection's resolution is
+   the width of its last interval (about 1/32 of the range); a difference
+   smaller than that, or than the spread over repeats, is not a finding.
+2. **End-to-end latency at the same input** (`frame_e2e`: from the pacer's
+   write of the chunk holding a frame's last sample to the sink's completion).
+   It includes the time data waited before any block ran, which is where a
+   slow scheduler shows first. Use the untraced value from the scan's run at
+   the calibrated scale (`at_calibrated_scale`), per receiver: EDF and rate
+   monotonic deliberately favour the faster receivers, so compare the fastest
+   receiver's and the worst receiver's, not an average over receivers.
+3. **The wait from arrival to the first block's start** (`entry_wait`, traced
+   runs): the same event under every policy, so the cleanest per-arrival
+   measure of how quickly each scheduler notices data. Traced, so compare it
+   between policies only in the same capture mask, and prefer a narrow one
+   (`work`, `0x4`) over all categories.
+4. **Worker time outside useful work, per useful call**, on the busiest
+   worker at the calibrated scale: (1 − demand) / productive calls per second
+   (`demand_per_worker`, `productive_calls_per_s_per_worker`). Near capacity
+   there is little idle time left to spin through, so this approaches the
+   scheduler's cost per call it made possible. At light load it measures
+   idleness instead: only read it at the calibrated scale.
+
+**And check the premise.** Demand per worker should agree across policies to
+within about ±0.02 at the same scale (§6). If one policy's demand is higher,
+its ordering made the same work dearer (a cache effect, say). That is a real
+cost of the policy but not scheduler overhead, and it must be named as such.
+
+Repeat each run at least three times before reading a difference between
+policies: one run per cell cannot separate a real shift of a few per cent
+from run-to-run spread.
 
 ### Markers see only what they bracket
 
@@ -347,8 +526,10 @@ Two groups of figures therefore describe different stretches of the same run:
 - **Over the short span:** every scheduler-event row in `MICRO.md`, the
   utilisation, and every batch response time and late share in
   `batch_rt.json` (`batches_in_window` counts only the batches inside it).
-- **Over the full 12 s:** `frame_rt`, because frame latencies come from
-  `latency.csv` and need no trace. The window is fixed before it is shifted.
+- **Over the full 12 s:** `frame_rt`, and in pacer mode `source_lag`,
+  `frame_e2e` and the saturation verdict, because they come from
+  `latency.csv` and `pacer.csv` and need no trace. The window is fixed before
+  it is shifted.
 
 Do not set a batch late share beside a frame late share as if they measured
 the same interval. A report states `window_covered_s` beside every batch-RT
@@ -365,20 +546,23 @@ rather than assume the narrower mask fits.
 
 ### A late batch is not always the scheduler's
 
-A batch's response time is measured from its nominal release, the instant
-the throttle *should* have published it. If the throttle published late, the
-batch starts late through no fault of the pipeline behind it. `batch_rt.json`
-separates the two for every receiver:
+A batch's response time is measured from its nominal release, the instant the
+source *should* have delivered it. If the data arrived late, the batch starts
+late through no fault of the pipeline behind it. `batch_rt.json` separates the
+two for every receiver:
 
-- `batch_rt_from_publish` measures from when the throttle actually
-  published, so it holds the pipeline's share alone;
-- `throttle_lag` is how late the publication itself was.
+- `batch_rt_from_publish` measures from when the data actually arrived, so it
+  holds the pipeline's share alone;
+- `source_lag` (also under its old name `throttle_lag`) is how late the
+  arrival itself was.
 
-When `batch_rt`'s late share is well above `batch_rt_from_publish`'s, most of
-the lateness comes from the source side. On the isolated guest, EDF's fastest
-receiver at ratio 16 was late for 1.7 % of batches from release but 0.49 %
-from publication, with a throttle lag of 55 µs at p99. Read both before
-blaming a policy.
+Under the throttle the two differed markedly: on the isolated guest, EDF's
+fastest receiver at ratio 16 was late for 1.7 % of batches from release but
+0.49 % from publication, with a throttle lag of 55 µs at p99, because the
+throttle only published when a worker ran it. Under the pacer, arrival no
+longer waits for the scheduler: the lag is the pacer's own error, a few µs,
+unless the receiver's buffer was full, and then the receiver is saturated.
+Read both before blaming a policy all the same.
 
 ### A mean that disagrees with its median
 
@@ -404,7 +588,8 @@ crosses workers. Two things follow:
   `d09a1e74` skips such blocks, but only when their producer shares their
   worker; a block fed from another worker is checked every pass, because its
   producer must not write this worker's state. On this workload each backstop
-  scan still evaluated 15.7–17.8 of a worker's 18 blocks. So most of the gain
+  scan still evaluated 15.7–17.8 of a worker's 18 blocks (throttle mode; 16
+  in pacer mode). So most of the gain
   from the per-pass fixes on M6 comes from the others. A workload that kept
   each chain on one worker would see a different picture.
 
@@ -431,7 +616,7 @@ untraced and once traced if the tracer's share matters:
 perf record -F 2999 --call-graph fp -o edf.perf -- ./build-prof/rx_latency4 \
     --run-dir data/prof_cell --out-dir /tmp/edf --chains 4 --threads 4 --policy edf \
     --fixed-batch 1024 --rates 1250000,1250000,2500000,5000000 --run-s 6 --rotate 1 \
-    --sched-ratio 16 --max-pass-duration 51 --timeout-s 120
+    --sched-ratio 16 --max-pass-duration 51 --timeout-s 120 --feed pacer
 perf script -i edf.perf --no-inline -F comm,tid,ip,sym > edf.stacks.txt
 ```
 
