@@ -1210,6 +1210,45 @@ const boost::ut::suite<"SchedulingAnalysis"> schedulingAnalysisTests = [] {
         expect(attributes->deadlineOrigin == AttributeOrigin::userSet) << "the deadline inherits the period's provenance";
     };
 
+    // An explicit zero is how a block declares "no temporal gate" in a graph whose rate would
+    // otherwise give it one. It must survive as user-set: were it derived instead, a release-tracking
+    // policy would gate the block to one batch per derived period and it could never drain a backlog.
+    "an explicit zero period is kept, not derived from the rate"_test = [] {
+        gr::Graph graph;
+        auto&     src     = graph.emplaceBlock<RateSource<float>>(atRate(1000.f));
+        auto&     zeroed  = graph.emplaceBlock<gr::testing::Copy<float>>({{"period", 0.f}, {"relative_deadline", 0.25f}});
+        auto&     bare    = graph.emplaceBlock<gr::testing::Copy<float>>({{"period", 0.f}});
+        auto&     derived = graph.emplaceBlock<gr::testing::Copy<float>>();
+        auto&     sink    = graph.emplaceBlock<gr::testing::NullSink<float>>();
+        expect(graph.connect<"out", "in">(src, zeroed).has_value());
+        expect(graph.connect<"out", "in">(zeroed, bare).has_value());
+        expect(graph.connect<"out", "in">(bare, derived).has_value());
+        expect(graph.connect<"out", "in">(derived, sink).has_value());
+        const gr::BlockModel* zeroedModel  = graph.blocks()[1].get();
+        const gr::BlockModel* bareModel    = graph.blocks()[2].get();
+        const gr::BlockModel* derivedModel = graph.blocks()[3].get();
+
+        gr::scheduler::Simple<> sched;
+        expect(sched.exchange(std::move(graph)).has_value());
+        expect(sched.changeStateTo(gr::lifecycle::State::INITIALISED).has_value());
+        const SchedulingAnalysis& analysis = sched.schedulingAnalysis();
+
+        expect(analysis.find(*derivedModel)->period > 0.f) << "the rate must derive a period where none is set, or the zero below proves nothing";
+
+        const auto* zeroedAttributes = analysis.find(*zeroedModel);
+        expect(eq(zeroedAttributes->period, 0.f)) << "an explicit zero must not be replaced by the derived period";
+        expect(zeroedAttributes->periodOrigin == AttributeOrigin::userSet);
+        expect(approx(zeroedAttributes->relativeDeadline, 0.25f, 1e-6f)) << "the deadline is independent of the period";
+
+        // Without a deadline of its own, a zero period leaves none: the implicit deadline is the
+        // period, and zero means unset. Under EDF such a block sorts last, so it must be given one.
+        const auto* bareAttributes = analysis.find(*bareModel);
+        expect(eq(bareAttributes->period, 0.f));
+        expect(eq(bareAttributes->relativeDeadline, 0.f)) << "a zero period must not imply a zero-length deadline";
+
+        std::ignore = sched.changeStateTo(gr::lifecycle::State::STOPPED);
+    };
+
     "a null batch strategy is ignored"_test = [] {
         AnchoredChain g{atRate(1000.f)};
 
