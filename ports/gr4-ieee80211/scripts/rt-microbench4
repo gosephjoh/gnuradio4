@@ -193,8 +193,13 @@ def m6_run(cell, d, log, pol, ratio, scale, run_s, traced=True, warmup=3.0, wind
     if traced:
         sh([EXP, os.path.join(d, "trace.gr4trace"), "--out-dir", d, "--meta", os.path.join(d, "trace_meta.json")] + (["--all-events"] if events else []), log)
     sh([sys.executable, ANALYSE, d, "--warmup", str(warmup), "--window", str(window), "--quiet"], log)
-    b = json.load(open(os.path.join(d, "batch_rt.json")))
-    ls = json.load(open(os.path.join(d, "latency_summary.json")))
+    lsp, bp = os.path.join(d, "latency_summary.json"), os.path.join(d, "batch_rt.json")
+    ls = json.load(open(lsp)) if os.path.exists(lsp) else {}
+    if not os.path.exists(bp) or ls.get("result") != "ok":
+        # a run that failed, timed out, or ended before the pacer started kept up with nothing:
+        # count it as saturated, so neither the calibration nor the scan builds on it
+        return {"policy": pol, "sched_ratio": ratio, "scale": scale, "run_s": run_s, "result": ls.get("result", "error"), "saturated": True, "saturation_reason": "the run did not complete", "per_chain": []}
+    b = json.load(open(bp))
     rec = {"policy": pol, "sched_ratio": ratio, "scale": scale, "run_s": run_s, "rates": [round(r * scale) for r in M6_RATES], "max_pass_duration_us": m6_pass_us(scale), "feed": ls.get("feed", "throttle"),
            "worker_cpus": ls.get("worker_cpus", []), "result": ls.get("result"), "saturated": bool(b.get("saturated")), "saturation_reason": b.get("saturation_reason"),
            "per_chain": [{"chain": pc["chain"], "rate": pc.get("rate"), "period_us": pc.get("batch_period_us"), "batch_rt": pc.get("batch_rt"), "frame_rt": pc.get("frame_rt"), "frame_e2e": pc.get("frame_e2e"),
@@ -258,10 +263,14 @@ def m6_calibrate(cell, out, log, start):
         dmax = r.get("demand_max")
         steps.append({"scale": scale, "demand_max": dmax, "demand_per_worker": r.get("demand_per_worker"), "saturated": r["saturated"], "result": r["result"]})
         print(f"m6 calibration step {k}: scale {scale:.3f} -> busiest worker's demand {dmax}, saturated {r['saturated']}", flush=True)
-        if r["result"] != "ok" or dmax is None:
-            break
         if r["saturated"]:
             saturated_at = scale if saturated_at is None else min(saturated_at, scale)
+            if kept_up is not None and kept_up[0] >= saturated_at:
+                # a scale that kept up once saturated on its repeat: fall back to the best step below it
+                below = [x for x in steps if not x["saturated"] and x["scale"] < saturated_at and x["demand_max"]]
+                kept_up = max(((x["scale"], x["demand_max"]) for x in below), default=None)
+        elif not dmax:
+            break  # no demand measured: nothing to scale from
         else:
             if kept_up is None or scale >= kept_up[0]:
                 kept_up = (scale, dmax)
@@ -295,7 +304,7 @@ def m6_saturation_scan(cell, out, log, scale, iterations=5):
     res = {}
     for ratio in (16, 4096):
         for pol in ("rr", "edf", "rm"):
-            lo, hi = None, min(cap, 2 * scale)
+            lo, hi = None, max(min(cap, 2 * scale), scale)
             probe = lambda s, tag: m6_run(cell, os.path.join(out, f"m6_scan_{pol}_r{ratio}_{tag}"), log, pol, ratio, s, M6_CAL_RUN_S, traced=False, warmup=2.0, window=6.0)
             base = probe(scale, "base")
             # untraced, at the calibrated scale: the latency every policy delivers on the same input,
@@ -504,9 +513,15 @@ def main():
         res["M5"] = m5(a.cell, a.out_dir, log)
     if "M6" in want:
         scale = a.m6_scale
+        if (a.m6_calibrate or a.m6_saturation_scan) and a.m6_feed != "pacer":
+            sys.exit("rt-microbench4: --m6-calibrate and --m6-saturation-scan need the pacer: under the throttle arrival itself slips as the workers fill, and saturation is judged by the pacer's write lag")
+        if scale > stimulus_scale_cap(a.cell, a.m6_run_s):
+            sys.exit(f"rt-microbench4: --m6-scale {scale} would run the fastest receiver past the end of the cell (at most {stimulus_scale_cap(a.cell, a.m6_run_s):.2f} for {a.m6_run_s} s)")
+        # a new M6 section replaces the old one whole: a calibration or a scan from an earlier
+        # invocation, at another scale, must not be reported beside it
+        res.pop("M6_calibration", None)
+        res.pop("M6_saturation_scan", None)
         if a.m6_calibrate:
-            if a.m6_feed != "pacer":
-                sys.exit("rt-microbench4: --m6-calibrate needs the pacer: under the throttle arrival itself slips as the workers fill")
             res["M6_calibration"] = m6_calibrate(a.cell, a.out_dir, log, a.m6_scale)
             scale = res["M6_calibration"]["scale"]
             if scale is None:

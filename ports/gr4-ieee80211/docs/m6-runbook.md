@@ -45,7 +45,7 @@ export and analysis. The optional saturation scan (§5) adds about 45 minutes.
 | ≈ 2.5 GB RAM for one translation unit | `src/chain.cpp`; build with `-j4` or lower on a small machine |
 | ≈ 6 GB free disk | 4.7 GB for the stimulus cell, about 1 GB of capture per run (deleted after each analysis) |
 | at least 8 hardware threads | four workers plus the tracing and the driver; fewer and the workers contend with the harness |
-| a fifth CPU for the pacer | it sleeps until 60 µs before each chunk is due, then spins; with four receivers a chunk falls due every ~50 µs on average at scale 1, so expect it to keep most of one CPU busy. On the isolated guest give it a housekeeping CPU (`--pacer-cpu 3`), never one of the workers' |
+| a fifth CPU for the pacer | it sleeps until 60 µs before each chunk is due, then spins; the four receivers together need about 9 800 chunks a second at scale 1 (a chunk every ~100 µs on average, every ~50 µs at 2×), so expect it to keep roughly half of one CPU busy at scale 1 and most of it near capacity. On the isolated guest give it a housekeeping CPU (`--pacer-cpu 3`), never one of the workers' |
 | four CPUs the workers can have to themselves | on a guest set up as `docs/e2e-sweep-runbook.md` §13 describes (CPUs 4–7 isolated, everything else confined to 0–3) the workers get them only if pinned: pass `--cpus 4-7` (§5). On a machine without that isolation, omit it |
 | the machine otherwise idle | this is a timing measurement: no other build, no other benchmark, nothing interactive |
 
@@ -121,7 +121,8 @@ there.
 share of its time inside `work()` calls that processed data
 (`trace-batch-rt.py`, `utilization.per_worker`). It then steps the scale as
 scale × 0.94 / demand and repeats, until two consecutive runs land in
-0.93–0.95, for at most five steps. Every step is recorded in `micro.json`
+0.93–0.95, for at most ten runs (five steps, each possibly confirmed). Every
+step is recorded in `micro.json`
 (`M6_calibration`) and `MICRO.md`, and the six runs use the accepted scale.
 The pass budget follows the scale (§7).
 
@@ -181,7 +182,8 @@ A run that did not keep real time measures a backlog, not a schedule. For
 each of the six `m6_*/latency_summary.json`:
 
 - `"result": "ok"` — not `"timeout"` or `"error"`.
-- `"max_pass_duration_us": 51` and `"sched_ratio"` 16 or 4096 as expected.
+- `"max_pass_duration_us"` 51 at scale 1, or 51.2 / scale rounded after
+  calibration (§7), and `"sched_ratio"` 16 or 4096 as expected.
   If the budget reads 0, the run took the scheduler's auto rule and §7 says
   why that is wrong here.
 - in every `per_chain` entry `decoded` equals `frames`, and at the top level
@@ -189,7 +191,8 @@ each of the six `m6_*/latency_summary.json`:
   decoded and checked byte for byte. (The top-level `frames` is the whole
   60 s cell, 102 934; a 20 s replay decodes 34 308 of them, so
   `decoded_total` is expected to be well below it.)
-- `elapsed_s` close to 20: a run that took appreciably longer did not keep up.
+- `elapsed_s` close to 20, plus about 0.5 s in pacer mode (the pacer's start
+  delay): a run that took appreciably longer did not keep up.
 - `worker_cpus` reads `[4, 5, 6, 7]` when the run was meant to be pinned,
   and `rt_prio` 0.
 - `"feed": "pacer"`, `pacer.finished` true and `pacer.error` empty;
@@ -213,7 +216,8 @@ and that every run's `demand_max` lies within ±0.02 of the calibration's last
 step. Demand should not depend on the policy; a larger spread means it does
 here, and the like-for-like comparison of §9 needs that explained first.
 
-Note each run's `window_covered_s` and `window_shifted` from the same file.
+Note each run's `window_covered_s` and `window_shifted` from its
+`m6_<policy>_r<ratio>/batch_rt.json` (they are not copied into `micro.json`).
 They say how much of the run the trace-based figures describe, and §9 says
 why that is usually far less than the 12 s asked for.
 
@@ -232,6 +236,7 @@ block from ever draining a backlog. The real timing is carried by
 `relative_deadline` instead (`src/chain.cpp`). In throttle mode every block
 declares a 1 µs period, and the auto rule would read 250 ns, ending every EDF
 pass after a single `work()` call. In pacer mode EDF's periods are exactly 0
+(except the recorders `--record` adds, which are for correctness runs only)
 (an explicit 0 means no temporal gate, and `qa_SchedulingAnalysis` pins that
 it is kept rather than derived), and the auto rule, which ignores zero
 periods, would switch the budget off. Either way, stating the budget gives the
@@ -405,7 +410,8 @@ holding throttles are unlike the other two.
 Pacer runs do not have this. The pacer's entry block has an input, so EDF
 releases it only when a chunk has arrived: a check on this workload found its
 selections equal to its productive calls. It has the pre-gate blocks' deadline
-(one batch period), not a tiny one, so EDF orders it honestly against other
+(one batch period times the receiver's class factor), not a tiny one, so EDF
+orders it honestly against other
 work and its jobs do not "miss" by construction; the EDF miss counts include
 it. One exception remains, and holds for any block: while a block's *output*
 is full, EDF keeps releasing it on its input alone and it keeps finding no

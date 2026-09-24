@@ -413,8 +413,11 @@ receiver alone is never cut.
 - Saturated runs (any receiver's pacer write lag p95 above ten batch periods;
   under the throttle, its publication lag) are listed and excluded from the
   pooled statistics, and their count per cell is in the table. The verdict
-  needs no trace (`latency_summary.json` `per_chain[].pacer.saturated`, and
-  `batch_rt.json`).
+  needs no trace. `batch_rt.json`'s is the one to report: it judges the chunks
+  inside the analysis window, the warm-up excluded. `latency_summary.json`'s
+  `per_chain[].pacer.saturated` judges every chunk of the run, warm-up
+  included, and is a quick check only: the two can disagree on a run that
+  started badly.
 
 ## 9. How the blocks' scheduling parameters are derived
 
@@ -510,7 +513,8 @@ receiver's **entry block** (a copy, fanning out to `mag2`, `dly16` and
   the graph.
 
 The entry block is timed like the pre-gate blocks it feeds (period as they
-have it; deadline one batch period), because the tiny deadline the throttle
+have it; deadline one batch period times the class factor), because the tiny
+deadline the throttle
 had existed only because the throttle was the clock. Under EDF every block
 declares a period of exactly 0 in pacer mode, with an explicit deadline
 everywhere. The entry block must take no input from inside the graph: the
@@ -601,7 +605,8 @@ use `CLOCK_MONOTONIC`, so every instant in the analysis is on one clock.
 6. **Check every run before reading a number** (`index.json`, then each
    `latency_summary.json` / `batch_rt.json` / `trace_meta.json`): `result` ok;
    per-chain `decoded == frames`, `missing_total` 0, `wrong_payload_total` 0;
-   `elapsed_s` within a few percent of 30; trace `lost` 0 (or the retained
+   `elapsed_s` within a few percent of 30 (plus the pacer's 0.5 s start
+   delay); trace `lost` 0 (or the retained
    span per run, if the ring held less); `saturated` per receiver; the
    `scheduler` field says `Simple<multiThreaded>`; `worker_cpus` and `rt_prio` say
    what §13 asked for; `feed` is `pacer`, `pacer.finished` true, and per

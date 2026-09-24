@@ -699,10 +699,11 @@ int main(int argc, char** argv) {
         uint64_t            missing_n = 0, misses = 0, unstamped = 0;
         double              first_us = std::nan("");
         const PacerStream*  stream   = pacer ? &pacer->streams()[k] : nullptr;
+        const bool          clocked  = stream && stream->t0Ns != 0; // false when the run ended before the pacer started
         for (std::size_t i = 0; i < frames_k; i++) {
             const uint64_t tf = stream ? stream->log[stream->chunkOf(first[i])].writtenNs : cb.stamper->_t_first[i];
             const uint64_t tl = stream ? stream->log[stream->chunkOf(last[i])].writtenNs : cb.stamper->_t_last[i];
-            const uint64_t tn = stream ? stream->nominalNs(stream->chunkOf(last[i])) : 0;
+            const uint64_t tn = clocked ? stream->nominalNs(stream->chunkOf(last[i])) : 0;
             const uint64_t td = cb.sink->_t_decode[i];
             if (tf == 0 || tl == 0) {
                 ++unstamped;
@@ -772,7 +773,7 @@ int main(int argc, char** argv) {
                 const PacerStream& st = pacer->streams()[k];
                 for (std::size_t j = 0; j < st.log.size(); ++j) {
                     const uint64_t first_sample = static_cast<uint64_t>(j) * st.chunk;
-                    std::fprintf(pf, "%zu,%zu,%llu,%llu,%llu,%llu,%u\n", k, j, static_cast<unsigned long long>(first_sample), static_cast<unsigned long long>(std::min<uint64_t>(st.chunk, st.total - first_sample)), static_cast<unsigned long long>(st.nominalNs(j)), static_cast<unsigned long long>(st.log[j].writtenNs), st.log[j].retries);
+                    std::fprintf(pf, "%zu,%zu,%llu,%llu,%llu,%llu,%u\n", k, j, static_cast<unsigned long long>(first_sample), static_cast<unsigned long long>(std::min<uint64_t>(st.chunk, st.total - first_sample)), static_cast<unsigned long long>(st.t0Ns != 0 ? st.nominalNs(j) : 0ULL), static_cast<unsigned long long>(st.log[j].writtenNs), st.log[j].retries);
                 }
             }
             std::fclose(pf);
