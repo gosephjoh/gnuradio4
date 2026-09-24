@@ -150,6 +150,41 @@ with the scale it saturated at. That is still the right operating point — the
 most load this machine carries under the least demanding policy — but say in
 the report that the band was not reached, and at what demand it stopped.
 
+`--m6-reference POLICY[,RATIO]` chooses the calibration's reference
+(default `rr,4096`). With `rm,4096` the calibration settles where rate
+monotonic first fails to keep up, which on this workload is where it starves
+a slow receiver (§9), well below round robin's capacity: the six runs then
+measure every policy at an input the least capable of them just sustains,
+and the band is not reached. `--m6-cal-run-s` and `--m6-cal-steps` set the
+length of a calibration step and how many (each possibly confirmed, so at
+most twice as many runs); `--m6-trace-buffer` and `--m6-trace-mask` the
+ring and the categories of the six runs, `--m6-cal-trace-buffer` and
+`--m6-cal-trace-mask` those of a calibration step. Export and analysis time
+scale with the ring, and so does the window the trace-based rows cover (§9):
+the published configuration (16 M records, every category, 10 s steps, 20 s
+runs) took 29 min on this guest, of which the runs were a fifth. A short
+configuration measured on 2026-09-24:
+
+```
+--m6-run-s 5 --m6-cal-run-s 4 --m6-cal-steps 2 \
+    --m6-trace-buffer 4194304 --m6-trace-mask 0x17f \
+    --m6-cal-trace-buffer 4194304 --m6-cal-trace-mask 0x104
+```
+
+took 6 min 51 s (four calibration steps, six runs), with the trace-based
+rows over 0.4–0.6 s of each RR or RM run and 1.8–2.2 s of each EDF run.
+`0x17f` drops `workPhases`, which no M6 row reads; a calibration step needs
+only the demand, and `0x104` (`work` + `workExact`) gives it — `workExact`
+alone does not, because the worker attribution comes from the `work`
+records. Do not go below 4 M records with every category live: a 2 M ring
+retains ~0.25 s, which on a 4 s run lies entirely in the drain after the
+input ends, and the analysis then refuses the capture (above) — a
+calibration step reads that as "saturated" and the scale collapses. The
+analysis window follows the run length (warm-up at most 15 % of the run).
+A 5 s run is dominated by its start-up (the pacer's 0.5 s delay, the
+workers' first passes), so its saturation verdicts and late shares are less
+settled than a 20 s run's; the reading says so.
+
 `--m6-scale S` skips the calibration and runs at scale S (with
 `--m6-calibrate`, S is the first step). `--m6-saturation-scan` adds, after the
 six runs, a bisection per policy and ratio for the largest scale that still

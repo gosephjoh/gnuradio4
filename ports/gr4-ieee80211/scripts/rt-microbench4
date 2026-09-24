@@ -162,8 +162,16 @@ def m6_pass_us(scale):
 M6_PASS_US = m6_pass_us(1.0)
 # calibration (docs/m6-runbook.md 4a): the busiest worker's demand, the share of its time in work()
 # calls that moved samples, is brought into this band by scaling every receiver's rate together
-M6_CAL_TARGET, M6_CAL_BAND, M6_CAL_RUN_S, M6_CAL_STEPS = 0.94, (0.93, 0.95), 10, 5
-M6_REFERENCE = ("rr", 4096)  # no release tracking, fewest message phases: the last to saturate
+M6_CAL_TARGET, M6_CAL_BAND = 0.94, (0.93, 0.95)
+M6_CAL = {"run_s": 10.0, "steps": 5}  # --m6-cal-run-s, --m6-cal-steps: a step may be confirmed, so at most 2 x steps runs
+M6_REFERENCE = ["rr", 4096]  # --m6-reference; RR at 4096: no release tracking, fewest message phases, the last to saturate
+M6_RING = {"records": 16777216, "mask": "all", "cal_records": 16777216, "cal_mask": "all"}  # --m6-trace-buffer/--m6-trace-mask and the calibration's; export and analysis time scale with the ring
+
+
+def analysis_window(run_s, warmup, window):
+    """the warm-up and window the analysis is asked for, kept inside a run shorter than their sum"""
+    warmup = min(warmup, 0.15 * run_s)
+    return warmup, min(window, run_s - warmup)
 
 
 CPUS = []  # --cpus LIST, appended to every rx_latency4 command
@@ -180,7 +188,7 @@ def stimulus_scale_cap(cell, run_s):
     return samples / (max(M6_RATES) * run_s)
 
 
-def m6_run(cell, d, log, pol, ratio, scale, run_s, traced=True, warmup=3.0, window=12.0, events=True):
+def m6_run(cell, d, log, pol, ratio, scale, run_s, traced=True, warmup=3.0, window=12.0, events=True, ring=None, mask=None):
     """one M6 run at `scale` x the base rates; returns the per-run record (and deletes the capture).
     events=False skips the per-kind event statistics: a calibration step needs only the demand."""
     os.makedirs(d, exist_ok=True)
@@ -188,10 +196,11 @@ def m6_run(cell, d, log, pol, ratio, scale, run_s, traced=True, warmup=3.0, wind
     cmd = [RX, "--run-dir", cell, "--out-dir", d, "--chains", "4", "--threads", "4", "--policy", pol, "--fixed-batch", str(M6_BATCH), "--rates", rates, "--run-s", str(run_s), "--rotate", "1",
            "--sched-ratio", str(ratio), "--max-pass-duration", str(m6_pass_us(scale)), "--timeout-s", str(10 * run_s + 60)] + FEED + pin()
     if traced:
-        cmd += ["--trace-categories", "all", "--trace-buffer", "16777216", "--trace-limit-mb", "1024", "--trace-out", os.path.join(d, "trace.gr4trace")]
+        cmd += ["--trace-categories", mask or M6_RING["mask"], "--trace-buffer", str(ring or M6_RING["records"]), "--trace-limit-mb", "1024", "--trace-out", os.path.join(d, "trace.gr4trace")]
     sh(cmd, log)
     if traced:
         sh([EXP, os.path.join(d, "trace.gr4trace"), "--out-dir", d, "--meta", os.path.join(d, "trace_meta.json")] + (["--all-events"] if events else []), log)
+    warmup, window = analysis_window(run_s, warmup, window)
     sh([sys.executable, ANALYSE, d, "--warmup", str(warmup), "--window", str(window), "--quiet"], log)
     lsp, bp = os.path.join(d, "latency_summary.json"), os.path.join(d, "batch_rt.json")
     ls = json.load(open(lsp)) if os.path.exists(lsp) else {}
@@ -200,7 +209,7 @@ def m6_run(cell, d, log, pol, ratio, scale, run_s, traced=True, warmup=3.0, wind
         # count it as saturated, so neither the calibration nor the scan builds on it
         return {"policy": pol, "sched_ratio": ratio, "scale": scale, "run_s": run_s, "result": ls.get("result", "error"), "saturated": True, "saturation_reason": "the run did not complete", "per_chain": []}
     b = json.load(open(bp))
-    rec = {"policy": pol, "sched_ratio": ratio, "scale": scale, "run_s": run_s, "rates": [round(r * scale) for r in M6_RATES], "max_pass_duration_us": m6_pass_us(scale), "feed": ls.get("feed", "throttle"),
+    rec = {"policy": pol, "sched_ratio": ratio, "scale": scale, "run_s": run_s, "rates": [round(r * scale) for r in M6_RATES], "max_pass_duration_us": m6_pass_us(scale), "feed": ls.get("feed", "throttle"), "trace_buffer_records": (ls.get("trace") or {}).get("buffer_records"), "trace_mask": (ls.get("trace") or {}).get("mask"),
            "worker_cpus": ls.get("worker_cpus", []), "result": ls.get("result"), "saturated": bool(b.get("saturated")), "saturation_reason": b.get("saturation_reason"),
            "per_chain": [{"chain": pc["chain"], "rate": pc.get("rate"), "period_us": pc.get("batch_period_us"), "batch_rt": pc.get("batch_rt"), "frame_rt": pc.get("frame_rt"), "frame_e2e": pc.get("frame_e2e"),
                           "entry_wait": pc.get("entry_wait"), "source_lag": pc.get("source_lag"), "saturated": pc.get("saturated"), "edf": pc.get("edf")} for pc in b["per_chain"]]}
@@ -254,12 +263,12 @@ def m6_calibrate(cell, out, log, start):
     -- and then the bracket closes below the band: the calibration settles on the largest scale that
     kept up and says the band was not reached."""
     pol, ratio = M6_REFERENCE
-    cap = stimulus_scale_cap(cell, max(M6_RUN["s"], M6_CAL_RUN_S))
+    cap = stimulus_scale_cap(cell, max(M6_RUN["s"], M6_CAL["run_s"]))
     lo_band, hi_band = M6_CAL_BAND
     steps, scale = [], min(start, cap)
     kept_up, saturated_at, accepted = None, None, None  # (scale, demand) of the largest scale that kept up; smallest that did not
-    for k in range(2 * M6_CAL_STEPS):
-        r = m6_run(cell, os.path.join(out, f"m6_cal_{k}"), log, pol, ratio, scale, M6_CAL_RUN_S, warmup=2.0, window=6.0, events=False)
+    for k in range(2 * M6_CAL["steps"]):
+        r = m6_run(cell, os.path.join(out, f"m6_cal_{k}"), log, pol, ratio, scale, M6_CAL["run_s"], warmup=2.0, window=6.0, events=False, ring=M6_RING["cal_records"], mask=M6_RING["cal_mask"])
         dmax = r.get("demand_max")
         steps.append({"scale": scale, "demand_max": dmax, "demand_per_worker": r.get("demand_per_worker"), "saturated": r["saturated"], "result": r["result"]})
         print(f"m6 calibration step {k}: scale {scale:.3f} -> busiest worker's demand {dmax}, saturated {r['saturated']}", flush=True)
@@ -289,7 +298,7 @@ def m6_calibrate(cell, out, log, start):
         if saturated_at is not None and proposal >= saturated_at:
             proposal = (kept_up[0] + saturated_at) / 2
         scale = min(cap, proposal)
-    cal = {"reference": {"policy": pol, "sched_ratio": ratio}, "target": M6_CAL_TARGET, "band": list(M6_CAL_BAND), "run_s": M6_CAL_RUN_S, "stimulus_cap": cap, "steps": steps,
+    cal = {"reference": {"policy": pol, "sched_ratio": ratio}, "target": M6_CAL_TARGET, "band": list(M6_CAL_BAND), "run_s": M6_CAL["run_s"], "max_runs": 2 * M6_CAL["steps"], "stimulus_cap": cap, "steps": steps,
            "converged": accepted is not None, "band_reached": accepted is not None, "saturated_at": saturated_at}
     cal["scale"] = accepted if accepted is not None else (kept_up[0] if kept_up else None)
     if accepted is None:
@@ -300,12 +309,12 @@ def m6_calibrate(cell, out, log, start):
 
 def m6_saturation_scan(cell, out, log, scale, iterations=5):
     """per policy and ratio, the largest scale that still keeps up (pacer write lag), untraced"""
-    cap = stimulus_scale_cap(cell, M6_CAL_RUN_S)
+    cap = stimulus_scale_cap(cell, M6_CAL["run_s"])
     res = {}
     for ratio in (16, 4096):
         for pol in ("rr", "edf", "rm"):
             lo, hi = None, max(min(cap, 2 * scale), scale)
-            probe = lambda s, tag: m6_run(cell, os.path.join(out, f"m6_scan_{pol}_r{ratio}_{tag}"), log, pol, ratio, s, M6_CAL_RUN_S, traced=False, warmup=2.0, window=6.0)
+            probe = lambda s, tag: m6_run(cell, os.path.join(out, f"m6_scan_{pol}_r{ratio}_{tag}"), log, pol, ratio, s, M6_CAL["run_s"], traced=False, warmup=2.0, window=6.0)
             base = probe(scale, "base")
             # untraced, at the calibrated scale: the latency every policy delivers on the same input,
             # free of the tracer's cost, which differs between policies
@@ -375,7 +384,7 @@ def write_md(res, out):
         any_run = next(iter(res["M6"].values()))
         m6_scale = any_run.get("scale", 1.0)
         m6_feed = any_run.get("feed", "throttle")
-        L.append(f"\n## M6 — scheduler pass cost on four workers (light mix 1.25/1.25/2.5/5 Msps x {m6_scale:.3f}, N = {M6_BATCH}, rotation 1, {any_run.get('run_s', 20)} s, input: {m6_feed}, every category traced, selection pass bounded at {any_run.get('max_pass_duration_us', M6_PASS_US)} µs)\n")
+        L.append(f"\n## M6 — scheduler pass cost on four workers (light mix 1.25/1.25/2.5/5 Msps x {m6_scale:.3f}, N = {M6_BATCH}, rotation 1, {any_run.get('run_s', 20)} s, input: {m6_feed}, {'every category traced' if any_run.get('trace_mask') in (None, 511, 'all') else f"trace mask 0x{int(any_run.get('trace_mask')):x}"}, {any_run.get('trace_buffer_records') or 16777216} records per ring, selection pass bounded at {any_run.get('max_pass_duration_us', M6_PASS_US)} µs)\n")
         cal = res.get("M6_calibration")
         if cal:
             L.append(f"\nCalibration ({cal['reference']['policy']} at ratio {cal['reference']['sched_ratio']}, {cal['run_s']} s steps, band {cal['band'][0]}-{cal['band'][1]} for the busiest worker's demand): " + "; ".join(f"x{x['scale']:.3f} -> {x['demand_max'] if x['demand_max'] is None else round(x['demand_max'], 3)}{' (saturated)' if x['saturated'] else ''}" for x in cal["steps"]) + f". Scale used: {cal['scale']}" + ("" if cal["converged"] else f" (band not reached: the largest scale that kept up; the reference saturated at {cal.get('saturated_at')})") + "\n")
@@ -486,7 +495,14 @@ def main():
     ap.add_argument("--pacer-cpu", type=int, help="pin the pacer thread to this CPU (a housekeeping CPU, not one of --cpus)")
     ap.add_argument("--m6-run-s", type=float, default=20.0, help="M6 run length in seconds (20 for every published M6; shorter only for a check)")
     ap.add_argument("--m6-scale", type=float, default=1.0, help="multiply every M6 rate by this; with --m6-calibrate, the first step")
-    ap.add_argument("--m6-calibrate", action="store_true", help="find the scale at which the busiest worker's demand is 0.93-0.95 (RR at ratio 4096, 10 s steps), then run M6 at it")
+    ap.add_argument("--m6-calibrate", action="store_true", help="find the scale at which the busiest worker's demand is 0.93-0.95 (--m6-reference at --m6-cal-run-s per step), then run M6 at it")
+    ap.add_argument("--m6-reference", default="rr,4096", help="the policy[,ratio] the calibration and its saturation verdict use (default rr,4096: the last to saturate); rm,4096 calibrates to where rate monotonic starves a receiver")
+    ap.add_argument("--m6-cal-run-s", type=float, default=10.0, help="length of each calibration step (default 10)")
+    ap.add_argument("--m6-cal-steps", type=int, default=5, help="calibration steps, each possibly confirmed, so at most twice this many runs (default 5)")
+    ap.add_argument("--m6-trace-buffer", type=int, default=16777216, help="trace records per worker for the six runs (default 16777216 = 512 MB); export and analysis time scale with it, and so does the window the trace-based rows cover")
+    ap.add_argument("--m6-trace-mask", default="all", help="trace categories of the six runs (default all; 0x17f drops workPhases, which no M6 row reads, and holds a longer window in the same ring)")
+    ap.add_argument("--m6-cal-trace-buffer", type=int, default=16777216, help="trace records per worker for a calibration step")
+    ap.add_argument("--m6-cal-trace-mask", default="all", help="trace categories of a calibration step; it needs only the demand, which 0x100 (workExact) gives at a fraction of the records")
     ap.add_argument("--m6-saturation-scan", action="store_true", help="after M6, bisect each policy's largest scale that still keeps up (untraced 10 s runs; about 7 runs per policy and ratio)")
     a = ap.parse_args()
     if a.cpus:
@@ -494,6 +510,12 @@ def main():
             lo, _, hi = tok.partition("-")
             CPUS.extend(range(int(lo), int(hi or lo) + 1))
     M6_RUN["s"] = a.m6_run_s
+    M6_CAL["run_s"], M6_CAL["steps"] = a.m6_cal_run_s, a.m6_cal_steps
+    M6_RING.update(records=a.m6_trace_buffer, mask=a.m6_trace_mask, cal_records=a.m6_cal_trace_buffer, cal_mask=a.m6_cal_trace_mask)
+    ref = a.m6_reference.split(",")
+    if ref[0] not in ("rr", "edf", "rm") or (len(ref) > 1 and ref[1] not in ("16", "4096")):
+        sys.exit("rt-microbench4: --m6-reference must be rr|edf|rm[,16|4096]")
+    M6_REFERENCE[:] = [ref[0], int(ref[1]) if len(ref) > 1 else 4096]
     FEED[:] = ["--feed", a.m6_feed] + (["--pacer-cpu", str(a.pacer_cpu)] if a.pacer_cpu is not None and a.m6_feed == "pacer" else [])
     os.chdir(HERE)
     os.makedirs(a.out_dir, exist_ok=True)
