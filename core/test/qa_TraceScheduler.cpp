@@ -696,6 +696,8 @@ const boost::ut::suite<"TraceScheduler"> traceSchedulerTests = [] {
         exportTimeline("t1d-terminal-done");
 
         expect(gt(okRecords, 0UZ) >> fatal) << "the graph must actually have done work";
+        expect(gt(doneRecords, okRecords)) << "stepped well past its end, a finished graph must be re-invoked more often than it "
+                                              "did work -- the flood of terminal records this scenario exists to show";
         expect(gt(doneSweeps, 0UZ)) << "a sweep whose blocks have all finished must report DONE, which is what lets a real "
                                        "worker break its loop -- the bound on the flood";
         // Recorded rather than asserted as a limit: the ratio is what it is, and the point is that a
@@ -753,6 +755,8 @@ const boost::ut::suite<"TraceScheduler"> traceSchedulerTests = [] {
 
         expect(gt(syncs, 0UZ) >> fatal) << "a running pool worker must re-sync at least once";
         expect(gt(phases, 0UZ)) << "the message phase must be entered";
+        expect(gt(houseKeeps, 0UZ)) << "buffer house-keeping rides the message phase under the default policy";
+        expect(le(houseKeeps, phases)) << "house-keeping runs inside a message phase, so it cannot happen more often";
 
         // The finding, asserted rather than merely printed: the overwhelming majority of re-syncs
         // rebuild state for a block list that did not change. A future fix that made the re-sync

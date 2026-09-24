@@ -439,6 +439,7 @@ const boost::ut::suite<"TraceBlock"> traceBlockTests = [] {
             pendingNs    = 0UL;
             pendingCount = 0UZ;
         }
+        expect(gt(nGrouped, nFullGroups)) << "the zero-work exit must occur, or the one-phase shape allowed above is never exercised";
         expect(eq(seen.size(), kPhaseCount)) << "all four stages must be represented, or the split does not partition the invocation";
         expect(gt(nFullGroups, 1UZ) >> fatal) << "fewer than two complete invocations cannot demonstrate containment";
         expect(eq(nFullGroups, 8UZ)) << "4096 samples at a 512 cap is eight productive invocations";

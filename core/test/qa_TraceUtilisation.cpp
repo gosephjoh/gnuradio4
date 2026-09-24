@@ -411,7 +411,7 @@ const boost::ut::suite<"TraceUtilisationLive"> traceUtilisationLiveTests = [] {
 
     "the two clocks agree with each other and with the wall"_test = [] {
         const std::vector<Event> events = runLive(categoryMask(Category::work, Category::schedulerLoop, Category::lifecycle), gr::Size_t{200000U});
-        const WorkerUtilisation& w      = workerUtilisation(events, 0UL).front();
+        const WorkerUtilisation  w      = workerUtilisation(events, 0UL).front(); // a copy: the vector is a temporary
         expect(w.computed >> fatal) << w.reason;
         expect(w.hasThreadCpuTime >> fatal) << "this platform has CLOCK_THREAD_CPUTIME_ID, so the reading must be present";
 
@@ -556,7 +556,7 @@ const boost::ut::suite<"TraceUtilisationLive"> traceUtilisationLiveTests = [] {
         // worker, the other by block -- so a mismatch means the two attributions disagree, which is
         // a direct check on the identity plumbing.
         const std::vector<Event> events = runLive(categoryMask(Category::work, Category::schedulerLoop, Category::lifecycle), gr::Size_t{50000U});
-        const WorkerUtilisation& w      = workerUtilisation(events, 0UL).front();
+        const WorkerUtilisation  w      = workerUtilisation(events, 0UL).front(); // a copy: the vector is a temporary
         expect(w.computed >> fatal) << w.reason;
 
         std::map<EntityId, std::uint64_t> byBlock;
