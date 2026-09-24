@@ -1,9 +1,14 @@
 # The end-to-end latency sweep: plan and runbook
 
 *Status: a plan, not yet run. Section 12 lists the questions still open and
-the decisions already taken (2026-09-23); open ones are marked ⚠ where they
-arise. Every number in this document that is not quoted from a file came from
-a script run on 2026-09-23 against the tree at `df99fb1`.*
+the decisions already taken (2026-09-23 and 2026-09-24); open ones are marked
+⚠ where they arise. From 2026-09-24 the sweep's input is the pacer
+(`rx_latency4 --feed pacer`, §10), and its headline metric needs no trace
+(§8.1).*
+
+*Every number in this document that is not quoted from a file came from a
+script run on 2026-09-23 against the tree at `df99fb1`, except where a
+later date is given.*
 
 The sweep repeats the shape of the published which-policy-for-which-workload
 sweep (`results/sweep-x86-8core/full/REPORT.md`) with a fourth scheduler
@@ -92,10 +97,11 @@ quarter of it; every run of a workload replays the same frames.
 restrictions": `--policy rr` without `--fixed-batch`, which leaves every
 block's `max_batch_size` at GR4's default (unbounded), no `min_samples` on any
 input, and — because `chain.cpp` attaches `period`/`relative_deadline` only in
-fixed-batch mode — no timing attributes at all. Two things follow. The throttle
-then runs in its plain mode (§10: it releases min(due, chunk) per call, with
-chunk = 4096, the app's default when `--fixed-batch` does not set it), and the
-end-to-end metric must be defined without a batch grid (§8). Decided
+fixed-batch mode — no timing attributes at all. Two things follow. Under the
+throttle it would then run in its plain mode (§10), and the end-to-end metric
+would have to be defined without a batch grid (§8). Under the pacer, which the
+sweep uses, the unbatched run is fed exactly like the batched ones: 1024-sample
+chunks at their nominal instants; only the pipeline's batch contract differs. Decided
 (2026-09-23): the unbatched run passes **`--chunk 1024`** and **`--catch-up`**.
 With the app's default chunk of 4096 the throttle's timer wakes every
 4096/rate — 1.6 ms at 2.5 Msps, 819 µs at 5 Msps — and data waits up to a
@@ -193,16 +199,20 @@ build/rx_latency4 --run-dir data/rt_300_300_102934_QPSK_1_2_s1 --out-dir <run> \
     --policy {rr|rm|edf} --fixed-batch 1024 \
     --threads 3 --chains 4 --rates 1250000,1250000,2500000,5000000 --run-s 30 \
     --rotate 1 --sched-ratio 4096 --max-pass-duration 51 --timeout-s 240 \
-    --cpus 4-7 \
+    --cpus 4-7 --feed pacer --pacer-cpu 3 \
     --trace-categories <mask> --trace-buffer <R> --trace-limit-mb <M> --trace-out <run>/trace.gr4trace
 ```
+
+`--feed pacer` replaces the file source and throttle with the pacer (§10);
+`--pacer-cpu 3` gives it a housekeeping CPU of its own.
 
 `simple1`/`simple2` use `--chains 1|2 --threads 1|2 --rate 2500000
 --max-samples 75000000` (30 s × 2.5 Msps) and `--max-pass-duration 102`.
 
-The unbatched RR run drops `--fixed-batch 1024` and adds `--chunk 1024
---catch-up`; it keeps `--max-pass-duration`, which RR does not read, so that
-every run's record carries the same settings.
+The unbatched RR run drops `--fixed-batch 1024` and adds `--chunk 1024`
+(the pacer's write chunk; `--catch-up` only matters to the throttle and may
+stay for the record); it keeps `--max-pass-duration`, which RR does not read,
+so that every run's record carries the same settings.
 
 Every command the driver issues is logged verbatim (`sweep.log`), and every
 run's `latency_summary.json` and `trace_meta.json` carry the values actually
@@ -222,8 +232,11 @@ applied (`sched_ratio`, `max_pass_duration_us`, `fixed_batch`, `rotate`,
 ## 6. What each run records
 
 From `rx_latency4`: `latency.csv` (one row per frame: the arrival stamps of its
-first and last sample at the throttle output, the sink's decode stamp, both
-latencies, decoded/correct flags), `latency_summary.json` (settings applied,
+first and last sample — under the pacer, the write instants of the chunks
+holding them — the sink's decode stamp, both latencies, decoded/correct flags,
+and under the pacer the nominal instant of the last sample's chunk with the
+latency from it), `pacer.csv` (one row per chunk: nominal and actual write
+instant, retries), `latency_summary.json` (settings applied,
 per-chain frame accounting, the clock-measured latency quantiles, `result`,
 `elapsed_s`), `trace_meta.json` (every block's GR4 name against its role, each
 throttle's start anchor, GR4's derived scheduling attributes per block —
@@ -231,8 +244,9 @@ period, deadline, priority, batch floor and ceiling, each with its origin —,
 the ring statistics `recorded` / `lost` / `rings`), and the capture
 `trace.gr4trace`.
 
-From the analysis (`trace-batch-rt.py`, extended per §8): `batch_rt.json`,
-`batch_rt.csv` (one row per batch), and the new per-frame end-to-end table.
+From the analysis (`trace-batch-rt.py`): `batch_rt.json`, `batch_rt.csv` (one
+row per batch), and `frame_e2e.csv` (one row per decoded frame: write, nominal
+and sink instants, E2E from the write and from the nominal instant).
 
 Added for this sweep: the **block-to-worker assignment**, read from the
 capture (every record carries its worker id) and written into
@@ -296,8 +310,29 @@ are (`scripts/trace-batch-rt.py`, `harness_blocks.hpp`):
 
 The proposed metric for this sweep, per frame *f*:
 
-> **E2E(f) = end of the sink invocation that delivered f − nominal release of
-> the data that completed f.**
+> **E2E(f) = the sink's stamp for f − the pacer's write of the chunk holding
+> f's last sample** (decided 2026-09-24; it supersedes the trace-based
+> proposal below, kept for the record).
+>
+> Nothing here needs a trace. The chunk holding the last sample is
+> ⌊s_last / chunk⌋ (manifest offsets); its write instant is in `pacer.csv`;
+> the sink stamps every packet of a call once, at the end of the call that
+> delivered it (pacer mode only), so the stamp is the completion of the sink
+> job. The latency therefore includes the time the data waited in the entry
+> block's buffer before any block ran, which no trace can see. It covers the
+> whole run, so the ring's size (§7) no longer bounds the headline metric;
+> the capture is still needed for batch response times, EDF misses and the
+> block-to-worker assignment. `trace-batch-rt.py` reports it per receiver as
+> `frame_e2e` (and `frame_e2e_nominal`, from the chunk's nominal instant: the
+> difference is the pacer's own error, a few µs), and writes `frame_e2e.csv`.
+> The unbatched configuration is measured the same way: its data also exists
+> only once a chunk is written, so the head start of the per-sample release
+> below disappears (decided 2026-09-24).
+>
+> The trace-based proposal, superseded:
+>
+> E2E(f) = end of the sink invocation that delivered f − nominal release of
+> the data that completed f.
 
 - *Release.* In the fixed-batch configurations the data unit the source
   releases is a batch, and batch *j* is released at its nominal arrival
@@ -325,7 +360,7 @@ The proposed metric for this sweep, per frame *f*:
   unbatched case is the fallback, and the report then says the completion
   instant is the sink's stamp rather than its invocation end.
 
-"Source" here is the **throttle**, not the file source. The file source reads
+(Throttle-era text:) "Source" here is the **throttle**, not the file source. The file source reads
 the file as fast as the buffer allows and is unbounded; it is the throttle that
 holds the clock, and its nominal arrival grid is the release of data into the
 receiver (§10). The report says so.
@@ -375,9 +410,11 @@ receiver alone is never cut.
   the late share is reported as a sensitivity of each configuration to its
   own period, one column among the others, and the report says so where it
   first appears.
-- Saturated runs (any receiver's throttle lag p95 above ten batch periods)
-  are listed and excluded from the pooled statistics, and their count per
-  cell is in the table.
+- Saturated runs (any receiver's pacer write lag p95 above ten batch periods;
+  under the throttle, its publication lag) are listed and excluded from the
+  pooled statistics, and their count per cell is in the table. The verdict
+  needs no trace (`latency_summary.json` `per_chain[].pacer.saturated`, and
+  `batch_rt.json`).
 
 ## 9. How the blocks' scheduling parameters are derived
 
@@ -421,6 +458,11 @@ The deadline factors (`--deadline-classes`, `--frame-deadline`) multiply the
 batch period; both are 1 in this sweep, so every pipeline block's deadline is
 its receiver's batch period: 819.2 / 409.6 / 204.8 µs at 1.25 / 2.5 / 5 Msps.
 
+In pacer mode (the sweep's input from 2026-09-24) the first three rows are
+gone: the file source, throttle and stamper are replaced by one entry block
+with the pre-gate blocks' timing, and under EDF every `period` is exactly 0
+(§10).
+
 ### 9.2 What GR4 derives
 
 For each block GR4's analysis records `period`, `relative_deadline`,
@@ -442,7 +484,49 @@ instead of `user_set`.
 
 ## 10. The clock-driven input
 
-The input is a file replayed through a throttle; the throttle is the clock.
+**The pacer (the sweep's input from 2026-09-24).** `rx_latency4 --feed pacer`
+(`include/gr4ieee80211/Pacer.hpp`) takes the clock out of the graph. One
+thread, outside the scheduler, writes each receiver's stimulus into that
+receiver's **entry block** (a copy, fanning out to `mag2`, `dly16` and
+`mul.in0`) at the nominal instant of each chunk, and logs when it did:
+
+- **the replay** is `FileSourceRaw`'s, sample for sample: the first
+  `max_samples` of the memory-mapped cell, then the fixed-batch flush tail,
+  padded to a multiple of N. A check on this port found the same sample count
+  per receiver and the same frames decoded, byte for byte, in both modes;
+- **chunk j** is due at t0 + end_j / rate, t0 being one instant shared by all
+  receivers, set `--pacer-delay-ms` (default 500) after the scheduler starts so
+  the workers' start-up transient does not fill the buffers;
+- **timing:** timer slack 1 ns, sleep until `--pacer-spin-us` (default 60)
+  before the due instant, then spin; `--pacer-cpu` pins it, `--pacer-prio` gives
+  it `SCHED_FIFO` (not used unless the lag measured on the isolated guest
+  calls for it);
+- **it never drops data.** A chunk that does not fit is retried every 5 µs,
+  and only its own receiver waits; the others' chunks are still written when
+  due. The write lag is the saturation evidence. Unpinned on the development
+  machine its p99 was 6–12 µs; pinned on the isolated guest it is still to be
+  measured (the calibration runs of §11 step 3 are the first chance);
+- **end of stream** is published after each receiver's last chunk, which ends
+  the graph.
+
+The entry block is timed like the pre-gate blocks it feeds (period as they
+have it; deadline one batch period), because the tiny deadline the throttle
+had existed only because the throttle was the clock. Under EDF every block
+declares a period of exactly 0 in pacer mode, with an explicit deadline
+everywhere. The entry block must take no input from inside the graph: the
+scheduler's release scan learns who feeds a block from graph edges, and a
+block with both an external and an in-graph input could be skipped while the
+pacer's data waits (`chain.cpp` refuses to build that shape).
+
+What the pacer removed: EDF selecting the throttle on almost every pass for
+nothing, the arrival instant depending on when a worker ran the throttle, the
+throttle's lag in the late shares, and the need for a trace to know when data
+arrived. The throttle stays available (`--feed throttle`, the default of
+`rx_latency4`, so earlier drivers reproduce their results); the rest of this
+section describes it.
+
+**Throttle mode (earlier sweeps).** The input is a file replayed through a
+throttle; the throttle is the clock.
 
 **`FileSourceRaw`** (`include/gr4ieee80211/FileSourceRaw.hpp`): a synchronous
 reader with GR3's `file_source` semantics — reads the raw complex64 file
@@ -496,9 +580,10 @@ use `CLOCK_MONOTONIC`, so every instant in the analysis is on one clock.
 1. **Build** as in `docs/m6-runbook.md` §3 (Release, g++-15, `-j4`).
 2. **Code changes, before anything is run** (each with a smoke test):
    - the block-to-worker assignment written per run (§6);
-   - `trace-batch-rt.py`: the per-frame E2E table (§8.1), for batched and
-     unbatched runs;
+   - ~~`trace-batch-rt.py`: the per-frame E2E table (§8.1)~~ — done
+     2026-09-24 (`frame_e2e`, `frame_e2e.csv`; trace-free under the pacer);
    - a driver `scripts/rt-e2e4` (from `rt-prelim4`: the four configurations,
+     `--feed pacer --pacer-cpu 3` on every run,
      `--run-s 30`, `--repeats 8`, the per-workload pass budget, the mask and
      ring of §7, capture deleted after analysis, `--skip-existing`,
      `index.json`, `sweep.log`);
@@ -519,7 +604,8 @@ use `CLOCK_MONOTONIC`, so every instant in the analysis is on one clock.
    `elapsed_s` within a few percent of 30; trace `lost` 0 (or the retained
    span per run, if the ring held less); `saturated` per receiver; the
    `scheduler` field says `Simple<multiThreaded>`; `worker_cpus` and `rt_prio` say
-   what §13 asked for. List the failures and the saturated runs in the
+   what §13 asked for; `feed` is `pacer`, `pacer.finished` true, and per
+   receiver `pacer.retries` 0 unless the run saturated. List the failures and the saturated runs in the
    report.
 7. **Analyse and report**: `rt-e2e-figs.py` → `results/sweep-x86-8core-e2e/`;
    the report's setup section states the machine, the commit, the mask, what a
@@ -538,11 +624,11 @@ Settled 2026-09-23:
 - **Settings audit** (§3.3) as written: nothing dropped, `--max-pass-duration`
   added, `--sched-ratio 4096` kept for every configuration.
 
-Held by the human:
+Held by the human, then resolved 2026-09-24:
 
-- **The metric's implementation**: the human will build the trace
-  infrastructure that computes the end-to-end latency before the sweep runs;
-  §8.1 is the proposed definition, to be reconciled with that implementation.
+- **The metric's implementation**: resolved without new trace infrastructure.
+  The pacer's write log and the sink's stamp give the end-to-end latency
+  directly (§8.1).
 
 Settled 2026-09-23, second round:
 
@@ -567,7 +653,19 @@ Settled 2026-09-23, third round:
   per CPU, everything else on 0–3; **pin only, no real-time priority**
   (decided 2026-09-23 on the measurements of §13 step 3b).
 
-Open: nothing beyond the held item above.
+Settled 2026-09-24:
+
+- **Input**: the pacer, on a housekeeping CPU (§10); `--feed pacer
+  --pacer-cpu 3` on every run.
+- **Metric**: E2E from the pacer's write to the sink's end-of-call stamp,
+  trace-free (§8.1); the unbatched configuration's release is its chunk's
+  write, like the others'.
+- **The entry block's timing**: the pre-gate blocks' (§10).
+- **EDF's periods**: exactly 0 in pacer mode, every block with an explicit
+  deadline; the throttle mode keeps 1 µs.
+- **Saturation**: the pacer's write lag p95 above ten batch periods (§8.4).
+
+Open: nothing.
 
 ## 13. Keeping the workers' CPUs to themselves
 
