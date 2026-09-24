@@ -550,6 +550,23 @@ alone for the pass period, or `work` and `workExact` (`0x104`) with it
 (`0x10c`) for batch response times. Check `window_covered_s` again afterwards
 rather than assume the narrower mask fits.
 
+**The window never runs past the end of the input.** The rings keep the
+*last* records, so the window slides toward the end of the run, and a run
+that saturated keeps draining its backlog after the input stops: its lagging
+receiver's blocks then run faster than their rate while the other receivers
+have nothing left, and none of that is the schedule being measured. Since
+2026-09-24 (after that run) `trace-batch-rt.py` clips the window at the earliest receiver's
+input end (`input_end_ns` in `batch_rt.json`), and refuses to analyse a
+capture whose rings hold only the drain. Results from before then are not
+clipped. In the pacer run of 2026-09-24
+(`results/sweep-x86-8core-m6-2026-09-24-pacer`), rate monotonic's window at
+ratio 16 ran to 20.7 s against an input that ended at 20.0 s: its trace-based
+rows, including demand (0.840) and calls per second, mix steady state with
+0.7 s of the starved receiver catching up, which is why that receiver's
+blocks show more than twice their input rate there. Its pacer-based figures
+(write lag, end-to-end latency, the saturation verdict) are unaffected; they
+never depended on the rings.
+
 ### A late batch is not always the scheduler's
 
 A batch's response time is measured from its nominal release, the instant the

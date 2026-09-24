@@ -134,9 +134,17 @@ def main():
     if not starts:
         die("no throttle start anchor in trace_meta.json (unthrottled run?)")
     t0 = min(starts)
+    # The window ends where the input does, at the latest. After it a receiver that fell behind is
+    # draining its backlog, with no new data arriving: its blocks run faster than its rate, the other
+    # receivers are idle, and none of it is the schedule being measured. The first receiver to run
+    # out sets the end, since from then on the workers carry less than the full mix.
+    ends = [int(c["throttle_start_ns"]) + int(float(c["max_samples"]) / float(c.get("rate") or rate) * 1e9)
+            for c in meta["chains"] if c.get("throttle_start_ns") and c.get("max_samples") and (c.get("rate") or rate)]
+    input_end = min(ends) if ends else (t0 + int(out["air_s"] * 1e9) if out["air_s"] else np.iinfo(np.int64).max)
+    out["input_end_ns"] = int(input_end) if input_end < np.iinfo(np.int64).max else None
     w0 = t0 + int(a.warmup * 1e9)
-    w1 = w0 + int(a.window * 1e9) if a.window > 0 else np.iinfo(np.int64).max
-    out["window_ns"] = [int(w0), None if a.window <= 0 else int(w1)]
+    w1 = min(w0 + int(a.window * 1e9) if a.window > 0 else np.iinfo(np.int64).max, input_end)
+    out["window_ns"] = [int(w0), None if w1 == np.iinfo(np.int64).max else int(w1)]
 
     # ---- frame response times (no trace needed)
     lat = pd.read_csv(os.path.join(rd, "latency.csv"))
@@ -208,7 +216,10 @@ def main():
             # slide the window to the retained span, keep its length where the span allows
             new_w0 = max(w0, span_start)
             new_w1 = (new_w0 + int(a.window * 1e9)) if a.window > 0 else span_end
-            new_w1 = min(new_w1, span_end)
+            new_w1 = min(new_w1, span_end, input_end)  # sliding must not carry the window past the input
+            if new_w0 >= input_end:
+                die(f"the rings retained nothing from before the input ended ({(span_start - t0)/1e9:.1f} s after the start, input over at {(input_end - t0)/1e9:.1f} s): "
+                    "what they hold is the drain of a backlog, not the schedule; enlarge trace_buffer or narrow the capture mask")
             if new_w0 != w0 or new_w1 != w1:
                 out["window_shifted"] = True
                 print(f"trace-batch-rt: NOTE the rings' common retained span starts {(span_start - t0)/1e9:.1f} s after the throttle start and ends at {(span_end - t0)/1e9:.1f} s; window set to [{(new_w0 - t0)/1e9:.1f}, {(new_w1 - t0)/1e9:.1f}] s", file=sys.stderr)

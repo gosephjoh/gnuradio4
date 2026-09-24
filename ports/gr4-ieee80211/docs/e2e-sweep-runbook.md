@@ -375,6 +375,12 @@ the window is whatever it retained and the report says how long that was per
 run, as before. The trace-free `lat_last_us` control covers the whole run
 regardless.
 
+The window never extends past the end of the input: `trace-batch-rt.py` clips
+it at the earliest receiver's input end (`input_end_ns`), because after it a
+saturated run is only draining its backlog. A ring that retained nothing
+from before the input ended is refused, not analysed. `--window 0` therefore
+means "to the end of the input", not "to the last record".
+
 ### 8.3 Whole-process stalls
 
 Same rule as the published sweep (`rt-full-figs.py::flag_stalls`, defaults
