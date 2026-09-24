@@ -468,16 +468,15 @@ class Scope {
 
 public:
     /// `event.startNs` is honoured where the caller set it (chaining) and taken now where it is 0.
-    explicit Scope(Event event) noexcept : _event(event) {
+    ///
+    /// Forced inline because the disabled path must cost what `emit()`'s does. Left to the heuristic,
+    /// GCC refuses to inline this into a function as large as `Block::workInternal`, and every scope
+    /// there then pays a call and an `Event` passed through memory with no category live.
+    [[gnu::always_inline]] explicit Scope(Event event) noexcept : _event(event) {
         if constexpr (kEnabled) {
-            if (categoryEnabled(categoryOf(_event.kind))) {
+            if (categoryEnabled(categoryOf(_event.kind))) [[unlikely]] {
                 if (_event.startNs == 0UL) {
-                    // Before the start is read: the first scope a thread opens is the outermost one, so
-                    // a ring built here lands before every span on the thread rather than inside one. A
-                    // caller that supplied the start has read its clock already; building here would
-                    // buy it nothing, so it is left to call `prepareThread()` first.
-                    static_cast<void>(detail::threadRing());
-                    _event.startNs = now();
+                    _event.startNs = firstInstant();
                 }
                 _armed = true;
             }
@@ -517,6 +516,19 @@ public:
 
     /// Lets a caller fill in counts discovered during the scope — samples processed, a status.
     [[nodiscard]] Event& event() noexcept { return _event; }
+
+private:
+    /// Out of line so the clock path cannot grow every call site the constructor is forced into, and
+    /// `static` so the scope itself does not escape: a member call would take its address and force
+    /// the whole object into memory at every call site, on the disabled path too.
+    [[gnu::noinline]] static std::uint64_t firstInstant() noexcept {
+        // Before the start is read: the first scope a thread opens is the outermost one, so a ring
+        // built here lands before every span on the thread rather than inside one. A caller that
+        // supplied the start has read its clock already; building here would buy it nothing, so it
+        // is left to call `prepareThread()` first.
+        static_cast<void>(detail::threadRing());
+        return now();
+    }
 };
 
 /// Reads one record. A plain function pointer, mirroring `gr::log::RecordConsumer`: allocation-free,

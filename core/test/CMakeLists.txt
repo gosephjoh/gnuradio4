@@ -89,6 +89,14 @@ add_ut_test(qa_TraceSchedulingPolicy)
 add_ut_test(qa_TraceOracle)
 add_ut_test(qa_TraceReport)
 add_ut_test(qa_TraceBlock)
+if(GR4_ENABLE_TRACING
+   AND CMAKE_NM
+   AND NOT EMSCRIPTEN)
+  # `qa_TraceBlock` runs the block-side scopes, which sit in the one function large enough that a
+  # compiler left to its own heuristic declines to inline the scope constructor into it.
+  add_test(NAME qa_TraceScopeInlined COMMAND ${CMAKE_COMMAND} -DNM=${CMAKE_NM} -DBINARY=$<TARGET_FILE:qa_TraceBlock> -P
+                                             ${CMAKE_CURRENT_SOURCE_DIR}/check_trace_scope_inlined.cmake)
+endif()
 add_ut_test(qa_TraceUtilisation)
 add_ut_test(qa_TraceSchedulingGraphs)
 add_ut_test(qa_SchedulerPassBudget)

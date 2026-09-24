@@ -719,9 +719,10 @@ public:
     A<bool, "disconnect on done", Doc<"If no downstream blocks, declare itself 'DONE' and disconnect from upstream blocks.">> disconnect_on_done = true;
     A<std::string, "compute domain", Doc<"compute domain/IO thread pool name">>                                               compute_domain     = gr::thread_pool::kDefaultIoPoolId;
 
-    // real-time scheduling attributes -- inert unless a scheduling policy reads them; 0 means "unset"
+    // real-time scheduling attributes -- inert unless a scheduling policy reads them; 0 means "unset", except that an
+    // explicitly set `period` of 0 is kept: only a period never set is derived
     A<std::int32_t, "sched_priority", Doc<"static scheduling priority, larger = more urgent (0: unset)">>                                  sched_priority    = 0;
-    A<float, "period", Unit<"s">, Doc<"inter-release interval; derived from graph rates when 0 (0: unset)">>                               period            = 0.f;
+    A<float, "period", Unit<"s">, Doc<"minimum interval between releases; derived from rates if never set (explicit 0: no gate)">>         period            = 0.f;
     A<float, "relative_deadline", Unit<"s">, Doc<"deadline measured from release; implicit (= period) when 0 (0: unset)">>                 relative_deadline = 0.f;
     A<float, "wcet_estimate", Unit<"s">, Doc<"per-invocation execution cost; only measured or user-supplied, never derived (0: unknown)">> wcet_estimate     = 0.f;
     A<gr::Size_t, "max_batch_size", Doc<"per-invocation batch ceiling; inherits the scheduler's max_work_items when 0 (0: unset)">>        max_batch_size    = 0U;

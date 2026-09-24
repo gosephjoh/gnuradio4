@@ -724,9 +724,11 @@ const boost::ut::suite<"Trace"> traceTests = [] {
         const AllocationSentinel sentinel;
         expect(eq(sentinel.delta(), 0UZ));
 
-        auto* deliberate = new int(7); // NOLINT(cppcoreguidelines-owning-memory) -- the point is to allocate
+        // A call to `operator new` itself, not a new-expression: the compiler may elide a paired
+        // `new`/`delete` expression entirely, and Clang does, which would fail this for the wrong reason.
+        void* deliberate = ::operator new(sizeof(int));
         expect(gt(sentinel.delta(), 0UZ)) << "the sentinel does not see allocations, so the next test proves nothing";
-        delete deliberate;
+        ::operator delete(deliberate);
     };
 
     "the steady state does not allocate"_test = [] {
